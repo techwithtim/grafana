@@ -18632,6 +18632,16 @@
         },
         "value": {
           "type": "string"
+        },
+        "variables": {
+          "description": "Optional template variable values applied when this item is played (dashboard_by_uid only)",
+          "type": "object",
+          "additionalProperties": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
         }
       }
     },
@@ -18649,6 +18659,16 @@
         "value": {
           "description": "Value depends on type and describes the playlist item.\n\n- dashboard_by_id: The value is an internal numerical identifier set by Grafana. This\nis not portable as the numerical identifier is non-deterministic between different instances.\nWill be replaced by dashboard_by_uid in the future. (deprecated)\n- dashboard_by_tag: The value is a tag which is set on any number of dashboards. All\ndashboards behind the tag will be added to the playlist.\n- dashboard_by_uid: The value is the dashboard UID",
           "type": "string"
+        },
+        "variables": {
+          "description": "Optional template variable values applied when this item is played (dashboard_by_uid only)",
+          "type": "object",
+          "additionalProperties": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
         }
       }
     },
