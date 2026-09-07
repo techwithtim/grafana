@@ -10,12 +10,26 @@ import (
 )
 
 func LegacyUpdateCommandToUnstructured(cmd UpdatePlaylistCommand) unstructured.Unstructured {
-	items := make([]map[string]string, 0, len(cmd.Items))
+	items := make([]map[string]any, 0, len(cmd.Items))
 	for _, item := range cmd.Items {
-		items = append(items, map[string]string{
+		entry := map[string]any{
 			"type":  item.Type,
 			"value": item.Value,
-		})
+		}
+		if len(item.Variables) > 0 {
+			// Unstructured content must only hold JSON-compatible values, so the typed
+			// map of string slices is converted all the way down to []any of string.
+			variables := make(map[string]any, len(item.Variables))
+			for name, values := range item.Variables {
+				encoded := make([]any, 0, len(values))
+				for _, value := range values {
+					encoded = append(encoded, value)
+				}
+				variables[name] = encoded
+			}
+			entry["variables"] = variables
+		}
+		items = append(items, entry)
 	}
 	obj := unstructured.Unstructured{
 		Object: map[string]interface{}{
