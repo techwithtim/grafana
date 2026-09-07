@@ -389,6 +389,30 @@ func doPlaylistTests(t *testing.T, helper *apis.K8sTestHelper) *apis.K8sTestHelp
 		require.NoError(t, err)
 		require.JSONEq(t, expectedResult, client.SanitizeJSON(found, "labels"))
 
+		// The legacy bodies below are compared as raw bytes, not with JSONEq, because they
+		// pin the exact response an existing client already parses: JSONEq ignores key order
+		// and formatting, so it would not catch an item that gained a key (an optional field
+		// serialized even when empty) or a reordered field. This suite runs with
+		// AppModeProduction, so web.Context.JSON writes compact JSON plus a single newline.
+		expectedLegacyDTO := `{"uid":"` + uid + `","name":"Test","interval":"20s","items":[{"type":"dashboard_by_uid","value":"xCmMwXdVz"},{"type":"dashboard_by_tag","value":"graph-ng"}]}` + "\n"
+		require.Equal(t, expectedLegacyDTO, string(legacyCreate.Body))
+
+		legacyGet := apis.DoRequest(helper, apis.RequestParams{
+			User:   client.Args.User,
+			Method: http.MethodGet,
+			Path:   "/api/playlists/" + uid,
+		}, &playlist.PlaylistDTO{})
+		require.Equal(t, 200, legacyGet.Response.StatusCode)
+		require.Equal(t, expectedLegacyDTO, string(legacyGet.Body))
+
+		legacyItems := apis.DoRequest(helper, apis.RequestParams{
+			User:   client.Args.User,
+			Method: http.MethodGet,
+			Path:   "/api/playlists/" + uid + "/items",
+		}, &[]playlist.PlaylistItemDTO{})
+		require.Equal(t, 200, legacyItems.Response.StatusCode)
+		require.Equal(t, `[{"type":"dashboard_by_uid","value":"xCmMwXdVz"},{"type":"dashboard_by_tag","value":"graph-ng"}]`+"\n", string(legacyItems.Body))
+
 		// Now modify the interval
 		updatedInterval := `"interval": "10m"`
 		legacyPayload = strings.Replace(legacyPayload, `"interval": "20s"`, updatedInterval, 1)
@@ -402,6 +426,18 @@ func doPlaylistTests(t *testing.T, helper *apis.K8sTestHelper) *apis.K8sTestHelp
 		require.Equal(t, 200, dtoResponse.Response.StatusCode)
 		require.Equal(t, uid, dtoResponse.Result.Uid)
 		require.Equal(t, "10m", dtoResponse.Result.Interval)
+
+		// Only the interval changed: an update must not add keys to variable-less items.
+		expectedLegacyDTOAfterUpdate := `{"uid":"` + uid + `","name":"Test","interval":"10m","items":[{"type":"dashboard_by_uid","value":"xCmMwXdVz"},{"type":"dashboard_by_tag","value":"graph-ng"}]}` + "\n"
+		require.Equal(t, expectedLegacyDTOAfterUpdate, string(dtoResponse.Body))
+
+		legacyGet = apis.DoRequest(helper, apis.RequestParams{
+			User:   client.Args.User,
+			Method: http.MethodGet,
+			Path:   "/api/playlists/" + uid,
+		}, &playlist.PlaylistDTO{})
+		require.Equal(t, 200, legacyGet.Response.StatusCode)
+		require.Equal(t, expectedLegacyDTOAfterUpdate, string(legacyGet.Body))
 
 		expectedUnstructuredResult := &unstructured.Unstructured{
 			Object: map[string]any{
@@ -459,6 +495,214 @@ func doPlaylistTests(t *testing.T, helper *apis.K8sTestHelper) *apis.K8sTestHelp
 		statusError := helper.AsStatusError(err)
 		require.Nil(t, found)
 		require.Equal(t, metav1.StatusReasonNotFound, statusError.Status().Reason)
+	})
+
+	// This runs after the legacy CRUD sub-test above because that one asserts the k8s List
+	// returns exactly one playlist, so any object created here beforehand would break it.
+	// Everything created below is removed by a t.Cleanup registered immediately after its
+	// creation, which keeps the org-scoped List assertions in the sibling sub-tests valid.
+	t.Run("Check playlist item variables round trip through legacy and k8s apis", func(t *testing.T) {
+		client := helper.GetResourceClient(apis.ResourceClientArgs{
+			User: helper.Org1.Editor,
+			GVR:  gvr,
+		})
+
+		// The same dashboard uid is listed twice on purpose, with a different variable set
+		// each time: that is how one parameterized dashboard rotates through several hosts
+		// within a single playlist.
+		legacyPayload := `{
+			"name": "With variables",
+			"interval": "20s",
+			"items": [
+			  {
+				"type": "dashboard_by_uid",
+				"value": "xCmMwXdVz",
+				"variables": { "host": ["a", "b"], "cluster": ["c"] }
+			  },
+			  {
+				"type": "dashboard_by_uid",
+				"value": "xCmMwXdVz",
+				"variables": { "host": ["z"] }
+			  },
+			  {
+				"type": "dashboard_by_tag",
+				"value": "graph-ng"
+			  }
+			],
+			"uid": ""
+		  }`
+		legacyCreate := apis.DoRequest(helper, apis.RequestParams{
+			User:   client.Args.User,
+			Method: http.MethodPost,
+			Path:   "/api/playlists",
+			Body:   []byte(legacyPayload),
+		}, &playlist.Playlist{})
+		require.Equal(t, 200, legacyCreate.Response.StatusCode)
+		require.NotNil(t, legacyCreate.Result)
+		uid := legacyCreate.Result.UID
+		t.Cleanup(func() {
+			_ = client.Resource.Delete(context.Background(), uid, metav1.DeleteOptions{})
+		})
+		require.NotEmpty(t, uid)
+
+		// Map keys are serialized in sorted order, hence cluster before host.
+		expectedResult := `{
+  "apiVersion": "playlist.grafana.app/v1",
+  "kind": "Playlist",
+  "metadata": {
+    "creationTimestamp": "${creationTimestamp}",
+    "name": "` + uid + `",
+    "namespace": "default",
+    "resourceVersion": "${resourceVersion}",
+    "uid": "${uid}"
+  },
+  "spec": {
+    "interval": "20s",
+    "items": [
+      {
+        "type": "dashboard_by_uid",
+        "value": "xCmMwXdVz",
+        "variables": {
+          "cluster": ["c"],
+          "host": ["a", "b"]
+        }
+      },
+      {
+        "type": "dashboard_by_uid",
+        "value": "xCmMwXdVz",
+        "variables": {
+          "host": ["z"]
+        }
+      },
+      {
+        "type": "dashboard_by_tag",
+        "value": "graph-ng"
+      }
+    ],
+    "title": "With variables"
+  },
+  "status": {}
+}`
+
+		found, err := client.Resource.Get(context.Background(), uid, metav1.GetOptions{})
+		require.NoError(t, err)
+		require.JSONEq(t, expectedResult, client.SanitizeJSON(found, "labels"))
+
+		// The tag item must not carry the key at all -- not even as an empty or null value,
+		// which would change the stored object of every playlist that uses no variables.
+		storedItems, _, err := unstructured.NestedSlice(found.Object, "spec", "items")
+		require.NoError(t, err)
+		require.Len(t, storedItems, 3)
+		storedTagItem, ok := storedItems[2].(map[string]any)
+		require.True(t, ok)
+		require.NotContains(t, storedTagItem, "variables")
+
+		// The deprecated legacy API returns the same variables on its DTOs
+		legacyGet := apis.DoRequest(helper, apis.RequestParams{
+			User:   client.Args.User,
+			Method: http.MethodGet,
+			Path:   "/api/playlists/" + uid,
+		}, &playlist.PlaylistDTO{})
+		require.Equal(t, 200, legacyGet.Response.StatusCode)
+		require.NotNil(t, legacyGet.Result)
+		require.Len(t, legacyGet.Result.Items, 3)
+		require.Equal(t, map[string][]string{"host": {"a", "b"}, "cluster": {"c"}}, legacyGet.Result.Items[0].Variables)
+		require.Equal(t, map[string][]string{"host": {"z"}}, legacyGet.Result.Items[1].Variables)
+		require.Nil(t, legacyGet.Result.Items[2].Variables)
+
+		legacyItems := apis.DoRequest(helper, apis.RequestParams{
+			User:   client.Args.User,
+			Method: http.MethodGet,
+			Path:   "/api/playlists/" + uid + "/items",
+		}, &[]playlist.PlaylistItemDTO{})
+		require.Equal(t, 200, legacyItems.Response.StatusCode)
+		require.NotNil(t, legacyItems.Result)
+		require.Equal(t, legacyGet.Result.Items, *legacyItems.Result)
+
+		// The update handler replaces the whole spec from the payload, so the edited payload
+		// resends every item that should survive the update.
+		updatedPayload := strings.Replace(legacyPayload, `"variables": { "host": ["z"] }`, `"variables": { "host": ["q"] }`, 1)
+		require.NotEqual(t, legacyPayload, updatedPayload)
+		dtoResponse := apis.DoRequest(helper, apis.RequestParams{
+			User:   client.Args.User,
+			Method: http.MethodPut,
+			Path:   "/api/playlists/" + uid,
+			Body:   []byte(updatedPayload),
+		}, &playlist.PlaylistDTO{})
+		require.Equal(t, 200, dtoResponse.Response.StatusCode)
+		require.NotNil(t, dtoResponse.Result)
+		require.Len(t, dtoResponse.Result.Items, 3)
+		require.Equal(t, map[string][]string{"host": {"q"}}, dtoResponse.Result.Items[1].Variables)
+
+		// The changed value is now stored, and the untouched items are unchanged
+		found, err = client.Resource.Get(context.Background(), uid, metav1.GetOptions{})
+		require.NoError(t, err)
+		require.JSONEq(t,
+			strings.Replace(expectedResult, `"host": ["z"]`, `"host": ["q"]`, 1),
+			client.SanitizeJSON(found, "labels"))
+
+		// Variables written straight through the k8s api survive both read paths too.
+		// spec.title and spec.interval are required here because the legacy DTO conversion
+		// type-asserts both of them without a guard.
+		k8sName := "playlist-with-variables"
+		k8sCreated, err := client.Resource.Create(context.Background(),
+			helper.LoadYAMLOrJSON(`{
+				"apiVersion": "playlist.grafana.app/v1",
+				"kind": "Playlist",
+				"metadata": { "name": "`+k8sName+`" },
+				"spec": {
+				  "title": "Created from k8s with variables",
+				  "interval": "5m",
+				  "items": [
+					{ "type": "dashboard_by_uid", "value": "xCmMwXdVz", "variables": { "host": ["a", "b"] } },
+					{ "type": "dashboard_by_tag", "value": "graph-ng" }
+				  ]
+				}
+			  }`),
+			metav1.CreateOptions{},
+		)
+		t.Cleanup(func() {
+			_ = client.Resource.Delete(context.Background(), k8sName, metav1.DeleteOptions{})
+		})
+		require.NoError(t, err)
+		require.Equal(t, k8sName, k8sCreated.GetName())
+
+		legacyGet = apis.DoRequest(helper, apis.RequestParams{
+			User:   client.Args.User,
+			Method: http.MethodGet,
+			Path:   "/api/playlists/" + k8sName,
+		}, &playlist.PlaylistDTO{})
+		require.Equal(t, 200, legacyGet.Response.StatusCode)
+		require.NotNil(t, legacyGet.Result)
+		require.Len(t, legacyGet.Result.Items, 2)
+		require.Equal(t, map[string][]string{"host": {"a", "b"}}, legacyGet.Result.Items[0].Variables)
+		require.Nil(t, legacyGet.Result.Items[1].Variables)
+
+		// v0alpha1 shares the item definition with v1, so a read through the older version
+		// must return the stored variables unchanged.
+		clientV0alpha1 := helper.GetResourceClient(apis.ResourceClientArgs{
+			User: helper.Org1.Editor,
+			GVR: schema.GroupVersionResource{
+				Group:    gvr.Group,
+				Version:  "v0alpha1",
+				Resource: gvr.Resource,
+			},
+		})
+		foundV0alpha1, err := clientV0alpha1.Resource.Get(context.Background(), k8sName, metav1.GetOptions{})
+		require.NoError(t, err)
+		v0alpha1Items, _, err := unstructured.NestedSlice(foundV0alpha1.Object, "spec", "items")
+		require.NoError(t, err)
+		require.Len(t, v0alpha1Items, 2)
+		require.Equal(t, map[string]any{
+			"type":  "dashboard_by_uid",
+			"value": "xCmMwXdVz",
+			"variables": map[string]any{
+				"host": []any{"a", "b"},
+			},
+		}, v0alpha1Items[0])
+		v0alpha1TagItem, ok := v0alpha1Items[1].(map[string]any)
+		require.True(t, ok)
+		require.NotContains(t, v0alpha1TagItem, "variables")
 	})
 
 	t.Run("Do CRUD via k8s (and check that legacy api still works)", func(t *testing.T) {
