@@ -12,6 +12,10 @@ package playlist
 	//  dashboards behind the tag will be added to the playlist.
 	//  - dashboard_by_uid: The value is the dashboard UID
 	value: string
+	// Optional template variable values applied when this item is played (dashboard_by_uid only).
+	// Each key is a variable name; its value is a list of one or more values for that variable.
+	// A multi-value variable is expressed by several list elements under the same key.
+	variables?: [string]: [string, ...string]
 }
 
 playlistv1: {
