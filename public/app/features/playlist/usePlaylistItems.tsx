@@ -13,7 +13,28 @@ export function usePlaylistItems(playlistItems?: PlaylistItemUI[]) {
   useAsync(async () => {
     for (const item of items) {
       if (!item.dashboards) {
-        setItems(await loadDashboards(items));
+        const loaded = await loadDashboards(items);
+        // Merge into the latest state instead of replacing it with the snapshot taken before
+        // the await, which would discard any edit made while the search was in flight.
+        // `loadDashboards` derives an item's dashboards from its type and value alone, so
+        // matching on that pair attaches the right result to each item, even when the same
+        // dashboard is listed more than once. Every other property is left untouched.
+        setItems((prev) => {
+          let merged = false;
+          const next = prev.map((prevItem) => {
+            const match = loaded.find(
+              (loadedItem) => loadedItem.type === prevItem.type && loadedItem.value === prevItem.value
+            );
+            if (!match) {
+              return prevItem;
+            }
+            merged = true;
+            return { ...prevItem, dashboards: match.dashboards };
+          });
+          // Keep the same array when nothing matched, so an item added mid-flight cannot
+          // bounce this effect between renders.
+          return merged ? next : prev;
+        });
         return;
       }
     }
@@ -74,5 +95,25 @@ export function usePlaylistItems(playlistItems?: PlaylistItemUI[]) {
     [items]
   );
 
-  return { items, addByUID, addByTag, deleteItem, moveItem };
+  const updateItemVariables = useCallback((index: number, variables?: Record<string, string[]>) => {
+    setItems((prev) => {
+      if (!prev[index]) {
+        return prev;
+      }
+
+      return prev.map((item, i) => {
+        if (i !== index) {
+          return item;
+        }
+
+        // Items originate from the RTK Query cache, so build a new object rather than
+        // mutating this one. An empty map drops the property altogether, keeping items
+        // without variables serialized exactly as they were before.
+        const { variables: _replaced, ...rest } = item;
+        return variables && Object.keys(variables).length > 0 ? { ...rest, variables } : rest;
+      });
+    });
+  }, []);
+
+  return { items, addByUID, addByTag, deleteItem, moveItem, updateItemVariables };
 }

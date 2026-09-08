@@ -72,7 +72,11 @@ Content-Type: application/json
         "items": [
           {
             "type": "dashboard_by_uid",
-            "value": "dashboard-uid-1"
+            "value": "dashboard-uid-1",
+            "variables": {
+              "host": ["Host1"],
+              "datacenter": ["eu-west-1", "us-east-1"]
+            }
           },
           {
             "type": "dashboard_by_tag",
@@ -326,3 +330,5 @@ Playlist items support three types:
 - `dashboard_by_uid`: Include a specific dashboard by its UID
 - `dashboard_by_tag`: Include all dashboards with a specific tag
 - `dashboard_by_id`: (Deprecated) Include a dashboard by internal ID
+
+Items of type `dashboard_by_uid` also support an optional `variables` field, which maps a template variable name to a list of one or more values that Grafana applies when the playlist reaches that item. Omit the field to leave the item's behavior unchanged, list several values under one name for a multi-value variable, and add the same dashboard UID more than once with a different set of variables to rotate one dashboard through each set.
