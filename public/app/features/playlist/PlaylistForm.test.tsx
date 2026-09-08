@@ -129,24 +129,73 @@ function disclosureStates() {
   return disclosureButtons().map((button) => button.getAttribute('aria-expanded'));
 }
 
-/** The add row's inputs are labelled, where an existing variable's inputs are aria-labelled. */
-function newVariableName() {
-  return screen.getByRole('textbox', { name: 'Variable name' });
+/**
+ * The draggable wrapper of the row at `index`. The variables panel renders as a sibling of the
+ * `role="row"` element rather than inside it, so the wrapper is the smallest element containing
+ * both, and it is what confines a query to one row's editor when two rows hold the same dashboard.
+ */
+function rowWrapper(index: number): HTMLElement {
+  const wrapper = rows()[index].parentElement;
+  if (!wrapper) {
+    throw new Error(`Row ${index} is not inside a draggable wrapper element`);
+  }
+  return wrapper;
 }
 
-function newVariableValues() {
-  return screen.getByRole('textbox', { name: 'Values (comma-separated)' });
+/** The disclosure belonging to the row at `index`, never the nth disclosure of the whole table. */
+function rowDisclosure(index: number) {
+  return within(rows()[index]).getByRole('button', { name: 'Template variables' });
 }
 
 /**
- * Commits one variable through the editor of the row at `index`, leaving the editor open. Every
- * editor labels its add row identically, so a caller must have at most one editor open at a time.
+ * The expanded variables panel of the row at `index`, reached by following that row's own
+ * disclosure. Two rows listing the same dashboard label their panels identically, so the returned
+ * region is provably the intended row's only because the disclosure that reports it controls
+ * (`aria-controls`) lives in that row and the region carrying that id sits in that row's wrapper.
  */
-async function addVariable(user: UserEvent, index: number, name: string, values: string) {
-  await user.click(disclosureButtons()[index]);
-  await user.type(newVariableName(), name);
-  await user.type(newVariableValues(), values);
-  await user.click(screen.getByRole('button', { name: 'Add variable' }));
+function variableEditorFor(index: number): HTMLElement {
+  const disclosure = rowDisclosure(index);
+  const controlledId = disclosure.getAttribute('aria-controls');
+  const region = within(rowWrapper(index)).getByRole('region');
+
+  expect(disclosure).toHaveAttribute('aria-expanded', 'true');
+  expect(region.id).not.toBe('');
+  expect(region.id).toBe(controlledId);
+
+  return region;
+}
+
+/** Expands the row at `index` and returns the panel its disclosure controls. */
+async function openVariableEditor(user: UserEvent, index: number): Promise<HTMLElement> {
+  await user.click(rowDisclosure(index));
+  return variableEditorFor(index);
+}
+
+/** The add row's inputs are labelled, where an existing variable's inputs are aria-labelled. */
+function newVariableName(editor: HTMLElement) {
+  return within(editor).getByRole('textbox', { name: 'Variable name' });
+}
+
+function newVariableValues(editor: HTMLElement) {
+  return within(editor).getByRole('textbox', { name: 'Values (comma-separated)' });
+}
+
+function addVariableButton(editor: HTMLElement) {
+  return within(editor).getByRole('button', { name: 'Add variable' });
+}
+
+/**
+ * Commits one variable through the editor of the row at `index`, leaving the editor open, and
+ * returns that editor's region so a caller can keep asserting inside it. Expansion and every query
+ * below it go through that row's disclosure and the region it controls, so an editor left open on
+ * another row — including one holding the same dashboard — cannot answer in its place.
+ */
+async function addVariable(user: UserEvent, index: number, name: string, values: string): Promise<HTMLElement> {
+  const editor = await openVariableEditor(user, index);
+  await user.type(newVariableName(editor), name);
+  await user.type(newVariableValues(editor), values);
+  await user.click(addVariableButton(editor));
+  return editor;
 }
 
 /** `jest.fn()` records its arguments untyped, so the submitted playlist is typed at this one spot. */
@@ -275,9 +324,10 @@ describe('PlaylistForm', () => {
       await user.click(disclosure);
       expect(disclosureStates()).toEqual(['true']);
 
-      await user.type(newVariableName(), 'host');
-      await user.type(newVariableValues(), 'a, b');
-      await user.click(screen.getByRole('button', { name: 'Add variable' }));
+      const editor = variableEditorFor(0);
+      await user.type(newVariableName(editor), 'host');
+      await user.type(newVariableValues(editor), 'a, b');
+      await user.click(addVariableButton(editor));
       await user.click(saveButton());
 
       await waitFor(() => {
@@ -315,9 +365,9 @@ describe('PlaylistForm', () => {
       const reloaded = getTestContext(saved);
 
       expect(screen.getByText('1 variable')).toBeInTheDocument();
-      await reloaded.user.click(disclosureButtons()[0]);
-      expect(await screen.findByRole('textbox', { name: 'Variable name for host' })).toHaveValue('host');
-      expect(screen.getByRole('textbox', { name: 'Values for host' })).toHaveValue('a, b');
+      const editor = await openVariableEditor(reloaded.user, 0);
+      expect(await within(editor).findByRole('textbox', { name: 'Variable name for host' })).toHaveValue('host');
+      expect(within(editor).getByRole('textbox', { name: 'Values for host' })).toHaveValue('a, b');
     });
 
     it('submits distinct variables for two rows holding the same dashboard', async () => {
@@ -325,11 +375,20 @@ describe('PlaylistForm', () => {
 
       await user.click(dashboardPickerButton());
       await addVariable(user, 0, 'host', 'a, b');
-      // Adding an item leaves open editors open, and every editor labels its add row the same way,
-      // so the first row is collapsed before the second one is opened.
-      await user.click(disclosureButtons()[0]);
       await user.click(dashboardPickerButton());
       await addVariable(user, 1, 'host', 'c');
+
+      // Both editors stay open on purpose. The two rows carry the same dashboard, so their rows and
+      // their panels are labelled identically and only the disclosure-to-panel association tells
+      // them apart; with one of the two closed, a panel rendered under the wrong row would look the
+      // same as a correct one. Each region is re-resolved through its own row's `aria-controls`
+      // here, so these assertions fail if that association is dropped or crossed over.
+      const firstEditor = variableEditorFor(0);
+      const secondEditor = variableEditorFor(1);
+      expect(firstEditor.id).not.toBe(secondEditor.id);
+      expect(within(firstEditor).getByRole('textbox', { name: 'Values for host' })).toHaveValue('a, b');
+      expect(within(secondEditor).getByRole('textbox', { name: 'Values for host' })).toHaveValue('c');
+
       await user.click(saveButton());
 
       await waitFor(() => {
@@ -355,8 +414,8 @@ describe('PlaylistForm', () => {
     it('submits an item with no variables key once its last variable is removed', async () => {
       const { onSubmitMock, user } = getTestContext(playlistWithVariables());
 
-      await user.click(disclosureButtons()[0]);
-      await user.click(await screen.findByRole('button', { name: 'Remove variable host' }));
+      const editor = await openVariableEditor(user, 0);
+      await user.click(await within(editor).findByRole('button', { name: 'Remove variable host' }));
       await user.click(saveButton());
 
       await waitFor(() => {
@@ -390,11 +449,11 @@ describe('PlaylistForm', () => {
     it('rejects a variable without a name and submits the items unchanged', async () => {
       const { onSubmitMock, user } = getTestContext(playlistWithVariables());
 
-      await user.click(disclosureButtons()[0]);
-      await user.type(newVariableValues(), 'Host9');
-      await user.click(screen.getByRole('button', { name: 'Add variable' }));
+      const editor = await openVariableEditor(user, 0);
+      await user.type(newVariableValues(editor), 'Host9');
+      await user.click(addVariableButton(editor));
 
-      expect(await screen.findByText('Variable name is required')).toBeInTheDocument();
+      expect(await within(editor).findByText('Variable name is required')).toBeInTheDocument();
 
       await user.click(saveButton());
       await waitFor(() => {
@@ -421,8 +480,8 @@ describe('PlaylistForm', () => {
     it('collapses every editor and leaves each remaining item its own variables when a row is deleted', async () => {
       const { onSubmitMock, user } = getTestContext(playlistWithVariables());
 
-      await user.click(disclosureButtons()[0]);
-      expect(await screen.findByRole('textbox', { name: 'Values for host' })).toHaveValue('Host1');
+      const editor = await openVariableEditor(user, 0);
+      expect(await within(editor).findByRole('textbox', { name: 'Values for host' })).toHaveValue('Host1');
       expect(disclosureStates()).toEqual(['true', 'false']);
 
       await user.click(within(rows()[1]).getByRole('button', { name: /delete playlist item/i }));
@@ -519,9 +578,12 @@ describe('PlaylistForm', () => {
       const { onSubmitMock, user, playlist } = getTestContext(playlistWithVariables());
 
       await addVariable(user, 0, 'cluster', 'eu-west');
-      await user.click(disclosureButtons()[0]);
-      await user.click(disclosureButtons()[1]);
-      await user.click(await screen.findByRole('button', { name: 'Remove variable host' }));
+      // The first row is collapsed again so the case also covers a commit surviving a closed
+      // editor, and the removal below goes through the second row's own panel — both rows carry a
+      // `host` variable, so an unscoped remove could take the first row's instead.
+      await user.click(rowDisclosure(0));
+      const secondEditor = await openVariableEditor(user, 1);
+      await user.click(await within(secondEditor).findByRole('button', { name: 'Remove variable host' }));
       await user.click(saveButton());
 
       await waitFor(() => {

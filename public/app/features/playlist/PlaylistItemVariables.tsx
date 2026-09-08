@@ -18,6 +18,9 @@ interface Props {
   onChange: (next?: Record<string, string[]>) => void;
 }
 
+/** The two inputs a row is made of, used to attach an error and a keystroke to one of them. */
+type RowField = 'name' | 'values';
+
 /** The text a row currently shows, before it is normalized and committed. */
 interface RowDraft {
   name: string;
@@ -26,11 +29,25 @@ interface RowDraft {
 
 /** A validation message plus the input it belongs to, so it renders under the offending input. */
 interface RowError {
-  field: 'name' | 'values';
+  field: RowField;
   message: string;
 }
 
+/**
+ * The uncommitted text and validation messages of the existing rows, keyed by the committed
+ * variable name each row was opened on.
+ *
+ * A variable name is arbitrary user text, so `toString`, `constructor` and `__proto__` are as
+ * valid as `host`. Maps rather than objects keep those names as data: an object would answer a
+ * lookup for them with a member of `Object.prototype`, which is neither a draft nor `undefined`.
+ */
+interface RowState {
+  drafts: Map<string, RowDraft>;
+  errors: Map<string, RowError>;
+}
+
 const EMPTY_DRAFT: RowDraft = { name: '', values: '' };
+const EMPTY_ROW_STATE: RowState = { drafts: new Map(), errors: new Map() };
 
 /**
  * Splits the comma-separated values input into the list stored on the playlist item.
@@ -47,6 +64,41 @@ function parseValues(raw: string): string[] {
     .filter(Boolean);
 }
 
+/** The text an untouched row shows: its committed name, and its values as the user would type them. */
+function draftFor(name: string, values: string[]): RowDraft {
+  return { name, values: values.join(', ') };
+}
+
+function withoutRow<T>(rows: Map<string, T>, name: string): Map<string, T> {
+  const next = new Map(rows);
+  next.delete(name);
+  return next;
+}
+
+/**
+ * Drops the pending state of rows the item no longer holds, and keeps every other row's.
+ *
+ * A rename, a removal, or an update arriving from the parent leaves keys behind that no longer
+ * identify a row, and re-attaching one to another variable would show one row's text under
+ * another name. Rows that are still committed are left exactly as they are, so text being typed
+ * into one row survives a change to an unrelated one. The state object is returned unchanged when
+ * nothing is stale, which is what stops the reconciliation below from looping.
+ */
+function reconcileRows(state: RowState, committed: Map<string, string[]>): RowState {
+  const isStale = (name: string) => !committed.has(name);
+  const staleDrafts = Array.from(state.drafts.keys()).filter(isStale);
+  const staleErrors = Array.from(state.errors.keys()).filter(isStale);
+  if (staleDrafts.length === 0 && staleErrors.length === 0) {
+    return state;
+  }
+
+  const drafts = new Map(state.drafts);
+  const errors = new Map(state.errors);
+  staleDrafts.forEach((name) => drafts.delete(name));
+  staleErrors.forEach((name) => errors.delete(name));
+  return { drafts, errors };
+}
+
 /**
  * Edits the template variable values of one `dashboard_by_uid` playlist item.
  *
@@ -60,22 +112,18 @@ export const PlaylistItemVariables = ({ variables, onChange }: Props) => {
   const newValuesId = useId();
 
   const entries = Object.entries(variables ?? {});
-  const committedNames = entries.map(([name]) => name);
-  const nameSignature = committedNames.join('\u0000');
+  const committed = new Map(entries);
+  const committedNames = Array.from(committed.keys());
 
-  const [drafts, setDrafts] = useState<Record<string, RowDraft>>({});
-  const [errors, setErrors] = useState<Record<string, RowError>>({});
+  const [rowState, setRowState] = useState<RowState>(EMPTY_ROW_STATE);
   const [newDraft, setNewDraft] = useState<RowDraft>(EMPTY_DRAFT);
   const [newError, setNewError] = useState<RowError | undefined>(undefined);
-  const [syncedNames, setSyncedNames] = useState(nameSignature);
 
-  // Drafts and errors are keyed by the committed variable name the row was opened on. Once that set
-  // of names changes — a rename, a removal, or an update from the parent — those keys no longer
-  // identify the same rows, so pending state is dropped instead of re-attaching to another variable.
-  if (syncedNames !== nameSignature) {
-    setSyncedNames(nameSignature);
-    setDrafts({});
-    setErrors({});
+  // Reconciling against the committed names as they arrive, rather than in an effect, means the
+  // rows below already read the reconciled state; the write only carries it into the next render.
+  const { drafts, errors } = reconcileRows(rowState, committed);
+  if (rowState.drafts !== drafts) {
+    setRowState({ drafts, errors });
   }
 
   const validate = (name: string, values: string[], otherNames: string[]): RowError | undefined => {
@@ -100,21 +148,33 @@ export const PlaylistItemVariables = ({ variables, onChange }: Props) => {
     return undefined;
   };
 
-  const updateDraft = (name: string, draft: RowDraft) => {
-    setDrafts((previous) => ({ ...previous, [name]: draft }));
-    // Typing is how the user fixes a rejected row, so the message must not linger over new input.
-    setErrors((previous) => {
-      if (!previous[name]) {
+  const updateDraft = (name: string, field: RowField, value: string) => {
+    setRowState((previous) => {
+      const draft = previous.drafts.get(name) ?? draftFor(name, committed.get(name) ?? []);
+      const drafts = new Map(previous.drafts).set(
+        name,
+        field === 'name' ? { ...draft, name: value } : { ...draft, values: value }
+      );
+      // Typing is how the user fixes a rejected row, so the message must not linger over new
+      // input — but only over the input it belongs to. An error on the other field of the row is
+      // still unresolved, and hiding it would report the row as fixed when it is not.
+      const errors = previous.errors.get(name)?.field === field ? withoutRow(previous.errors, name) : previous.errors;
+      return { drafts, errors };
+    });
+  };
+
+  /** Returns a row to its committed text by dropping its draft and its error, and nothing else. */
+  const clearRow = (name: string) => {
+    setRowState((previous) => {
+      if (!previous.drafts.has(name) && !previous.errors.has(name)) {
         return previous;
       }
-      const next = { ...previous };
-      delete next[name];
-      return next;
+      return { drafts: withoutRow(previous.drafts, name), errors: withoutRow(previous.errors, name) };
     });
   };
 
   const commitRow = (name: string) => {
-    const draft = drafts[name];
+    const draft = drafts.get(name);
     if (!draft) {
       // Blur also fires when a row is merely focused, so an untouched row has nothing to commit.
       return;
@@ -129,20 +189,32 @@ export const PlaylistItemVariables = ({ variables, onChange }: Props) => {
       committedNames.filter((other) => other !== name)
     );
     if (error) {
-      setErrors((previous) => ({ ...previous, [name]: error }));
+      setRowState((previous) => ({ ...previous, errors: new Map(previous.errors).set(name, error) }));
       return;
     }
 
-    const next: Record<string, string[]> = {};
-    for (const [committedName, committedValues] of entries) {
-      if (committedName === name) {
-        // Replacing the key in place keeps a renamed variable at its position in the list.
-        next[nextName] = nextValues;
-      } else {
-        next[committedName] = committedValues;
-      }
+    // An edit is committed once. Dropping the draft here leaves a second blur, or Enter pressed
+    // again, with nothing to commit, and returns the inputs to the values the item now holds
+    // rather than the text they were typed with. Only this row is dropped, so a neighbouring row
+    // keeps whatever is half-typed in it.
+    clearRow(name);
+
+    const next = new Map<string, string[]>();
+    for (const [committedName, committedValues] of committed) {
+      // Replacing the key in place keeps a renamed variable at its position in the list.
+      next.set(
+        committedName === name ? nextName : committedName,
+        committedName === name ? nextValues : committedValues
+      );
     }
-    onChange(next);
+    onChange(Object.fromEntries(next));
+  };
+
+  const updateNewDraft = (field: RowField, value: string) => {
+    setNewDraft((previous) => (field === 'name' ? { ...previous, name: value } : { ...previous, values: value }));
+    // Field-scoped for the same reason as the existing rows: a missing name is still missing while
+    // the values are being retyped.
+    setNewError((previous) => (previous?.field === field ? undefined : previous));
   };
 
   const commitNewRow = () => {
@@ -156,13 +228,18 @@ export const PlaylistItemVariables = ({ variables, onChange }: Props) => {
 
     setNewError(undefined);
     setNewDraft(EMPTY_DRAFT);
-    onChange({ ...variables, [name]: values });
+    // Building the map through Object.fromEntries defines every name as an own property of the
+    // result. Assigning one would let a variable named `__proto__` rewrite the map's prototype
+    // instead of appearing in it, losing the variable the user just added.
+    onChange(Object.fromEntries(new Map(entries).set(name, values)));
   };
 
   const removeRow = (name: string) => {
-    const next = Object.fromEntries(entries.filter(([committedName]) => committedName !== name));
+    clearRow(name);
+    const next = new Map(entries);
+    next.delete(name);
     // The playlist item stores "no variables" as an absent map rather than an empty one.
-    onChange(Object.keys(next).length > 0 ? next : undefined);
+    onChange(next.size > 0 ? Object.fromEntries(next) : undefined);
   };
 
   const handleKeyDown = (event: KeyboardEvent<HTMLInputElement>, commit: () => void) => {
@@ -182,12 +259,13 @@ export const PlaylistItemVariables = ({ variables, onChange }: Props) => {
           the add row, whose third cell is empty because it has no remove button. */}
       <div className={styles.grid}>
         {entries.map(([name, values]) => {
-          const draft = drafts[name] ?? { name, values: values.join(', ') };
-          const error = errors[name];
+          const draft = drafts.get(name) ?? draftFor(name, values);
+          const error = errors.get(name);
           return (
             <Fragment key={name}>
               <Field
                 noMargin
+                className={styles.nameCell}
                 invalid={error?.field === 'name'}
                 error={error?.field === 'name' ? error.message : undefined}
               >
@@ -197,7 +275,7 @@ export const PlaylistItemVariables = ({ variables, onChange }: Props) => {
                     variableName: name,
                   })}
                   placeholder={t('playlist-edit.form.variables-name-placeholder', 'Variable name')}
-                  onChange={(event) => updateDraft(name, { ...draft, name: event.currentTarget.value })}
+                  onChange={(event) => updateDraft(name, 'name', event.currentTarget.value)}
                   onBlur={() => commitRow(name)}
                   onKeyDown={(event) => handleKeyDown(event, () => commitRow(name))}
                 />
@@ -213,7 +291,7 @@ export const PlaylistItemVariables = ({ variables, onChange }: Props) => {
                     variableName: name,
                   })}
                   placeholder={t('playlist-edit.form.variables-values-placeholder', 'Values, comma-separated')}
-                  onChange={(event) => updateDraft(name, { ...draft, values: event.currentTarget.value })}
+                  onChange={(event) => updateDraft(name, 'values', event.currentTarget.value)}
                   onBlur={() => commitRow(name)}
                   onKeyDown={(event) => handleKeyDown(event, () => commitRow(name))}
                 />
@@ -234,6 +312,7 @@ export const PlaylistItemVariables = ({ variables, onChange }: Props) => {
 
         <Field
           noMargin
+          className={styles.nameCell}
           label={t('playlist-edit.form.variables-new-name-label', 'Variable name')}
           invalid={newError?.field === 'name'}
           error={newError?.field === 'name' ? newError.message : undefined}
@@ -242,10 +321,7 @@ export const PlaylistItemVariables = ({ variables, onChange }: Props) => {
             id={newNameId}
             value={newDraft.name}
             placeholder={t('playlist-edit.form.variables-name-placeholder', 'Variable name')}
-            onChange={(event) => {
-              setNewDraft({ ...newDraft, name: event.currentTarget.value });
-              setNewError(undefined);
-            }}
+            onChange={(event) => updateNewDraft('name', event.currentTarget.value)}
             onKeyDown={(event) => handleKeyDown(event, commitNewRow)}
           />
         </Field>
@@ -259,10 +335,7 @@ export const PlaylistItemVariables = ({ variables, onChange }: Props) => {
             id={newValuesId}
             value={newDraft.values}
             placeholder={t('playlist-edit.form.variables-values-placeholder', 'Values, comma-separated')}
-            onChange={(event) => {
-              setNewDraft({ ...newDraft, values: event.currentTarget.value });
-              setNewError(undefined);
-            }}
+            onChange={(event) => updateNewDraft('values', event.currentTarget.value)}
             onKeyDown={(event) => handleKeyDown(event, commitNewRow)}
           />
         </Field>
@@ -287,10 +360,29 @@ function getStyles(theme: GrafanaTheme2) {
     }),
     grid: css({
       display: 'grid',
-      // Two equal input columns and one column sized to the remove button.
-      gridTemplateColumns: '1fr 1fr auto',
+      // Two equal input columns and one column sized to the remove button. The tracks are
+      // minmax(0, …) and the items and their inputs are given a zero minimum because a grid item,
+      // and every flex item inside Input, is otherwise floored at the text field's intrinsic
+      // width — two of those plus the remove button overflow this already indented panel.
+      gridTemplateColumns: 'minmax(0, 1fr) minmax(0, 1fr) auto',
       gap: theme.spacing(1),
       alignItems: 'start',
+      '> *': {
+        minWidth: 0,
+      },
+      input: {
+        minWidth: 0,
+      },
+      [theme.breakpoints.down('sm')]: {
+        // Narrower than this, two inputs beside each other leave neither of them typable, so the
+        // name takes a line of its own and the values keep the width next to the remove button.
+        gridTemplateColumns: 'minmax(0, 1fr) auto',
+      },
+    }),
+    nameCell: css({
+      [theme.breakpoints.down('sm')]: {
+        gridColumn: '1 / -1',
+      },
     }),
     remove: css({
       // Lines the button up with the input beside it rather than the top of the cell.

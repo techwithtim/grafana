@@ -36,7 +36,7 @@ This API complies with the new Grafana API structure. To learn more refer to doc
 
 Lists all playlists in the specified namespace.
 
-- `namespace`: To learn more about which namespace to use, refer to the [API overview](https://grafana.com/docs/grafana/<GRAFANA_VERSION>/developers/http_api/apis/).
+- `namespace`: To learn more about which namespace to use, refer to the [API overview](https://grafana.com/docs/grafana/<GRAFANA_VERSION>/developer-resources/api-reference/http-api/apis/).
 
 **Example Request**:
 
@@ -95,7 +95,7 @@ Content-Type: application/json
 
 Retrieves a specific playlist by name.
 
-- `namespace`: To learn more about which namespace to use, refer to the [API overview](https://grafana.com/docs/grafana/<GRAFANA_VERSION>/developers/http_api/apis/).
+- `namespace`: To learn more about which namespace to use, refer to the [API overview](https://grafana.com/docs/grafana/<GRAFANA_VERSION>/developer-resources/api-reference/http-api/apis/).
 - `name`: The UID of the playlist.
 
 **Example Request**:
@@ -144,7 +144,7 @@ Content-Type: application/json
 
 Creates a new playlist.
 
-- `namespace`: To learn more about which namespace to use, refer to the [API overview](https://grafana.com/docs/grafana/<GRAFANA_VERSION>/developers/http_api/apis/).
+- `namespace`: To learn more about which namespace to use, refer to the [API overview](https://grafana.com/docs/grafana/<GRAFANA_VERSION>/developer-resources/api-reference/http-api/apis/).
 
 **Example Request**:
 
@@ -215,7 +215,7 @@ Content-Type: application/json
 
 Updates an existing playlist. The entire playlist spec must be provided.
 
-- `namespace`: To learn more about which namespace to use, refer to the [API overview](https://grafana.com/docs/grafana/<GRAFANA_VERSION>/developers/http_api/apis/).
+- `namespace`: To learn more about which namespace to use, refer to the [API overview](https://grafana.com/docs/grafana/<GRAFANA_VERSION>/developer-resources/api-reference/http-api/apis/).
 - `name`: The UID of the playlist.
 
 **Example Request**:
@@ -297,7 +297,7 @@ Content-Type: application/json
 
 Deletes a playlist.
 
-- `namespace`: To learn more about which namespace to use, refer to the [API overview](https://grafana.com/docs/grafana/<GRAFANA_VERSION>/developers/http_api/apis/).
+- `namespace`: To learn more about which namespace to use, refer to the [API overview](https://grafana.com/docs/grafana/<GRAFANA_VERSION>/developer-resources/api-reference/http-api/apis/).
 - `name`: The UID of the playlist.
 
 **Example Request**:
@@ -331,4 +331,4 @@ Playlist items support three types:
 - `dashboard_by_tag`: Include all dashboards with a specific tag
 - `dashboard_by_id`: (Deprecated) Include a dashboard by internal ID
 
-Items of type `dashboard_by_uid` also support an optional `variables` field, which maps a template variable name to a list of one or more values that Grafana applies when the playlist reaches that item. Omit the field to leave the item's behavior unchanged, list several values under one name for a multi-value variable, and add the same dashboard UID more than once with a different set of variables to rotate one dashboard through each set.
+Items of type `dashboard_by_uid` also support an optional `variables` field, which maps a template variable name to a list of one or more string values that Grafana applies when the playlist reaches that item. Omit the field to leave the item's behavior unchanged, list several values under one name for a multi-value variable, and add the same dashboard UID more than once with a different set of variables to rotate one dashboard through each set.

@@ -4,6 +4,7 @@ import userEvent, { type UserEvent } from '@testing-library/user-event';
 import { type ReactNode } from 'react';
 
 import { PlaylistTable } from './PlaylistTable';
+import { PlaylistTableRows } from './PlaylistTableRows';
 import { type PlaylistItemUI } from './types';
 
 /** The loaded-dashboard shape a row renders, taken from the playlist item type itself. */
@@ -69,12 +70,12 @@ jest.mock('@hello-pangea/dnd', () => {
   };
 });
 
-function hostDashboard(): LoadedDashboard {
+function loadedDashboard(uid: string, name: string): LoadedDashboard {
   return {
     kind: 'dashboard',
-    name: 'Host dashboard',
-    uid: 'uid_1',
-    url: '/d/uid_1/host-dashboard',
+    name,
+    uid,
+    url: `/d/${uid}`,
     panel_type: '',
     tags: [],
     location: 'General',
@@ -85,14 +86,30 @@ function hostDashboard(): LoadedDashboard {
 }
 
 /**
- * The same dashboard twice with different variables. Rows are addressed by position, so this is the
- * arrangement in which an editor left open across a move or a deletion would re-attach to the other
- * item. `dashboards` is filled in because a row without it renders a spinner instead of its name.
+ * The same dashboard by UID twice with different variables, then a tag row and a deprecated
+ * dashboard_by_id row. The duplicate UID is deliberate: rows are addressed by position, so this is
+ * the arrangement in which an editor left open across a move or a deletion would re-attach to the
+ * other item. The two non-UID rows are the negative case for the UID-only variables gate.
+ * `dashboards` is filled in on every row because a row without it renders a spinner instead of its
+ * name; the fixtures are inline because this suite never calls `loadDashboards`, which rejects
+ * dashboard_by_id items outright.
  */
 function playlistItems(): PlaylistItemUI[] {
   return [
-    { type: 'dashboard_by_uid', value: 'uid_1', variables: { host: ['Host1'] }, dashboards: [hostDashboard()] },
-    { type: 'dashboard_by_uid', value: 'uid_1', variables: { cluster: ['eu-west'] }, dashboards: [hostDashboard()] },
+    {
+      type: 'dashboard_by_uid',
+      value: 'uid_1',
+      variables: { host: ['Host1'] },
+      dashboards: [loadedDashboard('uid_1', 'Host dashboard')],
+    },
+    {
+      type: 'dashboard_by_uid',
+      value: 'uid_1',
+      variables: { cluster: ['eu-west'] },
+      dashboards: [loadedDashboard('uid_1', 'Host dashboard')],
+    },
+    { type: 'dashboard_by_tag', value: 'graph-ng', dashboards: [loadedDashboard('uid_2', 'Tagged dashboard')] },
+    { type: 'dashboard_by_id', value: '3', dashboards: [loadedDashboard('uid_3', 'Legacy dashboard')] },
   ];
 }
 
@@ -140,16 +157,35 @@ function disclosureStates() {
   return disclosureButtons().map((button) => button.getAttribute('aria-expanded'));
 }
 
-/**
- * Opens the first row's editor and proves it is genuinely open, because collapsing is only
- * observable from an expanded row. `host` belongs to the first item and `cluster` to the second, so
- * the editor on screen also identifies the row the disclosure opened.
- */
-async function expectFirstRowEditorOpen(user: UserEvent) {
-  await user.click(disclosureButtons()[0]);
+/** The `aria-controls` value of every row's variable editor disclosure, in row order. */
+function disclosureControls() {
+  return disclosureButtons().map((button) => button.getAttribute('aria-controls'));
+}
 
-  expect(await screen.findByRole('textbox', { name: 'Variable name for host' })).toBeInTheDocument();
-  expect(disclosureStates()).toEqual(['true', 'false']);
+/** Every open variables panel, whichever row it belongs to, so panels can be counted per row type. */
+function variablesPanels() {
+  return screen.queryAllByRole('region');
+}
+
+/**
+ * The open panels of the two `uid_1` rows, in DOM order. Both rows hold the same dashboard UID, so
+ * the panel name is the same for both and only their position and id tell them apart.
+ */
+function uidVariablesPanels() {
+  return screen.getAllByRole('region', { name: 'Template variables for uid_1' });
+}
+
+/**
+ * Opens the editor of both `dashboard_by_uid` rows and proves both are genuinely open. Collapsing is
+ * only observable from an expanded row, and only an expanded set holding more than one row tells a
+ * full clear apart from an implementation that drops the first row's entry alone.
+ */
+async function expandBothUidRows(user: UserEvent) {
+  await user.click(disclosureButtons()[0]);
+  await user.click(disclosureButtons()[1]);
+
+  expect(disclosureStates()).toEqual(['true', 'true']);
+  expect(variablesPanels()).toHaveLength(2);
 }
 
 function dropResult(sourceIndex: number, destinationIndex: number | null): DropResult {
@@ -185,9 +221,63 @@ describe('PlaylistTable', () => {
     jest.clearAllMocks();
   });
 
-  it('moves the item and collapses the open variable editor when a drag ends on a new position', async () => {
+  it('offers a variable editor on the two dashboard_by_uid rows and on neither the tag nor the id row', async () => {
+    const { user } = renderTable();
+
+    expect(screen.getAllByRole('row')).toHaveLength(4);
+    expect(screen.getByRole('cell', { name: 'Playlist item, dashboard_by_tag, graph-ng' })).toBeInTheDocument();
+    expect(screen.getByRole('cell', { name: 'Playlist item, dashboard_by_id, 3' })).toBeInTheDocument();
+    expect(disclosureButtons()).toHaveLength(2);
+    expect(variablesPanels()).toHaveLength(0);
+
+    await expandBothUidRows(user);
+
+    // Both open panels belong to the UID rows, so neither non-UID row gained one: the tag and id
+    // rows would name their panel after their own value, not after the duplicated UID.
+    expect(uidVariablesPanels()).toHaveLength(2);
+    expect(screen.queryByRole('region', { name: 'Template variables for graph-ng' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('region', { name: 'Template variables for 3' })).not.toBeInTheDocument();
+  });
+
+  it('closes an open variable editor when its own disclosure is clicked a second time', async () => {
+    const { user } = renderTable();
+
+    await user.click(disclosureButtons()[0]);
+
+    // `host` belongs to the first item and `cluster` to the second, so the editor on screen also
+    // identifies the row the disclosure opened.
+    expect(await screen.findByRole('textbox', { name: 'Variable name for host' })).toBeInTheDocument();
+    expect(disclosureStates()).toEqual(['true', 'false']);
+    expect(variablesPanels()).toHaveLength(1);
+
+    await user.click(disclosureButtons()[0]);
+
+    expect(disclosureStates()).toEqual(['false', 'false']);
+    expect(screen.queryByRole('region', { name: 'Template variables for uid_1' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('textbox', { name: 'Variable name for host' })).not.toBeInTheDocument();
+  });
+
+  it('points every open disclosure at the id of its own variables panel', async () => {
+    const { user } = renderTable();
+
+    await user.click(disclosureButtons()[0]);
+
+    const [firstPanelId] = disclosureControls();
+    expect(firstPanelId).toEqual(expect.stringMatching(/\S/));
+    expect(uidVariablesPanels().map((panel) => panel.getAttribute('id'))).toEqual([firstPanelId]);
+
+    await user.click(disclosureButtons()[1]);
+
+    // Both rows carry the same dashboard UID, so only distinct ids matched to the panels in DOM
+    // order show that each row derives its own panel id rather than sharing one.
+    const panelIds = disclosureControls();
+    expect(panelIds[0]).not.toEqual(panelIds[1]);
+    expect(uidVariablesPanels().map((panel) => panel.getAttribute('id'))).toEqual(panelIds);
+  });
+
+  it('moves the item and collapses both open variable editors when a drag ends on a new position', async () => {
     const { user, moveItem } = renderTable();
-    await expectFirstRowEditorOpen(user);
+    await expandBothUidRows(user);
 
     await endDrag(dropResult(0, 1));
 
@@ -196,19 +286,23 @@ describe('PlaylistTable', () => {
     await waitFor(() => {
       expect(disclosureStates()).toEqual(['false', 'false']);
     });
+    expect(variablesPanels()).toHaveLength(0);
   });
 
-  it('deletes the clicked item and collapses the variable editor open on another row', async () => {
+  it('deletes the clicked tag row and collapses both variable editors open on other rows', async () => {
     const { user, deleteItem } = renderTable();
-    await expectFirstRowEditorOpen(user);
+    await expandBothUidRows(user);
 
-    await user.click(deleteButtons()[1]);
+    // The tag row never had an editor of its own, so collapsing after its deletion is what shows
+    // the collapse is unconditional rather than a side effect of removing the deleted row's entry.
+    await user.click(deleteButtons()[2]);
 
-    expect(deleteItem).toHaveBeenCalledWith(1);
+    expect(deleteItem).toHaveBeenCalledWith(2);
     expect(deleteItem).toHaveBeenCalledTimes(1);
     await waitFor(() => {
       expect(disclosureStates()).toEqual(['false', 'false']);
     });
+    expect(variablesPanels()).toHaveLength(0);
   });
 
   it('does not move the item when a drag is cancelled without a destination', async () => {
@@ -217,5 +311,30 @@ describe('PlaylistTable', () => {
     await endDrag(dropResult(0, null));
 
     expect(moveItem).not.toHaveBeenCalled();
+  });
+});
+
+describe('PlaylistTableRows', () => {
+  // The table only ever expands a row whose own disclosure was clicked, and the tag and deprecated
+  // dashboard_by_id rows have none, so their index cannot enter the table's expanded set at all.
+  // The rows are therefore rendered directly with every index expanded, which is the only way to
+  // hold the panel to its own dashboard_by_uid gate instead of inferring it from the disclosure's.
+  // The stubbed `Draggable` above is what lets them render outside a real `DragDropContext`.
+  it('renders a variables panel on the dashboard_by_uid rows only, even with every row index expanded', () => {
+    render(
+      <PlaylistTableRows
+        items={playlistItems()}
+        onDelete={jest.fn()}
+        expanded={new Set([0, 1, 2, 3])}
+        onToggleExpanded={jest.fn()}
+        onVariablesChange={jest.fn()}
+      />
+    );
+
+    expect(disclosureStates()).toEqual(['true', 'true']);
+    expect(uidVariablesPanels()).toHaveLength(2);
+    expect(variablesPanels()).toHaveLength(2);
+    expect(screen.queryByRole('region', { name: 'Template variables for graph-ng' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('region', { name: 'Template variables for 3' })).not.toBeInTheDocument();
   });
 });

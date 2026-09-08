@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -537,12 +538,26 @@ func doPlaylistTests(t *testing.T, helper *apis.K8sTestHelper) *apis.K8sTestHelp
 			Path:   "/api/playlists",
 			Body:   []byte(legacyPayload),
 		}, &playlist.Playlist{})
+		// Registered before the assertions below, not after them: those assertions are fatal,
+		// so a create that succeeded on the server but answered with an unexpected body would
+		// otherwise abort the sub-test with the object still in unified storage, breaking the
+		// org-scoped List assertions in the sibling sub-tests. The closure reads the response
+		// only when it runs, so it needs no uid derived by a fatal assertion and does nothing
+		// when no object was created.
+		t.Cleanup(func() {
+			if legacyCreate.Result == nil || legacyCreate.Result.UID == "" {
+				return
+			}
+			err := client.Resource.Delete(context.Background(), legacyCreate.Result.UID, metav1.DeleteOptions{})
+			// An already-absent object is the expected outcome when the sub-test failed before
+			// or during creation; anything else left the fixture behind and must be visible.
+			if err != nil && !apierrors.IsNotFound(err) {
+				t.Errorf("failed to clean up playlist %s: %v", legacyCreate.Result.UID, err)
+			}
+		})
 		require.Equal(t, 200, legacyCreate.Response.StatusCode)
 		require.NotNil(t, legacyCreate.Result)
 		uid := legacyCreate.Result.UID
-		t.Cleanup(func() {
-			_ = client.Resource.Delete(context.Background(), uid, metav1.DeleteOptions{})
-		})
 		require.NotEmpty(t, uid)
 
 		// Map keys are serialized in sorted order, hence cluster before host.

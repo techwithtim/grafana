@@ -10,15 +10,17 @@ import (
 )
 
 func LegacyUpdateCommandToUnstructured(cmd UpdatePlaylistCommand) unstructured.Unstructured {
-	items := make([]map[string]any, 0, len(cmd.Items))
+	// Unstructured content must only hold JSON-compatible values: apimachinery walks it with
+	// runtime.DeepCopyJSONValue, which understands []any and map[string]any and panics on any
+	// other container -- a []map[string]any item list included. Both the item list and the
+	// typed map of string slices inside it are therefore converted all the way down.
+	items := make([]any, 0, len(cmd.Items))
 	for _, item := range cmd.Items {
 		entry := map[string]any{
 			"type":  item.Type,
 			"value": item.Value,
 		}
 		if len(item.Variables) > 0 {
-			// Unstructured content must only hold JSON-compatible values, so the typed
-			// map of string slices is converted all the way down to []any of string.
 			variables := make(map[string]any, len(item.Variables))
 			for name, values := range item.Variables {
 				encoded := make([]any, 0, len(values))

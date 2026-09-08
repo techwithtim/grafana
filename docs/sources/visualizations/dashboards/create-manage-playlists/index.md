@@ -93,10 +93,10 @@ You can create a playlist to present dashboards in a sequence, with a set order 
 
 1. To apply template variable values to a dashboard you added by title, click **Template variables** next to the dashboard name, then enter a variable name and its values.
 
-   Enter a variable in the **Variable name** and **Values (comma-separated)** fields, then click **Add variable**. Click the **X** next to a variable to remove it. Dashboards added by tag don't support template variables. Because Grafana separates values on commas, you can't enter a single value that itself contains a comma, although the API accepts one.
-   - **Values**: Grafana separates the values you enter on commas and trims the surrounding spaces.
-   - **Validation**: Grafana rejects an empty name or an empty value and shows an inline message.
-   - **Unique names**: You can use each variable name only once for a dashboard.
+   Enter a variable in the **Variable name** and **Values (comma-separated)** fields, then click **Add variable**. Click the **X** next to a variable to remove it. Dashboards added by tag don't support template variables. You can't enter a single value that contains a comma in the editor, although the API accepts one.
+   - **Values**: Grafana separates the values you enter on commas, trims the surrounding spaces, and ignores blank entries, so `x, , y` becomes the two values `x` and `y`.
+   - **Validation**: Grafana rejects an empty name or a values field with no non-empty entries, shows an inline message under that field, and leaves the dashboard row unchanged.
+   - **Unique names**: Grafana rejects a variable name that another variable on the same dashboard row already uses. You can use that name again on another row, including a second row for the same dashboard.
    - **Rename**: When you rename a variable, its values move to the new name.
    - **Enter key**: Press the `Enter` key to commit a variable row without saving the playlist.
    - **Removal**: When you remove the last variable, the dashboard row returns to its plain state.

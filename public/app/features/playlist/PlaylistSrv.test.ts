@@ -94,9 +94,13 @@ function playlistWithItems(items: PlaylistSpec['items']): Playlist {
 
 // The MemoryHistory that records the visited URLs is not part of the locationService interface, so the
 // cast reaching it lives here only, rather than being repeated in every case that reads a pushed URL.
-function getLastHistoryEntry(): Location {
+function getHistoryEntries(): Location[] {
   const history = locationService.getHistory();
-  const entries = (history as unknown as { base: { entries: Location[] } }).base.entries;
+  return (history as unknown as { base: { entries: Location[] } }).base.entries;
+}
+
+function getLastHistoryEntry(): Location {
+  const entries = getHistoryEntries();
   return entries[entries.length - 1];
 }
 
@@ -118,6 +122,7 @@ describe('PlaylistSrv', () => {
 
   afterEach(() => {
     unmockLocation();
+    jest.restoreAllMocks();
   });
 
   it('runs all dashboards in cycle and reloads page after 3 cycles', async () => {
@@ -271,6 +276,14 @@ describe('PlaylistSrv', () => {
   });
 
   it('pushes a distinct URL and keeps playing for a second item on the same dashboard with different variables', async () => {
+    // A second replace() would overwrite the current entry with a new location object carrying the
+    // second item's URL, so the latest entry alone cannot tell a pushed record from an overwritten
+    // one. The stack depth, the adjacent pair and the spied navigation methods can: replace() leaves
+    // the entry count unchanged, push() adds one. The spies are created here, after beforeEach has
+    // navigated to the playlist page, so the push count is still zero when the playlist starts.
+    const replaceSpy = jest.spyOn(locationService, 'replace');
+    const pushSpy = jest.spyOn(locationService, 'push');
+
     await srv.start(
       playlistWithItems([
         { type: 'dashboard_by_uid', value: 'aaa', variables: { host: ['one'] } },
@@ -278,15 +291,25 @@ describe('PlaylistSrv', () => {
       ])
     );
 
+    const entryCountAfterStart = getHistoryEntries().length;
     const first = getLastHistoryEntry();
     expect(first.pathname).toBe('/url/to/aaa');
     expect(first.search).toBe('?var-host=one');
+    expect(replaceSpy).toHaveBeenCalledTimes(1);
+    expect(replaceSpy).toHaveBeenCalledWith('/url/to/aaa?var-host=one');
+    expect(pushSpy).toHaveBeenCalledTimes(0);
 
     srv.next();
 
-    const second = getLastHistoryEntry();
-    expect(second.pathname).toBe('/url/to/aaa');
-    expect(second.search).toBe('?var-host=two');
+    const entries = getHistoryEntries();
+    expect(entries).toHaveLength(entryCountAfterStart + 1);
+    expect(entries[entries.length - 2].pathname).toBe('/url/to/aaa');
+    expect(entries[entries.length - 2].search).toBe('?var-host=one');
+    expect(entries[entries.length - 1].pathname).toBe('/url/to/aaa');
+    expect(entries[entries.length - 1].search).toBe('?var-host=two');
+    expect(pushSpy).toHaveBeenCalledTimes(1);
+    expect(pushSpy).toHaveBeenCalledWith('/url/to/aaa?var-host=two');
+    expect(replaceSpy).toHaveBeenCalledTimes(1);
     expect(srv.state.isPlaying).toBe(true);
   });
 
