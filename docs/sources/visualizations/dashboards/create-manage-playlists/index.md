@@ -116,11 +116,11 @@ You can edit a playlist including adding, removing, and rearranging the order of
 1. Click **Dashboards** in the main menu.
 1. Click **Playlists**.
 1. Find the playlist you want to update and click **Edit playlist**. Do one or more of the following:
-   - Edit - Update the name and time interval.
-   - Add dashboards - Search for dashboards by title or tag to add them to the playlist.
-   - Rearrange dashboards - Click and drag the dashboards into your desired order.
-   - Remove dashboards - Click the **X** next to the name of the dashboard you want to remove from the playlist.
-   - Template variables - Click **Template variables** next to a dashboard added by title to add, change, or remove its variable values.
+   - **Edit**: Update the name and time interval.
+   - **Add dashboards**: Search for dashboards by title or tag to add them to the playlist.
+   - **Rearrange dashboards**: Click and drag the dashboards into your desired order.
+   - **Remove dashboards**: Click the **X** next to the name of the dashboard you want to remove from the playlist.
+   - **Template variables**: Click **Template variables** next to a dashboard added by title to add, change, or remove its variable values.
 
 1. Click **Save**.
 
