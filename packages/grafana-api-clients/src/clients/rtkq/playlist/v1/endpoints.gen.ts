@@ -481,6 +481,7 @@ export type ObjectMeta = {
   uid?: string;
 };
 export type PlaylistPlaylistItem = {
+  /** type of the item. */
   type: 'dashboard_by_tag' | 'dashboard_by_uid' | 'dashboard_by_id';
   /** Value depends on type and describes the playlist item.
      - dashboard_by_id: The value is an internal numerical identifier set by Grafana. This
@@ -492,21 +493,13 @@ export type PlaylistPlaylistItem = {
   value: string;
   /** Optional template variable values applied when this item is played (dashboard_by_uid only).
     Each key is a variable name; its value is a list of one or more values for that variable.
-    A multi-value variable is expressed by several list elements under the same key.
-    The collection is bounded, because every value is expanded into a dashboard URL and into the
-    editor's controls: an item accepts at most 32 variables, a variable name of at most 128
-    characters, and at most 64 values of at most 1024 characters each. A character means one
-    Unicode code point everywhere the limit is applied. The last two maxima are part of this
-    schema; the first two are enforced on every write, which is the only place this schema
-    language can express them. */
+    A multi-value variable is expressed by several list elements under the same key. */
   variables?: {
     [key: string]: string[];
   };
 };
 export type PlaylistSpec = {
   interval: string;
-  /** The list is bounded: every viewer that plays the playlist walks all of it, loading a
-    dashboard and pushing a history entry for each item. */
   items: PlaylistPlaylistItem[];
   title: string;
 };

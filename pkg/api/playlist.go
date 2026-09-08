@@ -138,13 +138,6 @@ type playlistK8sHandler struct {
 	clientConfigProvider grafanaapiserver.DirectRestConfigProvider
 }
 
-// maxPlaylistBodyBytes caps a write to the deprecated /api/playlists endpoints. A playlist body
-// is a title, an interval and a bounded list of items, so the largest payload the playlist
-// budget can accept fits in a small fraction of this; web.MaxBindBodyBytes, which governs every
-// legacy endpoint, is 100 MiB and lets one request decode far more tiny values than the process
-// can afford to hold while they are validated and converted.
-const maxPlaylistBodyBytes = 4 << 20
-
 //-----------------------------------------------------------------------------------------
 // Playlist k8s wrapper functions
 //-----------------------------------------------------------------------------------------
@@ -298,20 +291,12 @@ func (pk8s *playlistK8sHandler) updatePlaylist(c *contextmodel.ReqContext) {
 		return // error is already sent
 	}
 	uid := web.Params(c.Req)[":uid"]
-	// Bound the body before it is decoded, not after: the decode itself is the allocation.
-	if c.Req.Body != nil {
-		c.Req.Body = http.MaxBytesReader(nil, c.Req.Body, maxPlaylistBodyBytes)
-	}
 	cmd := playlist.UpdatePlaylistCommand{}
 	if err := web.Bind(c.Req, &cmd); err != nil {
 		c.JsonApiErr(http.StatusBadRequest, "bad request data", err)
 		return
 	}
-	obj, err := playlist.LegacyUpdateCommandToUnstructured(cmd)
-	if err != nil {
-		c.JsonApiErr(http.StatusBadRequest, "bad request data", err)
-		return
-	}
+	obj := playlist.LegacyUpdateCommandToUnstructured(cmd)
 	obj.SetName(uid)
 	existing, err := client.Get(c.Req.Context(), uid, v1.GetOptions{})
 	if err != nil {
@@ -346,20 +331,12 @@ func (pk8s *playlistK8sHandler) createPlaylist(c *contextmodel.ReqContext) {
 	if !ok {
 		return // error is already sent
 	}
-	// Bound the body before it is decoded, not after: the decode itself is the allocation.
-	if c.Req.Body != nil {
-		c.Req.Body = http.MaxBytesReader(nil, c.Req.Body, maxPlaylistBodyBytes)
-	}
 	cmd := playlist.UpdatePlaylistCommand{}
 	if err := web.Bind(c.Req, &cmd); err != nil {
 		c.JsonApiErr(http.StatusBadRequest, "bad request data", err)
 		return
 	}
-	obj, err := playlist.LegacyUpdateCommandToUnstructured(cmd)
-	if err != nil {
-		c.JsonApiErr(http.StatusBadRequest, "bad request data", err)
-		return
-	}
+	obj := playlist.LegacyUpdateCommandToUnstructured(cmd)
 	out, err := client.Create(c.Req.Context(), &obj, v1.CreateOptions{})
 	if err != nil {
 		pk8s.writeError(c, err)

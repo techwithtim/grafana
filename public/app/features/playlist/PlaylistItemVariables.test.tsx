@@ -740,6 +740,45 @@ describe('PlaylistItemVariables', () => {
     expect(onChange).not.toHaveBeenCalled();
   });
 
+  it('introduces the add row with its own caption while keeping both of its fields reachable by their labels', async () => {
+    const onChange = jest.fn();
+    const { user } = setup(<PlaylistItemVariables variables={{ host: ['a'] }} onChange={onChange} />);
+
+    // The caption is what tells the two visible labels below it apart from the committed row
+    // above, whose inputs are named by `aria-label` alone.
+    expect(screen.getByText('Add a variable')).toBeInTheDocument();
+    // It is styled as a caption rather than marked up as one: this editor renders inside the
+    // row's `role="region"` panel, so a heading here would enter the page's heading outline.
+    expect(screen.queryByRole('heading')).not.toBeInTheDocument();
+    // It names nothing: the add row's fields still resolve through their own labels, the committed
+    // row through its aria-labels, and the add button through its own text.
+    expect(newName()).toBeInTheDocument();
+    expect(newValues()).toBeInTheDocument();
+    expect(rowName('host')).toHaveValue('host');
+    expect(rowValues('host')).toHaveValue('a');
+    expect(addButton()).toBeInTheDocument();
+    expect(screen.getAllByRole('textbox')).toHaveLength(4);
+
+    // The caption is decoration, so it must not have displaced the add row's own behaviour.
+    await user.type(newName(), 'cluster');
+    await user.type(newValues(), 'c');
+    await user.click(addButton());
+
+    await waitFor(() => {
+      expect(onChange).toHaveBeenCalledWith({ host: ['a'], cluster: ['c'] });
+    });
+    expect(onChange).toHaveBeenCalledTimes(1);
+  });
+
+  it('shows the add row caption on an item that holds no variables yet', () => {
+    setup(<PlaylistItemVariables onChange={jest.fn()} />);
+
+    expect(screen.getByText('Add a variable')).toBeInTheDocument();
+    expect(newName()).toBeInTheDocument();
+    expect(newValues()).toBeInTheDocument();
+    expect(screen.getAllByRole('textbox')).toHaveLength(2);
+  });
+
   it.each(unrenderableMaps)(
     'renders one fixed message and no rows when the stored variables hold $desc',
     ({ variables }) => {

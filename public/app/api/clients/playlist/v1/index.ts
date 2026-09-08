@@ -67,10 +67,6 @@ async function migrateInternalIDs(playlist?: PlaylistSpec) {
   if (playlist?.items) {
     for (const item of playlist.items) {
       if (item.type === 'dashboard_by_id') {
-        // Template variables are a dashboard_by_uid capability, and the editor and the playlist
-        // runtime both recognise them by that type alone. A map stored on the deprecated id form
-        // would become indistinguishable from a supported one here, so migration discards it.
-        delete item.variables;
         item.type = 'dashboard_by_uid';
         const uids = await getBackendSrv().get<string[]>(`/api/dashboards/ids/${item.value}`);
         if (uids?.length) {

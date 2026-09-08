@@ -113,6 +113,26 @@ const valueOverLimit = 'v'.repeat(MAX_VARIABLE_VALUE_LENGTH + 1);
 const valuesAtLimit = Array.from({ length: MAX_VALUES_PER_VARIABLE }, (_, index) => `v${index}`);
 const valuesOverLimit = Array.from({ length: MAX_VALUES_PER_VARIABLE + 1 }, (_, index) => `v${index}`);
 
+// The total URL budget charges a pair for `var-<name>=` plus the encoded value of each of its
+// values, for the `&` joining those parameters to each other, and for the one that would join the
+// pair to whatever follows it. With the one-character name `k` and alphanumeric values, which
+// encode to themselves, that is exactly `count * ('var-k='.length + length + 1)` — so eight values
+// of this length cost the whole budget and leave room for nothing else.
+const BUDGET_PAIR_VALUE_COUNT = 8;
+const BUDGET_PAIR_VALUE_LENGTH = MAX_ENCODED_VARIABLES_LENGTH / BUDGET_PAIR_VALUE_COUNT - 'var-k='.length - 1;
+
+// Four characters per value below that, which leaves exactly 32 characters of the budget: enough
+// for the 28 a single `[object Object]` value costs as playback writes it (`var-x=`, the twenty-one
+// characters of `%5Bobject%20Object%5D`, and the joining `&`), and nowhere near the 236 the map
+// form of the serializer counts for the same value by decomposing it one character per parameter.
+const FILLER_PAIR_VALUE_LENGTH = BUDGET_PAIR_VALUE_LENGTH - 4;
+
+// Distinct values of an exact length, so what is emitted, and in which order, is asserted rather
+// than assumed. `padStart` pads with `v` and never truncates, so each value is `length` characters.
+function budgetPairValues(length: number): string[] {
+  return Array.from({ length: BUDGET_PAIR_VALUE_COUNT }, (_, index) => String(index).padStart(length, 'v'));
+}
+
 // One code point each, but not one UTF-16 code unit each: `é` is one unit and `𝄞` is two, so a
 // limit measured with `String.prototype.length` refuses strings of these that the schema, and the
 // API enforcing it, accept. Neither is one character once encoded either — `é` costs six and `𝄞`
@@ -470,6 +490,77 @@ describe('PlaylistSrv', () => {
     const { search } = getLastHistoryEntry();
     expect(varPortionOf(search).length).toBeLessThanOrEqual(MAX_ENCODED_VARIABLES_LENGTH);
     expect(Array.from(new URLSearchParams(search).keys())).toHaveLength(7);
+    expect(srv.state.isPlaying).toBe(true);
+  });
+
+  it('applies a variable whose measured cost is exactly the total budget', async () => {
+    const values = budgetPairValues(BUDGET_PAIR_VALUE_LENGTH);
+
+    await srv.start(playlistWithItems([{ type: 'dashboard_by_uid', value: 'aaa', variables: { k: values } }]));
+
+    const { search } = getLastHistoryEntry();
+    expect(new URLSearchParams(search).getAll('var-k')).toEqual(values);
+    // The pair is charged for the `&` that would join it to a next parameter, and it is the last
+    // one here, so a pair sitting exactly on the budget writes one character less than the budget.
+    expect(varPortionOf(search).length).toBe(MAX_ENCODED_VARIABLES_LENGTH - 1);
+    expect(logWarning).not.toHaveBeenCalled();
+    expect(srv.state.isPlaying).toBe(true);
+  });
+
+  it('drops a variable whose measured cost is one character past the total budget', async () => {
+    const values = budgetPairValues(BUDGET_PAIR_VALUE_LENGTH);
+    // One character more than the case above, and still well inside the per-value maximum, so the
+    // total budget is the only rule that can refuse it.
+    values[values.length - 1] += 'v';
+
+    await srv.start(
+      playlistWithItems([{ type: 'dashboard_by_uid', value: 'aaa', variables: { k: values, host: ['a'] } }])
+    );
+
+    expect(getLastHistoryEntry().search).toBe('?var-host=a');
+    expect(logWarning).toHaveBeenCalledTimes(1);
+    expect(logWarning).toHaveBeenCalledWith(expect.any(String), {
+      appliedVariables: '1',
+      droppedVariables: '1',
+      variablesLeftUninspected: 'false',
+    });
+    expect(srv.state.isPlaying).toBe(true);
+  });
+
+  it('applies a single "[object Object]" value that fits the budget left over, costing what it is written as', async () => {
+    // Only a budget measured in the form playback emits admits this: the map form of the serializer
+    // decomposes the value into one parameter per character and charges 236 characters for the 28
+    // it writes, which is more than the filler leaves and would drop a pair that fits.
+    const filler = budgetPairValues(FILLER_PAIR_VALUE_LENGTH);
+
+    await srv.start(
+      playlistWithItems([{ type: 'dashboard_by_uid', value: 'aaa', variables: { k: filler, x: ['[object Object]'] } }])
+    );
+
+    const { search } = getLastHistoryEntry();
+    const params = new URLSearchParams(search);
+    expect(params.getAll('var-k')).toEqual(filler);
+    expect(params.getAll('var-x')).toEqual(['[object Object]']);
+    // Two names only: an indexed `var-x[0]`-style parameter would mean the value was decomposed.
+    expect(Array.from(new Set(params.keys()))).toEqual(['var-k', 'var-x']);
+    expect(varPortionOf(search).length).toBeLessThanOrEqual(MAX_ENCODED_VARIABLES_LENGTH);
+    expect(logWarning).not.toHaveBeenCalled();
+    expect(srv.state.isPlaying).toBe(true);
+  });
+
+  it('applies every value of a variable holding the maximum number of "[object Object]" values', async () => {
+    const values = Array.from({ length: MAX_VALUES_PER_VARIABLE }, () => '[object Object]');
+
+    await srv.start(playlistWithItems([{ type: 'dashboard_by_uid', value: 'aaa', variables: { x: values } }]));
+
+    const { search } = getLastHistoryEntry();
+    const params = new URLSearchParams(search);
+    expect(params.getAll('var-x')).toEqual(values);
+    expect(Array.from(new Set(params.keys()))).toEqual(['var-x']);
+    // 1791 characters as written; the map form of the serializer would have measured 15104 of them
+    // and refused the pair outright.
+    expect(varPortionOf(search).length).toBeLessThanOrEqual(MAX_ENCODED_VARIABLES_LENGTH);
+    expect(logWarning).not.toHaveBeenCalled();
     expect(srv.state.isPlaying).toBe(true);
   });
 

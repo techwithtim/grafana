@@ -1,9 +1,9 @@
-import { css } from '@emotion/css';
+import { css, cx } from '@emotion/css';
 import { Fragment, type KeyboardEvent, useId, useState } from 'react';
 
 import { type GrafanaTheme2 } from '@grafana/data';
 import { Trans, t } from '@grafana/i18n';
-import { Alert, Button, Field, IconButton, Input, useStyles2 } from '@grafana/ui';
+import { Alert, Button, Field, IconButton, Input, Text, useStyles2 } from '@grafana/ui';
 
 import {
   MAX_VALUES_PER_VARIABLE,
@@ -375,6 +375,25 @@ export const PlaylistItemVariables = ({ variables, onChange }: Props) => {
           );
         })}
 
+        {/*
+         * The add row is introduced by a rule and a caption of its own because its two fields are
+         * the only ones here with visible labels: directly under the last committed row, whose
+         * inputs carry an `aria-label` and no label element, those labels otherwise read as
+         * captions for the row above them.
+         *
+         * It is a styled text element and not a heading element: this editor renders inside the
+         * row's `role="region"` panel, where an `h*` would enter the page's heading outline for a
+         * control group. Nothing references it, so it is the accessible name of nothing and every
+         * existing name in this panel is unchanged. The rule is dropped when no variable is
+         * committed yet and the caption is the first thing in the grid, where it would divide the
+         * fields from the panel's own padding rather than from anything.
+         */}
+        <div className={cx(styles.addCaption, { [styles.addCaptionDivided]: entries.length > 0 })}>
+          <Text element="span" variant="h6">
+            <Trans i18nKey="playlist-edit.form.variables-add-heading">Add a variable</Trans>
+          </Text>
+        </div>
+
         <Field
           noMargin
           className={styles.nameCell}
@@ -450,6 +469,18 @@ function getStyles(theme: GrafanaTheme2) {
       [theme.breakpoints.down('sm')]: {
         gridColumn: '1 / -1',
       },
+    }),
+    // Spans every column at both breakpoints, so the caption keeps its own line above the add
+    // row's fields instead of taking the width of one of them.
+    addCaption: css({
+      gridColumn: '1 / -1',
+    }),
+    addCaptionDivided: css({
+      borderBlockStart: `1px solid ${theme.colors.border.weak}`,
+      // The grid's own gap sits above the rule and this padding below it, which keeps the caption
+      // closer to the fields it introduces than to the committed row it is separated from.
+      marginBlockStart: theme.spacing(1),
+      paddingBlockStart: theme.spacing(1.5),
     }),
     remove: css({
       marginBlockStart: theme.spacing(0.5),

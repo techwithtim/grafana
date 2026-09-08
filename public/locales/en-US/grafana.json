@@ -13499,6 +13499,7 @@
       "table-empty": "Playlist is empty. Add dashboards below.",
       "table-heading": "Dashboards",
       "variables-add": "Add variable",
+      "variables-add-heading": "Add a variable",
       "variables-name-aria-label": "Variable name for {{variableName}}",
       "variables-name-duplicate": "A variable with this name already exists",
       "variables-name-placeholder": "Variable name",

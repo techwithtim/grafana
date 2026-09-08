@@ -140,7 +140,11 @@ export const PlaylistTableRows = ({ items, onDelete, expanded, onToggleExpanded,
                         size="md"
                         onClick={() => onToggleExpanded(index)}
                         aria-expanded={isExpanded}
-                        aria-controls={panelId}
+                        // The panel is only in the document while the row is expanded, and
+                        // aria-controls has to name an element that exists: a collapsed row would
+                        // otherwise point assistive technology at an id nothing resolves to.
+                        // aria-expanded alone already announces the collapsed disclosure.
+                        aria-controls={isExpanded ? panelId : undefined}
                         tooltip={t('playlist-edit.form.variables-toggle', 'Template variables')}
                       />
                     )}

@@ -1,15 +1,11 @@
 package playlist
 
 import (
-	"fmt"
-	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-
-	playlistapp "github.com/grafana/grafana/apps/playlist/pkg/app"
 )
 
 func TestLegacyUpdateCommandToUnstructured(t *testing.T) {
@@ -47,8 +43,7 @@ func TestLegacyUpdateCommandToUnstructured(t *testing.T) {
 		},
 	}
 
-	obj, err := LegacyUpdateCommandToUnstructured(cmd)
-	require.NoError(t, err, "this fixture is well within the playlist budget")
+	obj := LegacyUpdateCommandToUnstructured(cmd)
 
 	spec, ok := obj.Object["spec"].(map[string]any)
 	require.True(t, ok, "spec should be a map[string]any")
@@ -120,192 +115,10 @@ func TestLegacyUpdateCommandToUnstructured(t *testing.T) {
 	})
 }
 
-// dashboardItems returns count minimal, variable-less items.
-func dashboardItems(count int) []PlaylistItem {
-	items := make([]PlaylistItem, count)
-	for i := range items {
-		items[i] = PlaylistItem{Type: "dashboard_by_uid", Value: "xCmMwXdVz"}
-	}
-	return items
-}
-
-// itemWithVariables returns a single-item list carrying exactly the given variables.
-func itemWithVariables(variables map[string][]string) []PlaylistItem {
-	return []PlaylistItem{{Type: "dashboard_by_uid", Value: "xCmMwXdVz", Variables: variables}}
-}
-
-// distinctVariables returns count single-valued variables under distinct names.
-func distinctVariables(count int) map[string][]string {
-	variables := make(map[string][]string, count)
-	for i := range count {
-		variables[fmt.Sprintf("host-%d", i)] = []string{"a"}
-	}
-	return variables
-}
-
-// distinctValues returns count distinct values for one variable.
-func distinctValues(count int) []string {
-	values := make([]string, count)
-	for i := range values {
-		values[i] = fmt.Sprintf("host-%d", i)
-	}
-	return values
-}
-
-func TestLegacyUpdateCommandToUnstructuredRejectsPayloadsOverTheBudget(t *testing.T) {
-	longName := strings.Repeat("n", playlistapp.MaxVariableNameLength+1)
-	longValue := strings.Repeat("v", playlistapp.MaxVariableValueLength+1)
-
-	tests := []struct {
-		name string
-		// items is the only part of the command the budget applies to.
-		items []PlaylistItem
-		// errContains are substrings the aggregate message must carry: the field path and
-		// the limit are what makes a 400 actionable.
-		errContains []string
-		// errNotContains guards the amplification rule: an over-long name or value must
-		// never be echoed back inside the error that rejects it.
-		errNotContains []string
-	}{
-		{
-			name:        "more items than the maximum",
-			items:       dashboardItems(playlistapp.MaxPlaylistItems + 1),
-			errContains: []string{"items", "must have at most 1000 items"},
-		},
-		{
-			name:        "more variables than the maximum",
-			items:       itemWithVariables(distinctVariables(playlistapp.MaxItemVariables + 1)),
-			errContains: []string{"items[0].variables", "must have at most 32 items"},
-		},
-		{
-			name:        "more values than the maximum",
-			items:       itemWithVariables(map[string][]string{"host": distinctValues(playlistapp.MaxVariableValues + 1)}),
-			errContains: []string{"items[0].variables[host]", "must have at most 64 items"},
-		},
-		{
-			name:           "variable name longer than the maximum",
-			items:          itemWithVariables(map[string][]string{longName: {"a"}}),
-			errContains:    []string{"items[0].variables", "may not be more than 128 characters"},
-			errNotContains: []string{longName},
-		},
-		{
-			name:           "variable value longer than the maximum",
-			items:          itemWithVariables(map[string][]string{"host": {longValue}}),
-			errContains:    []string{"items[0].variables[host][0]", "may not be more than 1024 characters"},
-			errNotContains: []string{longValue},
-		},
-		{
-			name:        "nil value list",
-			items:       itemWithVariables(map[string][]string{"host": nil}),
-			errContains: []string{"items[0].variables[host]", "at least one value"},
-		},
-		{
-			name:        "empty value list",
-			items:       itemWithVariables(map[string][]string{"host": {}}),
-			errContains: []string{"items[0].variables[host]", "at least one value"},
-		},
-		{
-			name:        "empty string element",
-			items:       itemWithVariables(map[string][]string{"host": {"a", ""}}),
-			errContains: []string{"items[0].variables[host][1]", "must not be empty"},
-		},
-		{
-			name:        "empty variable name",
-			items:       itemWithVariables(map[string][]string{"": {"a"}}),
-			errContains: []string{"items[0].variables", "name is required"},
-		},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			obj, err := LegacyUpdateCommandToUnstructured(UpdatePlaylistCommand{
-				UID:      "playlist-uid",
-				Name:     "Test",
-				Interval: "20s",
-				Items:    tc.items,
-			})
-			require.Error(t, err)
-			for _, expected := range tc.errContains {
-				assert.Contains(t, err.Error(), expected)
-			}
-			for _, forbidden := range tc.errNotContains {
-				assert.NotContains(t, err.Error(), forbidden,
-					"the rejection must not echo the value it rejects")
-			}
-			// A rejected payload is refused before anything is built, so the caller gets a
-			// zero object rather than a partially converted one it could still write.
-			assert.Equal(t, unstructured.Unstructured{}, obj,
-				"nothing may be allocated for a payload that is refused")
-		})
-	}
-}
-
-func TestLegacyUpdateCommandToUnstructuredAcceptsTheBudgetLimits(t *testing.T) {
-	// Every maximum is accepted exactly at the limit: an off-by-one in either direction is a
-	// contract change, one that would either reject a valid playlist or let the next one grow.
-	tests := []struct {
-		name      string
-		items     []PlaylistItem
-		wantItems int
-	}{
-		{
-			name:      "item count at the maximum",
-			items:     dashboardItems(playlistapp.MaxPlaylistItems),
-			wantItems: playlistapp.MaxPlaylistItems,
-		},
-		{
-			name:      "variable count at the maximum",
-			items:     itemWithVariables(distinctVariables(playlistapp.MaxItemVariables)),
-			wantItems: 1,
-		},
-		{
-			name:      "value count at the maximum",
-			items:     itemWithVariables(map[string][]string{"host": distinctValues(playlistapp.MaxVariableValues)}),
-			wantItems: 1,
-		},
-		{
-			name: "variable name at the maximum length",
-			items: itemWithVariables(map[string][]string{
-				strings.Repeat("n", playlistapp.MaxVariableNameLength): {"a"},
-			}),
-			wantItems: 1,
-		},
-		{
-			name: "variable value at the maximum length",
-			items: itemWithVariables(map[string][]string{
-				"host": {strings.Repeat("v", playlistapp.MaxVariableValueLength)},
-			}),
-			wantItems: 1,
-		},
-		{
-			name:      "no items at all",
-			items:     nil,
-			wantItems: 0,
-		},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			obj, err := LegacyUpdateCommandToUnstructured(UpdatePlaylistCommand{
-				UID:      "playlist-uid",
-				Name:     "Test",
-				Interval: "20s",
-				Items:    tc.items,
-			})
-			require.NoError(t, err)
-			require.Equal(t, "playlist-uid", obj.GetName())
-			items, found, err := unstructured.NestedSlice(obj.Object, "spec", "items")
-			require.NoError(t, err)
-			require.True(t, found)
-			assert.Len(t, items, tc.wantItems)
-		})
-	}
-}
-
 func TestLegacyUpdateCommandToUnstructuredHappyPathIsUnchanged(t *testing.T) {
-	// The accepted output is asserted as a whole here, so adding validation in front of the
-	// conversion cannot quietly change the object the legacy endpoints write.
-	obj, err := LegacyUpdateCommandToUnstructured(UpdatePlaylistCommand{
+	// The output is asserted as a whole here, so no later change to this conversion can
+	// quietly alter the object the legacy endpoints write.
+	obj := LegacyUpdateCommandToUnstructured(UpdatePlaylistCommand{
 		UID:      "playlist-uid",
 		Name:     "Test",
 		Interval: "20s",
@@ -314,7 +127,6 @@ func TestLegacyUpdateCommandToUnstructuredHappyPathIsUnchanged(t *testing.T) {
 			{Type: "dashboard_by_tag", Value: "graph-ng"},
 		},
 	})
-	require.NoError(t, err)
 	assert.Equal(t, map[string]any{
 		"metadata": map[string]any{
 			"name": "playlist-uid",

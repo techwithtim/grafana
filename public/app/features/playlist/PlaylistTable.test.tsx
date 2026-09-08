@@ -253,6 +253,27 @@ describe('PlaylistTable', () => {
     expect(uidVariablesPanels().map((panel) => panel.getAttribute('id'))).toEqual(panelIds);
   });
 
+  // A collapsed row mounts no panel, so the attribute is absent rather than naming an id that
+  // resolves to nothing; `aria-expanded` is what announces the collapsed disclosure.
+  it('carries aria-controls only while the row it belongs to is expanded', async () => {
+    const { user } = renderTable();
+
+    expect(disclosureStates()).toEqual(['false', 'false']);
+    expect(disclosureControls()).toEqual([null, null]);
+
+    await user.click(disclosureButtons()[0]);
+
+    const [firstPanelId, secondPanelId] = disclosureControls();
+    expect(firstPanelId).toEqual(expect.stringMatching(/\S/));
+    expect(secondPanelId).toBeNull();
+    expect(uidVariablesPanels().map((panel) => panel.getAttribute('id'))).toEqual([firstPanelId]);
+
+    await user.click(disclosureButtons()[0]);
+
+    expect(disclosureStates()).toEqual(['false', 'false']);
+    expect(disclosureControls()).toEqual([null, null]);
+  });
+
   it('moves the item and collapses both open variable editors when a drag ends on a new position', async () => {
     const { user, moveItem } = renderTable();
     await expandBothUidRows(user);

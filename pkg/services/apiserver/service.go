@@ -176,15 +176,7 @@ func ProvideService(
 	// We need to register the routes in ProvideService to make sure
 	// the routes are registered before the Grafana HTTP server starts.
 	proxyHandler := func(k8sRoute routing.RouteRegister) {
-		// allowNamespaceFromPath is decided by the route the request came in on, never by the
-		// request itself: only the credential-less public routes below may adopt the org and
-		// namespace named in the path. Every other route is registered behind
-		// middleware.ReqSignedIn, so a request reaching it carries an identity that
-		// authenticated, including the configured anonymous identity. That identity is bound to
-		// the organization configured for anonymous access and reports !c.IsSignedIn purely
-		// because it is anonymous (contexthandler sets IsSignedIn = !IsAnonymous), so
-		// re-scoping it from the URL would let a caller pick any organization's namespace.
-		serve := func(c *contextmodel.ReqContext, allowNamespaceFromPath bool) {
+		handler := func(c *contextmodel.ReqContext) {
 			if err := s.AwaitRunning(c.Req.Context()); err != nil {
 				c.Resp.WriteHeader(http.StatusInternalServerError)
 				_, _ = c.Resp.Write([]byte(http.StatusText(http.StatusInternalServerError)))
@@ -203,9 +195,8 @@ func ProvideService(
 			}
 
 			if c.SignedInUser != nil {
-				// A caller on a public route has no credentials and no organization of its own,
-				// so the requested namespace is its only scope.
-				if allowNamespaceFromPath && !c.IsSignedIn {
+				// For unauthenticated requests, we set the namespace to the requested one
+				if !c.IsSignedIn {
 					useNamespaceFromPath(req.URL.Path, c.SignedInUser)
 				}
 
@@ -216,18 +207,12 @@ func ProvideService(
 			resp := responsewriter.WrapForHTTP1Or2(c.Resp)
 			s.handler.ServeHTTP(resp, req)
 		}
-		handler := func(c *contextmodel.ReqContext) {
-			serve(c, false)
-		}
-		publicHandler := func(c *contextmodel.ReqContext) {
-			serve(c, true)
-		}
 		// Allow unauthenticated GET access to snapshots and the dashboard subresource.
 		// Snapshots are shared via URL with the key, so they are always publicly accessible.
 		// Authorization is enforced by the snapshot authorizer.
 		snapshotPath := "/" + dashv0.GROUP + "/" + dashv0.VERSION + "/namespaces/:namespace/snapshots/:name"
-		k8sRoute.Get(snapshotPath, publicHandler)
-		k8sRoute.Get(snapshotPath+"/dashboard", publicHandler)
+		k8sRoute.Get(snapshotPath, handler)
+		k8sRoute.Get(snapshotPath+"/dashboard", handler)
 
 		k8sRoute.Any("/", middleware.ReqSignedIn, handler)
 		k8sRoute.Any("/*", middleware.ReqSignedIn, handler)

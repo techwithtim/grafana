@@ -1,5 +1,6 @@
 package playlist
 
+// Playlist model
 type Playlist struct {
 	Id       int64  `json:"id,omitempty" db:"id"`
 	UID      string `json:"uid" xorm:"uid" db:"uid"`
@@ -14,9 +15,10 @@ type Playlist struct {
 
 type PlaylistDTO struct {
 	// Unique playlist identifier. Generated on creation, either by the
-	// creator of the playlist or by the application.
+	// creator of the playlist of by the application.
 	Uid string `json:"uid" db:"uid"`
 
+	// Name of the playlist.
 	Name string `json:"name"`
 
 	// Interval sets the time between switching views in a playlist.
@@ -34,9 +36,10 @@ type PlaylistDTO struct {
 }
 
 type PlaylistItemDTO struct {
-	// Title is a deprecated legacy field retained for compatibility and omitted when unset.
+	// Title is an unused property -- it will be removed in the future
 	Title *string `json:"title,omitempty"`
 
+	// Type of the item.
 	Type string `json:"type"`
 
 	// Value depends on type and describes the playlist item.

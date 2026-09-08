@@ -4,36 +4,14 @@ import (
 	"encoding/json"
 
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/util/validation/field"
 
-	playlistapp "github.com/grafana/grafana/apps/playlist/pkg/app"
 	"github.com/grafana/grafana/pkg/apimachinery/utils"
 	"github.com/grafana/grafana/pkg/util"
 )
 
 // LegacyUpdateCommandToUnstructured converts a deprecated /api/playlists body into the
 // unstructured object the resource API stores.
-//
-// The playlist collection budget is enforced first, before the item list or any of the per-value
-// copies below are allocated: the legacy body is decoded into typed items by web.Bind, and
-// building the unstructured copy of an unbounded one would allocate a second, larger set of
-// slices for a payload that is about to be refused anyway. The limits and the error messages are
-// the shared ones from the app package, so the legacy bridge and resource admission refuse
-// exactly the same payloads.
-func LegacyUpdateCommandToUnstructured(cmd UpdatePlaylistCommand) (unstructured.Unstructured, error) {
-	// The legacy body names this field items, not spec.items, so the caller sees the path it sent.
-	itemsPath := field.NewPath("items")
-	errs := playlistapp.ValidateItemCount(len(cmd.Items), itemsPath)
-	if len(errs) == 0 {
-		for i, item := range cmd.Items {
-			errs = append(errs, playlistapp.ValidateItemVariables(
-				item.Variables, itemsPath.Index(i).Child("variables"))...)
-		}
-	}
-	if err := errs.ToAggregate(); err != nil {
-		return unstructured.Unstructured{}, err
-	}
-
+func LegacyUpdateCommandToUnstructured(cmd UpdatePlaylistCommand) unstructured.Unstructured {
 	// Unstructured content must only hold JSON-compatible values: apimachinery walks it with
 	// runtime.DeepCopyJSONValue, which understands []any and map[string]any and panics on any
 	// other container -- a []map[string]any item list included. Both the item list and the
@@ -70,7 +48,7 @@ func LegacyUpdateCommandToUnstructured(cmd UpdatePlaylistCommand) (unstructured.
 		cmd.UID = util.GenerateShortUID()
 	}
 	obj.SetName(cmd.UID)
-	return obj, nil
+	return obj
 }
 
 func UnstructuredToLegacyPlaylist(item unstructured.Unstructured) *Playlist {

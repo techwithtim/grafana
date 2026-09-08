@@ -93,7 +93,7 @@ You can create a playlist to present dashboards in a sequence, with a set order 
 
 1. To apply template variable values to a dashboard you added by title, click **Template variables** next to the dashboard name, then enter a variable name and its values.
 
-   Enter a variable in the **Variable name** and **Values (comma-separated)** fields, then click **Add variable**. Click the **X** next to a variable to remove it. Dashboards added by tag don't support template variables. You can't enter a single value that contains a comma in the editor, although the API accepts one.
+   Enter a variable in the **Variable name** and **Values (comma-separated)** fields, then click **Add variable**. Click the **X** next to a variable to remove it. Dashboards added by tag don't support template variables. You can't enter a single value that contains a comma in the editor, although the API accepts one. The editor accepts up to 32 variables for each dashboard row and up to 64 values for each variable.
    - **Values**: Grafana separates the values you enter on commas, trims the surrounding spaces, and ignores blank entries, so `x, , y` becomes the two values `x` and `y`.
    - **Validation**: Grafana rejects an empty name or a values field with no non-empty entries, shows an inline message under that field, and leaves the dashboard row unchanged.
    - **Unique names**: Grafana rejects a variable name that another variable on the same dashboard row already uses. You can use that name again on another row, including a second row for the same dashboard.
@@ -120,7 +120,7 @@ You can edit a playlist including adding, removing, and rearranging the order of
    - Add dashboards - Search for dashboards by title or tag to add them to the playlist.
    - Rearrange dashboards - Click and drag the dashboards into your desired order.
    - Remove dashboards - Click the **X** next to the name of the dashboard you want to remove from the playlist.
-   - **Template variables**: Click **Template variables** next to a dashboard added by title to add, change, or remove its variable values.
+   - Template variables - Click **Template variables** next to a dashboard added by title to add, change, or remove its variable values.
 
 1. Click **Save**.
 
