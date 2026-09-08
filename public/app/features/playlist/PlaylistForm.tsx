@@ -63,8 +63,13 @@ export const PlaylistForm = ({
 
   const doSubmit = async (specUpdates: Playlist['spec']) => {
     setSaving(true);
-    // Strip UI-only properties (dashboards) from items before submission
-    const apiItems = items.map(({ dashboards, ...item }) => item);
+    // Strip UI-only properties (dashboards) from items before submission. An item that carries
+    // no variables is submitted without the property at all rather than with an empty or
+    // undefined one, so playlists without template variables serialize exactly as they did
+    // before the field existed.
+    const apiItems = items.map(({ dashboards, variables, ...item }) =>
+      variables && Object.keys(variables).length > 0 ? { ...item, variables } : item
+    );
     try {
       // The direct-save path navigates away; the provisioned path returns after opening the drawer,
       // so reset `saving` here or the Save button would keep spinning behind the drawer.
