@@ -91,7 +91,23 @@ You can create a playlist to present dashboards in a sequence, with a set order 
 
    Added dashboards are displayed in a list in the **Dashboards** section of the page, in the order you added them. This is also the play order of the dashboards.
 
+1. To apply template variable values to a dashboard you added by title, click **Template variables** next to the dashboard name, then enter a variable name and its values.
+
+   Enter a variable in the **Variable name** and **Values (comma-separated)** fields, then click **Add variable**. Click the **X** next to a variable to remove it. Dashboards added by tag don't support template variables. Because Grafana separates values on commas, you can't enter a single value that itself contains a comma, although the API accepts one.
+   - **Values**: Grafana separates the values you enter on commas and trims the surrounding spaces.
+   - **Validation**: Grafana rejects an empty name or an empty value and shows an inline message.
+   - **Unique names**: You can use each variable name only once for a dashboard.
+   - **Rename**: When you rename a variable, its values move to the new name.
+   - **Enter key**: Press the `Enter` key to commit a variable row without saving the playlist.
+   - **Removal**: When you remove the last variable, the dashboard row returns to its plain state.
+   - **Repeated dashboards**: You can add the same dashboard again with **Add by title** and give it a different set of values, so one dashboard rotates through values such as `Host1`, `Host2`, and `Host3`.
+   - **Reordering**: When you reorder or delete a dashboard row, Grafana closes any open variable editor.
+
 1. Click **Save**.
+
+{{< admonition type="caution" >}}
+Grafana places template variable values in the dashboard URL, so they're visible in browser history, in proxy and server access logs, and in any link you copy or share. Don't put secrets or other sensitive data in playlist variables.
+{{< /admonition >}}
 
 ## Edit a playlist
 
@@ -104,6 +120,7 @@ You can edit a playlist including adding, removing, and rearranging the order of
    - Add dashboards - Search for dashboards by title or tag to add them to the playlist.
    - Rearrange dashboards - Click and drag the dashboards into your desired order.
    - Remove dashboards - Click the **X** next to the name of the dashboard you want to remove from the playlist.
+   - **Template variables**: Click **Template variables** next to a dashboard added by title to add, change, or remove its variable values.
 
 1. Click **Save**.
 

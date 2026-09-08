@@ -1,14 +1,16 @@
 import { render, screen, waitFor, within } from '@testing-library/react';
-import userEvent from '@testing-library/user-event';
+import userEvent, { type UserEvent } from '@testing-library/user-event';
 
 import { setBackendSrv } from '@grafana/runtime';
 import { getCustomSearchHandler } from '@grafana/test-utils/handlers';
 import server, { setupMockServer } from '@grafana/test-utils/server';
+import { type DashboardPickerDTO } from 'app/core/components/Select/DashboardPicker';
 
 import { type Playlist } from '../../api/clients/playlist/v1';
 import { backendSrv } from '../../core/services/backend_srv';
 
 import { PlaylistForm } from './PlaylistForm';
+import * as playlistUtils from './utils';
 
 setBackendSrv(backendSrv);
 setupMockServer();
@@ -17,6 +19,20 @@ jest.mock('app/core/components/TagFilter/TagFilter', () => ({
   TagFilter: () => {
     return <>mocked-tag-filter</>;
   },
+}));
+
+// The real picker is an async Select backed by dashboard search. A button standing in for it keeps
+// "add this dashboard" a single click, and `type="button"` matters: a submit button inside the
+// form's real <form> would save the playlist instead of adding an item.
+jest.mock('app/core/components/Select/DashboardPicker', () => ({
+  DashboardPicker: ({ onChange }: { onChange: (dashboard: DashboardPickerDTO) => void }) => (
+    <button
+      type="button"
+      onClick={() => onChange({ uid: 'uid_1', name: 'Host dashboard', folderUid: 'folder_1', folderTitle: 'Folder 1' })}
+    >
+      mocked-dashboard-picker
+    </button>
+  ),
 }));
 
 const mockPlaylist: Playlist = {
@@ -51,21 +67,103 @@ const mockEmptyPlaylist: Playlist = {
   status: {},
 };
 
+/**
+ * A playlist whose dashboard items carry template variables, plus a tag item that cannot. Returned
+ * from a factory so a test that edits it cannot leak state into the next one, and so the
+ * immutability case can compare the object it passed in against a literal of these same values.
+ */
+function playlistWithVariables(): Playlist {
+  return {
+    apiVersion: 'playlist.grafana.app/v1',
+    kind: 'Playlist',
+    spec: {
+      title: 'A test playlist',
+      interval: '10m',
+      items: [
+        { type: 'dashboard_by_uid', value: 'uid_1', variables: { host: ['Host1'] } },
+        { type: 'dashboard_by_uid', value: 'uid_2', variables: { host: ['Host2'] } },
+        { type: 'dashboard_by_tag', value: 'tag_A' },
+      ],
+    },
+    metadata: {
+      name: 'foo',
+    },
+    status: {},
+  };
+}
+
+function setup(jsx: JSX.Element) {
+  return {
+    user: userEvent.setup(),
+    ...render(jsx),
+  };
+}
+
 function getTestContext(playlist: Playlist = mockPlaylist) {
   server.use(getCustomSearchHandler([]));
   const onSubmitMock = jest.fn();
-  const { rerender } = render(<PlaylistForm onSubmit={onSubmitMock} playlist={playlist} />);
+  const { rerender, unmount, user } = setup(<PlaylistForm onSubmit={onSubmitMock} playlist={playlist} />);
 
-  return { onSubmitMock, playlist, rerender };
+  return { onSubmitMock, playlist, rerender, unmount, user };
 }
 
 function rows() {
   return screen.getAllByRole('row');
 }
 
+/** The picker re-mounts on every add (`key={items.length}`), so it is queried again each time. */
+function dashboardPickerButton() {
+  return screen.getByRole('button', { name: 'mocked-dashboard-picker' });
+}
+
+function saveButton() {
+  return screen.getByRole('button', { name: /save/i });
+}
+
+/** One per `dashboard_by_uid` row, in row order; tag rows have no variable editor. */
+function disclosureButtons() {
+  return screen.getAllByRole('button', { name: 'Template variables' });
+}
+
+function disclosureStates() {
+  return disclosureButtons().map((button) => button.getAttribute('aria-expanded'));
+}
+
+/** The add row's inputs are labelled, where an existing variable's inputs are aria-labelled. */
+function newVariableName() {
+  return screen.getByRole('textbox', { name: 'Variable name' });
+}
+
+function newVariableValues() {
+  return screen.getByRole('textbox', { name: 'Values (comma-separated)' });
+}
+
+/**
+ * Commits one variable through the editor of the row at `index`, leaving the editor open. Every
+ * editor labels its add row identically, so a caller must have at most one editor open at a time.
+ */
+async function addVariable(user: UserEvent, index: number, name: string, values: string) {
+  await user.click(disclosureButtons()[index]);
+  await user.type(newVariableName(), name);
+  await user.type(newVariableValues(), values);
+  await user.click(screen.getByRole('button', { name: 'Add variable' }));
+}
+
+/** `jest.fn()` records its arguments untyped, so the submitted playlist is typed at this one spot. */
+function firstSubmittedPlaylist(onSubmitMock: jest.Mock): Playlist {
+  const [submitted]: [Playlist] = onSubmitMock.mock.calls[0];
+  return submitted;
+}
+
 describe('PlaylistForm', () => {
   beforeEach(() => {
     jest.spyOn(console, 'error').mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    // The enrichment case stubs the dashboard loader. This project's jest config restores nothing
+    // between tests, so the stub has to be dropped here or it would answer for the next case too.
+    jest.restoreAllMocks();
   });
 
   describe('when mounted with a playlist', () => {
@@ -163,6 +261,295 @@ describe('PlaylistForm', () => {
       getTestContext(mockEmptyPlaylist);
 
       expect(screen.getByRole('button', { name: /save/i })).toBeDisabled();
+    });
+  });
+
+  describe('when editing the template variables of a dashboard item', () => {
+    it('submits the variables entered for a newly added dashboard', async () => {
+      const { onSubmitMock, user } = getTestContext(mockEmptyPlaylist);
+
+      await user.click(dashboardPickerButton());
+      const disclosure = await screen.findByRole('button', { name: 'Template variables' });
+      expect(disclosure).toHaveAttribute('aria-expanded', 'false');
+
+      await user.click(disclosure);
+      expect(disclosureStates()).toEqual(['true']);
+
+      await user.type(newVariableName(), 'host');
+      await user.type(newVariableValues(), 'a, b');
+      await user.click(screen.getByRole('button', { name: 'Add variable' }));
+      await user.click(saveButton());
+
+      await waitFor(() => {
+        expect(onSubmitMock).toHaveBeenCalledWith({
+          apiVersion: 'playlist.grafana.app/v1',
+          kind: 'Playlist',
+          spec: {
+            title: 'A test playlist',
+            interval: '10m',
+            items: [{ type: 'dashboard_by_uid', value: 'uid_1', variables: { host: ['a', 'b'] } }],
+          },
+          metadata: {
+            name: 'foo',
+          },
+          status: {},
+        });
+      });
+      expect(onSubmitMock).toHaveBeenCalledTimes(1);
+    });
+
+    it('pre-populates the editor from a saved playlist when the form is mounted again', async () => {
+      const { onSubmitMock, user, unmount } = getTestContext(mockEmptyPlaylist);
+
+      await user.click(dashboardPickerButton());
+      await addVariable(user, 0, 'host', 'a, b');
+      await user.click(saveButton());
+      await waitFor(() => {
+        expect(onSubmitMock).toHaveBeenCalledTimes(1);
+      });
+      const saved = firstSubmittedPlaylist(onSubmitMock);
+      unmount();
+
+      // `usePlaylistItems` seeds its state from the prop only once, so re-rendering the same
+      // instance would prove nothing about loading — the saved playlist needs a fresh mount.
+      const reloaded = getTestContext(saved);
+
+      expect(screen.getByText('1 variable')).toBeInTheDocument();
+      await reloaded.user.click(disclosureButtons()[0]);
+      expect(await screen.findByRole('textbox', { name: 'Variable name for host' })).toHaveValue('host');
+      expect(screen.getByRole('textbox', { name: 'Values for host' })).toHaveValue('a, b');
+    });
+
+    it('submits distinct variables for two rows holding the same dashboard', async () => {
+      const { onSubmitMock, user } = getTestContext(mockEmptyPlaylist);
+
+      await user.click(dashboardPickerButton());
+      await addVariable(user, 0, 'host', 'a, b');
+      // Adding an item leaves open editors open, and every editor labels its add row the same way,
+      // so the first row is collapsed before the second one is opened.
+      await user.click(disclosureButtons()[0]);
+      await user.click(dashboardPickerButton());
+      await addVariable(user, 1, 'host', 'c');
+      await user.click(saveButton());
+
+      await waitFor(() => {
+        expect(onSubmitMock).toHaveBeenCalledWith({
+          apiVersion: 'playlist.grafana.app/v1',
+          kind: 'Playlist',
+          spec: {
+            title: 'A test playlist',
+            interval: '10m',
+            items: [
+              { type: 'dashboard_by_uid', value: 'uid_1', variables: { host: ['a', 'b'] } },
+              { type: 'dashboard_by_uid', value: 'uid_1', variables: { host: ['c'] } },
+            ],
+          },
+          metadata: {
+            name: 'foo',
+          },
+          status: {},
+        });
+      });
+    });
+
+    it('submits an item with no variables key once its last variable is removed', async () => {
+      const { onSubmitMock, user } = getTestContext(playlistWithVariables());
+
+      await user.click(disclosureButtons()[0]);
+      await user.click(await screen.findByRole('button', { name: 'Remove variable host' }));
+      await user.click(saveButton());
+
+      await waitFor(() => {
+        expect(onSubmitMock).toHaveBeenCalledWith({
+          apiVersion: 'playlist.grafana.app/v1',
+          kind: 'Playlist',
+          spec: {
+            title: 'A test playlist',
+            interval: '10m',
+            items: [
+              { type: 'dashboard_by_uid', value: 'uid_1' },
+              { type: 'dashboard_by_uid', value: 'uid_2', variables: { host: ['Host2'] } },
+              { type: 'dashboard_by_tag', value: 'tag_A' },
+            ],
+          },
+          metadata: {
+            name: 'foo',
+          },
+          status: {},
+        });
+      });
+      // `toHaveBeenCalledWith` compares with `toEqual` semantics, which treats a `variables:
+      // undefined` key as absent, so the key set of each submitted item is asserted directly.
+      expect(firstSubmittedPlaylist(onSubmitMock).spec.items.map((item) => Object.keys(item).sort())).toEqual([
+        ['type', 'value'],
+        ['type', 'value', 'variables'],
+        ['type', 'value'],
+      ]);
+    });
+
+    it('rejects a variable without a name and submits the items unchanged', async () => {
+      const { onSubmitMock, user } = getTestContext(playlistWithVariables());
+
+      await user.click(disclosureButtons()[0]);
+      await user.type(newVariableValues(), 'Host9');
+      await user.click(screen.getByRole('button', { name: 'Add variable' }));
+
+      expect(await screen.findByText('Variable name is required')).toBeInTheDocument();
+
+      await user.click(saveButton());
+      await waitFor(() => {
+        expect(onSubmitMock).toHaveBeenCalledWith({
+          apiVersion: 'playlist.grafana.app/v1',
+          kind: 'Playlist',
+          spec: {
+            title: 'A test playlist',
+            interval: '10m',
+            items: [
+              { type: 'dashboard_by_uid', value: 'uid_1', variables: { host: ['Host1'] } },
+              { type: 'dashboard_by_uid', value: 'uid_2', variables: { host: ['Host2'] } },
+              { type: 'dashboard_by_tag', value: 'tag_A' },
+            ],
+          },
+          metadata: {
+            name: 'foo',
+          },
+          status: {},
+        });
+      });
+    });
+
+    it('collapses every editor and leaves each remaining item its own variables when a row is deleted', async () => {
+      const { onSubmitMock, user } = getTestContext(playlistWithVariables());
+
+      await user.click(disclosureButtons()[0]);
+      expect(await screen.findByRole('textbox', { name: 'Values for host' })).toHaveValue('Host1');
+      expect(disclosureStates()).toEqual(['true', 'false']);
+
+      await user.click(within(rows()[1]).getByRole('button', { name: /delete playlist item/i }));
+
+      await waitFor(() => {
+        expect(disclosureStates()).toEqual(['false']);
+      });
+      await user.click(saveButton());
+      await waitFor(() => {
+        expect(onSubmitMock).toHaveBeenCalledWith({
+          apiVersion: 'playlist.grafana.app/v1',
+          kind: 'Playlist',
+          spec: {
+            title: 'A test playlist',
+            interval: '10m',
+            items: [
+              { type: 'dashboard_by_uid', value: 'uid_1', variables: { host: ['Host1'] } },
+              { type: 'dashboard_by_tag', value: 'tag_A' },
+            ],
+          },
+          metadata: {
+            name: 'foo',
+          },
+          status: {},
+        });
+      });
+    });
+
+    it('keeps a variable entered while the dashboard search is in flight and still merges the loaded dashboard', async () => {
+      let releaseSearch = () => {};
+      const searchGate = new Promise<void>((resolve) => {
+        releaseSearch = resolve;
+      });
+      // The editor and the dashboard search write to the same item list, and a timed delay would
+      // leave which of them lands last to the wall clock. Gating the loader makes the in-flight
+      // window exact, and its result carries no variables on purpose: only a merge that keeps the
+      // current state's other properties can leave the variable entered mid-flight in place.
+      const loadDashboards = jest.spyOn(playlistUtils, 'loadDashboards').mockImplementation(async () => {
+        await searchGate;
+        return [
+          {
+            type: 'dashboard_by_uid',
+            value: 'uid_1',
+            dashboards: [
+              {
+                kind: 'dashboard',
+                name: 'Host dashboard',
+                uid: 'uid_1',
+                url: '/d/uid_1/host-dashboard',
+                panel_type: '',
+                tags: [],
+                location: 'general',
+                ds_uid: [],
+                score: 0,
+                explain: {},
+              },
+            ],
+          },
+        ];
+      });
+      const { onSubmitMock, user } = getTestContext(mockEmptyPlaylist);
+
+      await user.click(dashboardPickerButton());
+      await waitFor(() => {
+        expect(loadDashboards).toHaveBeenCalledWith([{ type: 'dashboard_by_uid', value: 'uid_1' }]);
+      });
+      expect(screen.queryByText('Host dashboard')).not.toBeInTheDocument();
+
+      await addVariable(user, 0, 'host', 'a, b');
+      releaseSearch();
+
+      expect(await screen.findByText('Host dashboard')).toBeInTheDocument();
+      expect(screen.getByText('1 variable')).toBeInTheDocument();
+
+      await user.click(saveButton());
+      await waitFor(() => {
+        expect(onSubmitMock).toHaveBeenCalledWith({
+          apiVersion: 'playlist.grafana.app/v1',
+          kind: 'Playlist',
+          spec: {
+            title: 'A test playlist',
+            interval: '10m',
+            items: [{ type: 'dashboard_by_uid', value: 'uid_1', variables: { host: ['a', 'b'] } }],
+          },
+          metadata: {
+            name: 'foo',
+          },
+          status: {},
+        });
+      });
+    });
+
+    it('leaves the playlist prop untouched while variables are added and removed', async () => {
+      const { onSubmitMock, user, playlist } = getTestContext(playlistWithVariables());
+
+      await addVariable(user, 0, 'cluster', 'eu-west');
+      await user.click(disclosureButtons()[0]);
+      await user.click(disclosureButtons()[1]);
+      await user.click(await screen.findByRole('button', { name: 'Remove variable host' }));
+      await user.click(saveButton());
+
+      await waitFor(() => {
+        expect(onSubmitMock).toHaveBeenCalledWith({
+          apiVersion: 'playlist.grafana.app/v1',
+          kind: 'Playlist',
+          spec: {
+            title: 'A test playlist',
+            interval: '10m',
+            items: [
+              { type: 'dashboard_by_uid', value: 'uid_1', variables: { host: ['Host1'], cluster: ['eu-west'] } },
+              { type: 'dashboard_by_uid', value: 'uid_2' },
+              { type: 'dashboard_by_tag', value: 'tag_A' },
+            ],
+          },
+          metadata: {
+            name: 'foo',
+          },
+          status: {},
+        });
+      });
+      // The items reach the form from the RTK Query cache, so the edits above must have produced
+      // new objects rather than writing through to the ones passed in.
+      expect(playlist.spec.items).toEqual([
+        { type: 'dashboard_by_uid', value: 'uid_1', variables: { host: ['Host1'] } },
+        { type: 'dashboard_by_uid', value: 'uid_2', variables: { host: ['Host2'] } },
+        { type: 'dashboard_by_tag', value: 'tag_A' },
+      ]);
     });
   });
 });

@@ -13451,7 +13451,10 @@
       "aria-label-playlist-item": "Playlist item, {{itemType}}, {{itemValue}}",
       "multiple-dashboards-found": "Multiple items found: {{items}}",
       "no-dashboards-found": "No dashboards found",
-      "not-found": "Not found: {{items}}"
+      "not-found": "Not found: {{items}}",
+      "variables-count_one": "{{count}} variable",
+      "variables-count_other": "{{count}} variables",
+      "variables-panel": "Template variables for {{itemValue}}"
     },
     "start-modal": {
       "button-start": "Start {{title}}",
@@ -13494,7 +13497,19 @@
       "table-delete": "Delete playlist item",
       "table-drag": "Reorder playlist item",
       "table-empty": "Playlist is empty. Add dashboards below.",
-      "table-heading": "Dashboards"
+      "table-heading": "Dashboards",
+      "variables-add": "Add variable",
+      "variables-name-aria-label": "Variable name for {{variableName}}",
+      "variables-name-duplicate": "A variable with this name already exists",
+      "variables-name-placeholder": "Variable name",
+      "variables-name-required": "Variable name is required",
+      "variables-new-name-label": "Variable name",
+      "variables-new-values-label": "Values (comma-separated)",
+      "variables-remove": "Remove variable {{variableName}}",
+      "variables-toggle": "Template variables",
+      "variables-value-required": "Variable value is required",
+      "variables-values-aria-label": "Values for {{variableName}}",
+      "variables-values-placeholder": "Values, comma-separated"
     },
     "sub-title": "A playlist rotates through a pre-selected list of dashboards. A playlist can be a great way to build situational awareness, or just show off your metrics to your team or visitors.",
     "title": "Edit playlist"
