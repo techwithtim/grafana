@@ -13,7 +13,6 @@ func NewPlaylistItem() *PlaylistItem {
 // Shared item definition for all versions
 // +k8s:openapi-gen=true
 type PlaylistPlaylistItem struct {
-	// type of the item.
 	Type PlaylistPlaylistItemType `json:"type"`
 	// Value depends on type and describes the playlist item.
 	//  - dashboard_by_id: The value is an internal numerical identifier set by Grafana. This
@@ -26,6 +25,12 @@ type PlaylistPlaylistItem struct {
 	// Optional template variable values applied when this item is played (dashboard_by_uid only).
 	// Each key is a variable name; its value is a list of one or more values for that variable.
 	// A multi-value variable is expressed by several list elements under the same key.
+	// The collection is bounded, because every value is expanded into a dashboard URL and into the
+	// editor's controls: an item accepts at most 32 variables, a variable name of at most 128
+	// characters, and at most 64 values of at most 1024 characters each. A character means one
+	// Unicode code point everywhere the limit is applied. The last two maxima are part of this
+	// schema; the first two are enforced on every write, which is the only place this schema
+	// language can express them.
 	Variables map[string][]string `json:"variables,omitempty"`
 }
 
@@ -41,9 +46,11 @@ func (PlaylistPlaylistItem) OpenAPIModelName() string {
 
 // +k8s:openapi-gen=true
 type PlaylistSpec struct {
-	Title    string         `json:"title"`
-	Interval string         `json:"interval"`
-	Items    []PlaylistItem `json:"items"`
+	Title    string `json:"title"`
+	Interval string `json:"interval"`
+	// The list is bounded: every viewer that plays the playlist walks all of it, loading a
+	// dashboard and pushing a history entry for each item.
+	Items []PlaylistItem `json:"items"`
 }
 
 // NewPlaylistSpec creates a new PlaylistSpec object.

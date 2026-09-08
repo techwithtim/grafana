@@ -37,11 +37,16 @@ func (auth namespaceAuthorizer) Authorize(ctx context.Context, a authorizer.Attr
 		return authorizer.DecisionNoOpinion, "", nil
 	}
 
-	// Anonymous users and Grafana Admins can access any valid namespace; skip org scoping.
-	if types.IsIdentityType(ident.GetIdentityType(), types.TypeAnonymous) {
+	// An anonymous identity that carries no organization has nothing to scope against, and
+	// reaches only the public routes where the API-specific authorizer decides, so it may
+	// access any valid namespace. An anonymous identity bound to an organization (the one
+	// configured for anonymous access) is scoped by the checks below like every other
+	// identity; otherwise it could read another organization's namespace.
+	if types.IsIdentityType(ident.GetIdentityType(), types.TypeAnonymous) && ident.GetOrgID() == 0 {
 		return authorizer.DecisionNoOpinion, "", nil
 	}
 
+	// Grafana Admins can access any valid namespace; skip org scoping.
 	if ident.GetIsGrafanaAdmin() {
 		return authorizer.DecisionNoOpinion, "", nil
 	}

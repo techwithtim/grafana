@@ -18536,7 +18536,6 @@
       "type": "object"
     },
     "Playlist": {
-      "description": "Playlist model",
       "type": "object",
       "properties": {
         "id": {
@@ -18569,11 +18568,10 @@
           }
         },
         "name": {
-          "description": "Name of the playlist.",
           "type": "string"
         },
         "uid": {
-          "description": "Unique playlist identifier. Generated on creation, either by the\ncreator of the playlist of by the application.",
+          "description": "Unique playlist identifier. Generated on creation, either by the\ncreator of the playlist or by the application.",
           "type": "string"
         }
       }
@@ -18649,11 +18647,10 @@
       "type": "object",
       "properties": {
         "title": {
-          "description": "Title is an unused property -- it will be removed in the future",
+          "description": "Title is a deprecated legacy field retained for compatibility and omitted when unset.",
           "type": "string"
         },
         "type": {
-          "description": "Type of the item.",
           "type": "string"
         },
         "value": {

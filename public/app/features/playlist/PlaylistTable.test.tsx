@@ -7,14 +7,8 @@ import { PlaylistTable } from './PlaylistTable';
 import { PlaylistTableRows } from './PlaylistTableRows';
 import { type PlaylistItemUI } from './types';
 
-/** The loaded-dashboard shape a row renders, taken from the playlist item type itself. */
 type LoadedDashboard = NonNullable<PlaylistItemUI['dashboards']>[number];
 
-/**
- * The props each stubbed drag-and-drop export receives from `PlaylistTable` and
- * `PlaylistTableRows`. The stubs render their children straight away, so `provided` is all they
- * have to supply and none of the library's drag-state objects need to be invented here.
- */
 interface DragDropContextStubProps {
   children: ReactNode;
 }
@@ -28,10 +22,10 @@ interface DraggableStubProps {
   children: (provided: DraggableProvided) => ReactNode;
 }
 
-// `PlaylistTable` keeps its `onDragEnd` handler internal and the real library only calls it after a
-// pointer drag that jsdom cannot produce, so a reorder is reachable only by stubbing the library and
-// reading the handler back off the props `DragDropContext` recorded. All three exports are stubbed
-// together because `Draggable` throws when it renders outside a real `DragDropContext`.
+// `PlaylistTable` keeps `onDragEnd` internal rather than exposing it as a prop, so a reorder is
+// invoked deterministically by reading that handler back off the props the stubbed `DragDropContext`
+// recorded, without driving the library's sensor lifecycle or the layout measurements it needs. All
+// three exports are stubbed together because `Draggable` throws outside a real `DragDropContext`.
 jest.mock('@hello-pangea/dnd', () => {
   const contextId = 'playlist-table-test';
 
@@ -86,13 +80,10 @@ function loadedDashboard(uid: string, name: string): LoadedDashboard {
 }
 
 /**
- * The same dashboard by UID twice with different variables, then a tag row and a deprecated
- * dashboard_by_id row. The duplicate UID is deliberate: rows are addressed by position, so this is
- * the arrangement in which an editor left open across a move or a deletion would re-attach to the
- * other item. The two non-UID rows are the negative case for the UID-only variables gate.
- * `dashboards` is filled in on every row because a row without it renders a spinner instead of its
- * name; the fixtures are inline because this suite never calls `loadDashboards`, which rejects
- * dashboard_by_id items outright.
+ * The duplicate UID is deliberate: rows are addressed by position, so this is the arrangement in
+ * which an editor left open across a move or a deletion would re-attach to the other item. The tag
+ * row and the deprecated `dashboard_by_id` row are the negative case for the UID-only variables
+ * gate, and every row carries `dashboards` because a row without it renders a spinner, not its name.
  */
 function playlistItems(): PlaylistItemUI[] {
   return [
@@ -152,25 +143,18 @@ function deleteButtons() {
   return screen.getAllByRole('button', { name: /delete playlist item/i });
 }
 
-/** The `aria-expanded` state of every row's variable editor disclosure, in row order. */
 function disclosureStates() {
   return disclosureButtons().map((button) => button.getAttribute('aria-expanded'));
 }
 
-/** The `aria-controls` value of every row's variable editor disclosure, in row order. */
 function disclosureControls() {
   return disclosureButtons().map((button) => button.getAttribute('aria-controls'));
 }
 
-/** Every open variables panel, whichever row it belongs to, so panels can be counted per row type. */
 function variablesPanels() {
   return screen.queryAllByRole('region');
 }
 
-/**
- * The open panels of the two `uid_1` rows, in DOM order. Both rows hold the same dashboard UID, so
- * the panel name is the same for both and only their position and id tell them apart.
- */
 function uidVariablesPanels() {
   return screen.getAllByRole('region', { name: 'Template variables for uid_1' });
 }
@@ -232,8 +216,6 @@ describe('PlaylistTable', () => {
 
     await expandBothUidRows(user);
 
-    // Both open panels belong to the UID rows, so neither non-UID row gained one: the tag and id
-    // rows would name their panel after their own value, not after the duplicated UID.
     expect(uidVariablesPanels()).toHaveLength(2);
     expect(screen.queryByRole('region', { name: 'Template variables for graph-ng' })).not.toBeInTheDocument();
     expect(screen.queryByRole('region', { name: 'Template variables for 3' })).not.toBeInTheDocument();
@@ -244,8 +226,6 @@ describe('PlaylistTable', () => {
 
     await user.click(disclosureButtons()[0]);
 
-    // `host` belongs to the first item and `cluster` to the second, so the editor on screen also
-    // identifies the row the disclosure opened.
     expect(await screen.findByRole('textbox', { name: 'Variable name for host' })).toBeInTheDocument();
     expect(disclosureStates()).toEqual(['true', 'false']);
     expect(variablesPanels()).toHaveLength(1);
@@ -268,8 +248,6 @@ describe('PlaylistTable', () => {
 
     await user.click(disclosureButtons()[1]);
 
-    // Both rows carry the same dashboard UID, so only distinct ids matched to the panels in DOM
-    // order show that each row derives its own panel id rather than sharing one.
     const panelIds = disclosureControls();
     expect(panelIds[0]).not.toEqual(panelIds[1]);
     expect(uidVariablesPanels().map((panel) => panel.getAttribute('id'))).toEqual(panelIds);

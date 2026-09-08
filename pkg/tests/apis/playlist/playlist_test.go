@@ -17,7 +17,9 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 
+	playlistapp "github.com/grafana/grafana/apps/playlist/pkg/app"
 	playlist "github.com/grafana/grafana/pkg/registry/apps/playlist"
 	"github.com/grafana/grafana/pkg/services/accesscontrol"
 	"github.com/grafana/grafana/pkg/services/org"
@@ -50,10 +52,8 @@ func TestIntegrationPlaylist(t *testing.T) {
 			EnableFeatureToggles: []string{"playlistsRBAC"},
 		}))
 
-		// The accepted verbs will change when dual write is enabled
 		disco, err := h.GetGroupVersionInfoJSON("playlist.grafana.app")
 		require.NoError(t, err)
-		// t.Logf("%s", disco)
 		require.JSONEq(t, `[
           {
             "freshness": "Current",
@@ -143,22 +143,19 @@ func TestIntegrationPlaylist(t *testing.T) {
 
 func doPlaylistTests(t *testing.T, helper *apis.K8sTestHelper) *apis.K8sTestHelper {
 	t.Run("Check direct List permissions from different org users", func(t *testing.T) {
-		// Check view permissions
 		rsp := helper.List(helper.Org1.Viewer, "default", gvr)
 		require.Equal(t, 200, rsp.Response.StatusCode)
 		require.NotNil(t, rsp.Result)
 		require.Empty(t, rsp.Result.Items)
 		require.Nil(t, rsp.Status)
 
-		// Check view permissions
 		rsp = helper.List(helper.OrgB.Viewer, "default", gvr)
-		require.Equal(t, 403, rsp.Response.StatusCode) // OrgB can not see default namespace
+		require.Equal(t, 403, rsp.Response.StatusCode) // OrgB cannot access Org1's default namespace
 		require.Nil(t, rsp.Result)
 		require.Equal(t, metav1.StatusReasonForbidden, rsp.Status.Reason)
 
-		// Check view permissions
 		rsp = helper.List(helper.OrgB.Viewer, "org-22", gvr)
-		require.Equal(t, 403, rsp.Response.StatusCode) // Unknown/not a member
+		require.Equal(t, 403, rsp.Response.StatusCode) // org-22 is not an organization this user is a member of
 		require.Nil(t, rsp.Result)
 		require.Equal(t, metav1.StatusReasonForbidden, rsp.Status.Reason)
 	})
@@ -182,7 +179,6 @@ func doPlaylistTests(t *testing.T, helper *apis.K8sTestHelper) *apis.K8sTestHelp
 			GVR:  gvr,
 		})
 
-		// Without any RBAC grant, a None-role user is denied all playlist operations.
 		t.Run("None role denied by default", func(t *testing.T) {
 			_, err = clientNone.Resource.Get(context.Background(), created.GetName(), metav1.GetOptions{})
 			require.Error(t, err)
@@ -203,13 +199,9 @@ func doPlaylistTests(t *testing.T, helper *apis.K8sTestHelper) *apis.K8sTestHelp
 			require.Error(t, err)
 		})
 
-		// When a None-role user is explicitly granted playlists:read via RBAC, they can
-		// read playlists — this is the proper fix for the customer use case described in
-		// https://github.com/grafana/grafana/issues/115712.
-		//
-		// Note: we create a fresh user and use a managed: role name so the permission is
-		// visible to GetUserPermissions (which filters by OSSRolesPrefixes = ["managed:", "extsvc:"]).
-		// AddUserPermissionToDB uses "test:role" which is silently filtered out.
+		// The permission is granted through a fresh user and a managed: role name because
+		// GetUserPermissions filters by OSSRolesPrefixes = ["managed:", "extsvc:"], and the
+		// generic AddUserPermissionToDB helper uses "test:role", which is silently filtered out.
 		t.Run("None role with explicit playlists:read can read but not write", func(t *testing.T) {
 			noneWithRead := helper.CreateUser("none-with-read", apis.Org1, org.RoleNone, nil)
 			noneUserID, err := noneWithRead.Identity.GetInternalID()
@@ -275,20 +267,18 @@ func doPlaylistTests(t *testing.T, helper *apis.K8sTestHelper) *apis.K8sTestHelp
 	})
 
 	t.Run("Check k8s client-go List from different org users", func(t *testing.T) {
-		// Check Org1 Viewer
 		client := helper.GetResourceClient(apis.ResourceClientArgs{
 			User:      helper.Org1.Viewer,
-			Namespace: "", // << fills in the value org1 is allowed to see!
+			Namespace: "", // Empty resolves to the user's own organization namespace
 			GVR:       gvr,
 		})
 		rsp, err := client.Resource.List(context.Background(), metav1.ListOptions{})
 		require.NoError(t, err)
 		require.Empty(t, rsp.Items)
 
-		// Check org2 viewer can not see org1 (default namespace)
 		client = helper.GetResourceClient(apis.ResourceClientArgs{
 			User:      helper.OrgB.Viewer,
-			Namespace: "default", // actually org1
+			Namespace: "default", // The default namespace belongs to Org1
 			GVR:       gvr,
 		})
 		rsp, err = client.Resource.List(context.Background(), metav1.ListOptions{})
@@ -296,7 +286,6 @@ func doPlaylistTests(t *testing.T, helper *apis.K8sTestHelper) *apis.K8sTestHelp
 		require.Nil(t, rsp)
 		require.Equal(t, metav1.StatusReasonForbidden, statusError.Status().Reason)
 
-		// Check invalid namespace
 		client = helper.GetResourceClient(apis.ResourceClientArgs{
 			User:      helper.OrgB.Viewer,
 			Namespace: "org-22", // org 22 does not exist
@@ -314,7 +303,7 @@ func doPlaylistTests(t *testing.T, helper *apis.K8sTestHelper) *apis.K8sTestHelp
 			GVR:  gvr,
 		})
 
-		// This includes the raw dashboard values that are currently sent (but should not be and are ignored)
+		// Legacy clients may send dashboard metadata alongside each item; the bridge ignores it.
 		legacyPayload := `{
 			"name": "Test",
 			"interval": "20s",
@@ -379,22 +368,20 @@ func doPlaylistTests(t *testing.T, helper *apis.K8sTestHelper) *apis.K8sTestHelp
   "status": {}
 }`
 
-		// List includes the expected result
 		k8sList, err := client.Resource.List(context.Background(), metav1.ListOptions{})
 		require.NoError(t, err)
 		require.Equal(t, 1, len(k8sList.Items))
 		require.JSONEq(t, expectedResult, client.SanitizeJSON(&k8sList.Items[0], "labels"))
 
-		// Get should return the same result
 		found, err := client.Resource.Get(context.Background(), uid, metav1.GetOptions{})
 		require.NoError(t, err)
 		require.JSONEq(t, expectedResult, client.SanitizeJSON(found, "labels"))
 
-		// The legacy bodies below are compared as raw bytes, not with JSONEq, because they
-		// pin the exact response an existing client already parses: JSONEq ignores key order
-		// and formatting, so it would not catch an item that gained a key (an optional field
-		// serialized even when empty) or a reordered field. This suite runs with
-		// AppModeProduction, so web.Context.JSON writes compact JSON plus a single newline.
+		// The legacy bodies below are compared as raw bytes, not with JSONEq, because they pin
+		// the exact response an existing client already parses: raw equality also fixes field
+		// order, the compact formatting and the single trailing newline, all of which JSONEq
+		// ignores. This suite runs with AppModeProduction, so web.Context.JSON writes compact
+		// JSON followed by that newline.
 		expectedLegacyDTO := `{"uid":"` + uid + `","name":"Test","interval":"20s","items":[{"type":"dashboard_by_uid","value":"xCmMwXdVz"},{"type":"dashboard_by_tag","value":"graph-ng"}]}` + "\n"
 		require.Equal(t, expectedLegacyDTO, string(legacyCreate.Body))
 
@@ -414,7 +401,6 @@ func doPlaylistTests(t *testing.T, helper *apis.K8sTestHelper) *apis.K8sTestHelp
 		require.Equal(t, 200, legacyItems.Response.StatusCode)
 		require.Equal(t, `[{"type":"dashboard_by_uid","value":"xCmMwXdVz"},{"type":"dashboard_by_tag","value":"graph-ng"}]`+"\n", string(legacyItems.Body))
 
-		// Now modify the interval
 		updatedInterval := `"interval": "10m"`
 		legacyPayload = strings.Replace(legacyPayload, `"interval": "20s"`, updatedInterval, 1)
 		require.JSONEq(t, expectedResult, client.SanitizeJSON(&k8sList.Items[0], "labels"))
@@ -474,7 +460,6 @@ func doPlaylistTests(t *testing.T, helper *apis.K8sTestHelper) *apis.K8sTestHelp
 		expectedSpec, _, err := unstructured.NestedMap(expectedUnstructuredResult.Object, "spec")
 		require.NoError(t, err)
 
-		// Make sure the changed interval is now returned from k8s
 		found, err = client.Resource.Get(context.Background(), uid, metav1.GetOptions{})
 		require.NoError(t, err)
 		foundSpec, _, err := unstructured.NestedMap(found.Object, "spec")
@@ -483,13 +468,12 @@ func doPlaylistTests(t *testing.T, helper *apis.K8sTestHelper) *apis.K8sTestHelp
 		require.Equal(t, accExpected.GetName(), found.GetName())
 		require.Equal(t, expectedSpec, foundSpec)
 
-		// Delete does not return anything
 		deleteResponse := apis.DoRequest(helper, apis.RequestParams{
 			User:   client.Args.User,
 			Method: http.MethodDelete,
 			Path:   "/api/playlists/" + uid,
 			Body:   []byte(legacyPayload),
-		}, &playlist.PlaylistDTO{}) // response is empty
+		}, &playlist.PlaylistDTO{})
 		require.Equal(t, 200, deleteResponse.Response.StatusCode)
 
 		found, err = client.Resource.Get(context.Background(), uid, metav1.GetOptions{})
@@ -560,7 +544,6 @@ func doPlaylistTests(t *testing.T, helper *apis.K8sTestHelper) *apis.K8sTestHelp
 		uid := legacyCreate.Result.UID
 		require.NotEmpty(t, uid)
 
-		// Map keys are serialized in sorted order, hence cluster before host.
 		expectedResult := `{
   "apiVersion": "playlist.grafana.app/v1",
   "kind": "Playlist",
@@ -612,7 +595,6 @@ func doPlaylistTests(t *testing.T, helper *apis.K8sTestHelper) *apis.K8sTestHelp
 		require.True(t, ok)
 		require.NotContains(t, storedTagItem, "variables")
 
-		// The deprecated legacy API returns the same variables on its DTOs
 		legacyGet := apis.DoRequest(helper, apis.RequestParams{
 			User:   client.Args.User,
 			Method: http.MethodGet,
@@ -649,14 +631,12 @@ func doPlaylistTests(t *testing.T, helper *apis.K8sTestHelper) *apis.K8sTestHelp
 		require.Len(t, dtoResponse.Result.Items, 3)
 		require.Equal(t, map[string][]string{"host": {"q"}}, dtoResponse.Result.Items[1].Variables)
 
-		// The changed value is now stored, and the untouched items are unchanged
 		found, err = client.Resource.Get(context.Background(), uid, metav1.GetOptions{})
 		require.NoError(t, err)
 		require.JSONEq(t,
 			strings.Replace(expectedResult, `"host": ["z"]`, `"host": ["q"]`, 1),
 			client.SanitizeJSON(found, "labels"))
 
-		// Variables written straight through the k8s api survive both read paths too.
 		// spec.title and spec.interval are required here because the legacy DTO conversion
 		// type-asserts both of them without a guard.
 		k8sName := "playlist-with-variables"
@@ -720,6 +700,234 @@ func doPlaylistTests(t *testing.T, helper *apis.K8sTestHelper) *apis.K8sTestHelp
 		require.NotContains(t, v0alpha1TagItem, "variables")
 	})
 
+	// Every write path enforces the same two rules before anything is stored: the playlist
+	// collection budget, and the contract that a variable holds one or more non-empty string
+	// values. The legacy endpoints enforce it in front of the conversion, and both served
+	// versions enforce it through the single shared admission validator. Each case compares the
+	// size of the collection before and after the rejected write, so a rejection that still
+	// persisted an object fails here, and every attempted creation registers its cleanup
+	// immediately so the org-scoped List assertions in the sibling sub-tests stay valid.
+	t.Run("Reject playlist item variables that break the contract", func(t *testing.T) {
+		client := helper.GetResourceClient(apis.ResourceClientArgs{
+			User: helper.Org1.Editor,
+			GVR:  gvr,
+		})
+
+		countPlaylists := func(t *testing.T) int {
+			t.Helper()
+			list, err := client.Resource.List(context.Background(), metav1.ListOptions{})
+			require.NoError(t, err)
+			return len(list.Items)
+		}
+
+		// One variable past the maximum, and one item past it: both are built here rather than
+		// written out, and both are driven by the shared constants so the fixtures follow the
+		// budget instead of restating it.
+		overLimitVariables := &strings.Builder{}
+		for i := range playlistapp.MaxItemVariables + 1 {
+			if i > 0 {
+				overLimitVariables.WriteString(",")
+			}
+			fmt.Fprintf(overLimitVariables, `"host-%d":["a"]`, i)
+		}
+		overLimitItems := &strings.Builder{}
+		for i := range playlistapp.MaxPlaylistItems + 1 {
+			if i > 0 {
+				overLimitItems.WriteString(",")
+			}
+			fmt.Fprintf(overLimitItems, `{"type":"dashboard_by_uid","value":"uid-%d"}`, i)
+		}
+
+		legacyCases := []struct {
+			name  string
+			items string
+		}{
+			{
+				name:  "a null value list",
+				items: `[{"type":"dashboard_by_uid","value":"xCmMwXdVz","variables":{"host":null}}]`,
+			},
+			{
+				name:  "a null array element",
+				items: `[{"type":"dashboard_by_uid","value":"xCmMwXdVz","variables":{"host":[null]}}]`,
+			},
+			{
+				name:  "more variables than the maximum",
+				items: `[{"type":"dashboard_by_uid","value":"xCmMwXdVz","variables":{` + overLimitVariables.String() + `}}]`,
+			},
+			{
+				name:  "more items than the maximum",
+				items: `[` + overLimitItems.String() + `]`,
+			},
+			{
+				// One item, one oversized value: the body is refused while it is being read,
+				// before it is decoded into items at all, which is the only limit that bounds
+				// a payload whose size is not in its element count.
+				name:  "a body larger than the cap",
+				items: `[{"type":"dashboard_by_uid","value":"` + strings.Repeat("v", 5<<20) + `"}]`,
+			},
+		}
+		for _, tc := range legacyCases {
+			t.Run("legacy POST with "+tc.name, func(t *testing.T) {
+				before := countPlaylists(t)
+				rejected := apis.DoRequest(helper, apis.RequestParams{
+					User:   client.Args.User,
+					Method: http.MethodPost,
+					Path:   "/api/playlists",
+					Body:   []byte(`{"name":"Over budget","interval":"20s","items":` + tc.items + `,"uid":""}`),
+				}, &playlist.Playlist{})
+				// The legacy handler answers a refused body with the same 400 it uses for a
+				// malformed one; the field-level detail is logged rather than returned.
+				require.Equal(t, http.StatusBadRequest, rejected.Response.StatusCode)
+				require.Equal(t, before, countPlaylists(t),
+					"a rejected legacy write must not create a playlist")
+			})
+		}
+
+		resourceCases := []struct {
+			name      string
+			variables string
+			// path is the field path the rejection must name, which is what proves the
+			// playlist validator refused the write rather than something incidental.
+			path string
+		}{
+			{
+				name:      "a null value list",
+				variables: `{"host":null}`,
+				path:      "spec.items[0].variables[host]",
+			},
+			{
+				name:      "a null array element",
+				variables: `{"host":[null]}`,
+				path:      "spec.items[0].variables[host][0]",
+			},
+			{
+				name:      "more variables than the maximum",
+				variables: `{` + overLimitVariables.String() + `}`,
+				path:      "spec.items[0].variables",
+			},
+		}
+		// Both versions are checked through the same cases: the two ManagedKinds entries share
+		// one validator instance, and a version that stopped enforcing the contract would
+		// otherwise be a way around it that only shows up in production.
+		for _, version := range []string{"v1", "v0alpha1"} {
+			versionClient := helper.GetResourceClient(apis.ResourceClientArgs{
+				User: helper.Org1.Editor,
+				GVR: schema.GroupVersionResource{
+					Group:    gvr.Group,
+					Version:  version,
+					Resource: gvr.Resource,
+				},
+			})
+			for i, tc := range resourceCases {
+				t.Run(version+" create with "+tc.name, func(t *testing.T) {
+					name := fmt.Sprintf("rejected-%s-%d", version, i)
+					before := countPlaylists(t)
+					created, err := versionClient.Resource.Create(context.Background(),
+						helper.LoadYAMLOrJSON(`{
+							"apiVersion": "playlist.grafana.app/`+version+`",
+							"kind": "Playlist",
+							"metadata": { "name": "`+name+`" },
+							"spec": {
+							  "title": "Over budget",
+							  "interval": "5m",
+							  "items": [
+								{ "type": "dashboard_by_uid", "value": "xCmMwXdVz", "variables": `+tc.variables+` }
+							  ]
+							}
+						  }`),
+						metav1.CreateOptions{},
+					)
+					// Registered immediately after the attempt, before the assertions below:
+					// if admission ever stopped refusing this payload the object would exist,
+					// and the fatal assertions that follow must not leave it behind.
+					t.Cleanup(func() {
+						err := client.Resource.Delete(context.Background(), name, metav1.DeleteOptions{})
+						if err != nil && !apierrors.IsNotFound(err) {
+							t.Errorf("failed to clean up playlist %s: %v", name, err)
+						}
+					})
+					require.Error(t, err)
+					require.Nil(t, created)
+					require.Contains(t, err.Error(), tc.path)
+					require.Equal(t, before, countPlaylists(t),
+						"a rejected resource write must not create a playlist")
+
+					_, err = client.Resource.Get(context.Background(), name, metav1.GetOptions{})
+					require.True(t, apierrors.IsNotFound(err),
+						"the rejected object must not exist, got %v", err)
+				})
+			}
+		}
+
+		t.Run("replace and patch of a stored playlist", func(t *testing.T) {
+			name := "playlist-variables-contract"
+			created, err := client.Resource.Create(context.Background(),
+				helper.LoadYAMLOrJSON(`{
+					"apiVersion": "playlist.grafana.app/v1",
+					"kind": "Playlist",
+					"metadata": { "name": "`+name+`" },
+					"spec": {
+					  "title": "Within budget",
+					  "interval": "5m",
+					  "items": [
+						{ "type": "dashboard_by_uid", "value": "xCmMwXdVz", "variables": { "host": ["a"] } }
+					  ]
+					}
+				  }`),
+				metav1.CreateOptions{},
+			)
+			t.Cleanup(func() {
+				err := client.Resource.Delete(context.Background(), name, metav1.DeleteOptions{})
+				if err != nil && !apierrors.IsNotFound(err) {
+					t.Errorf("failed to clean up playlist %s: %v", name, err)
+				}
+			})
+			require.NoError(t, err)
+			require.Equal(t, name, created.GetName())
+
+			// PUT :: the whole spec is replaced, with one variable set to null
+			replaced := created.DeepCopy()
+			require.NoError(t, unstructured.SetNestedSlice(replaced.Object, []any{
+				map[string]any{
+					"type":      "dashboard_by_uid",
+					"value":     "xCmMwXdVz",
+					"variables": map[string]any{"host": nil},
+				},
+			}, "spec", "items"))
+			_, err = client.Resource.Update(context.Background(), replaced, metav1.UpdateOptions{})
+			require.Error(t, err)
+			require.Contains(t, err.Error(), "spec.items[0].variables[host]")
+
+			// PATCH :: a JSON patch, not a merge patch. A JSON merge patch cannot express this
+			// case at all: null means "remove this key" to the merge algorithm, and the nulls
+			// inside a replacement value are pruned with it, so the same payload as a merge
+			// patch produces an item with no variables and is legitimately accepted.
+			_, err = client.Resource.Patch(context.Background(), name, types.JSONPatchType,
+				[]byte(`[{"op":"replace","path":"/spec/items/0/variables/host","value":null}]`),
+				metav1.PatchOptions{})
+			require.Error(t, err)
+			require.Contains(t, err.Error(), "spec.items[0].variables[host]")
+
+			// PATCH :: the budget applies to a patched object as much as to a replaced one
+			_, err = client.Resource.Patch(context.Background(), name, types.MergePatchType,
+				[]byte(`{"spec":{"items":[{"type":"dashboard_by_uid","value":"xCmMwXdVz","variables":{`+
+					overLimitVariables.String()+`}}]}}`),
+				metav1.PatchOptions{})
+			require.Error(t, err)
+			require.Contains(t, err.Error(), "spec.items[0].variables")
+
+			// Neither refused write changed what is stored
+			found, err := client.Resource.Get(context.Background(), name, metav1.GetOptions{})
+			require.NoError(t, err)
+			items, _, err := unstructured.NestedSlice(found.Object, "spec", "items")
+			require.NoError(t, err)
+			require.Len(t, items, 1)
+			storedItem, ok := items[0].(map[string]any)
+			require.True(t, ok)
+			require.Equal(t, map[string]any{"host": []any{"a"}}, storedItem["variables"])
+		})
+	})
+
 	t.Run("Do CRUD via k8s (and check that legacy api still works)", func(t *testing.T) {
 		t.Skip()
 		client := helper.GetResourceClient(apis.ResourceClientArgs{
@@ -727,7 +935,6 @@ func doPlaylistTests(t *testing.T, helper *apis.K8sTestHelper) *apis.K8sTestHelp
 			GVR:  gvr,
 		})
 
-		// Create the playlist "test"
 		first, err := client.Resource.Create(context.Background(),
 			helper.LoadYAMLOrJSONFile("testdata/playlist-test-create.yaml"),
 			metav1.CreateOptions{},
@@ -736,7 +943,6 @@ func doPlaylistTests(t *testing.T, helper *apis.K8sTestHelper) *apis.K8sTestHelp
 		require.Equal(t, "test", first.GetName())
 		uids := []string{first.GetName()} //nolint:prealloc
 
-		// Create (with name generation) two playlists
 		for range 2 {
 			out, err := client.Resource.Create(context.Background(),
 				helper.LoadYAMLOrJSONFile("testdata/playlist-generate.yaml"),
@@ -745,16 +951,14 @@ func doPlaylistTests(t *testing.T, helper *apis.K8sTestHelper) *apis.K8sTestHelp
 			require.NoError(t, err)
 			uids = append(uids, out.GetName())
 		}
-		slices.Sort(uids) // make list compare stable
+		slices.Sort(uids)
 
-		// Check that everything is returned from the List command
 		list, err := client.Resource.List(context.Background(), metav1.ListOptions{})
 		require.NoError(t, err)
 		require.Equal(t, uids, SortSlice(Map(list.Items, func(item unstructured.Unstructured) string {
 			return item.GetName()
 		})))
 
-		// The legacy endpoint has the same results
 		searchResponse := apis.DoRequest(helper, apis.RequestParams{
 			User:   client.Args.User,
 			Method: http.MethodGet,
@@ -765,12 +969,10 @@ func doPlaylistTests(t *testing.T, helper *apis.K8sTestHelper) *apis.K8sTestHelp
 			return item.UID
 		})))
 
-		// Check all playlists
 		for _, uid := range uids {
 			getFromBothAPIs(t, helper, client, uid, nil)
 		}
 
-		// PUT :: Update the title (full payload)
 		updated, err := client.Resource.Update(context.Background(),
 			helper.LoadYAMLOrJSONFile("testdata/playlist-test-replace.yaml"),
 			metav1.UpdateOptions{},
@@ -785,7 +987,6 @@ func doPlaylistTests(t *testing.T, helper *apis.K8sTestHelper) *apis.K8sTestHelp
 		})
 		require.Equal(t, updated.GetResourceVersion(), out.GetResourceVersion())
 
-		// PATCH :: apply only some fields
 		updated, err = client.Resource.Apply(context.Background(), "test",
 			helper.LoadYAMLOrJSONFile("testdata/playlist-test-apply.yaml"),
 			metav1.ApplyOptions{
@@ -802,23 +1003,19 @@ func doPlaylistTests(t *testing.T, helper *apis.K8sTestHelper) *apis.K8sTestHelp
 			Interval: "22m", // has not changed from previous update
 		})
 
-		// Now delete all playlist (three)
 		for _, uid := range uids {
 			err := client.Resource.Delete(context.Background(), uid, metav1.DeleteOptions{})
 			require.NoError(t, err)
 
-			// Second call is not found!
 			err = client.Resource.Delete(context.Background(), uid, metav1.DeleteOptions{})
 			statusError := helper.AsStatusError(err)
 			require.Equal(t, metav1.StatusReasonNotFound, statusError.Status().Reason)
 
-			// Not found from k8s getter
 			_, err = client.Resource.Get(context.Background(), uid, metav1.GetOptions{})
 			statusError = helper.AsStatusError(err)
 			require.Equal(t, metav1.StatusReasonNotFound, statusError.Status().Reason)
 		}
 
-		// Check that they are all gone
 		list, err = client.Resource.List(context.Background(), metav1.ListOptions{})
 		require.NoError(t, err)
 		require.Empty(t, list.Items)
@@ -827,7 +1024,6 @@ func doPlaylistTests(t *testing.T, helper *apis.K8sTestHelper) *apis.K8sTestHelp
 	return helper
 }
 
-// typescript style map function
 func Map[A any, B any](input []A, m func(A) B) []B {
 	output := make([]B, len(input))
 	for i, element := range input {
@@ -841,12 +1037,10 @@ func SortSlice[A cmp.Ordered](input []A) []A {
 	return input
 }
 
-// This does a get with both k8s and legacy API, and verifies the results are the same
 func getFromBothAPIs(t *testing.T,
 	helper *apis.K8sTestHelper,
 	client *apis.K8sResourceClient,
 	uid string,
-	// Optionally match some expect some values
 	expect *playlist.PlaylistDTO,
 ) *unstructured.Unstructured {
 	t.Helper()
@@ -890,4 +1084,155 @@ func getFromBothAPIs(t *testing.T,
 		}
 	}
 	return found
+}
+
+// TestIntegrationPlaylistAnonymousOrgIsolation pins the organization boundary for the
+// configured anonymous identity on both served versions of the resource API.
+//
+// The configuration under test is the one that makes the read path reachable: anonymous
+// access is enabled and bound to a single organization, and playlistsRBAC is left at its
+// default of off, so the playlist authorizer expresses no opinion for a Viewer and the org
+// role authorizer grants the read verbs. In that state the namespace named in the request
+// URL must not move the anonymous identity into another organization, because a playlist
+// spec — including the per-item template variable values — is organization-scoped data.
+func TestIntegrationPlaylistAnonymousOrgIsolation(t *testing.T) {
+	testutil.SkipIntegrationTestInShortMode(t)
+
+	helper := apis.NewK8sTestHelper(t, testinfra.GrafanaOpts{
+		AppModeProduction: true,           // do not start extra port 6443
+		AnonymousUserRole: org.RoleViewer, // anonymous lands in org 1, the harness anonymous org
+		// [auth.anonymous] enabled = true is the harness default and is what this test needs,
+		// so DisableAnonymous stays false. playlistsRBAC is deliberately not enabled.
+	})
+
+	anonNamespace := apis.DefaultNamespace
+	otherNamespace := helper.Namespacer(helper.OrgB.Admin.Identity.GetOrgID())
+	require.NotEqual(t, anonNamespace, otherNamespace, "the two organizations must have distinct namespaces")
+
+	// The asset that must stay invisible: a playlist owned by the other organization whose
+	// title and variable value are distinctive enough to be searched for in any response body.
+	const (
+		otherOrgTitle         = "Other org playlist"
+		otherOrgVariableValue = "anon-isolation-secret-host"
+	)
+	otherOrgClient := helper.GetResourceClient(apis.ResourceClientArgs{
+		User: helper.OrgB.Admin,
+		GVR:  gvr,
+	})
+	otherOrgPlaylist, err := otherOrgClient.Resource.Create(context.Background(),
+		helper.LoadYAMLOrJSON(fmt.Sprintf(`{
+			"apiVersion": "playlist.grafana.app/v1",
+			"kind": "Playlist",
+			"metadata": { "generateName": "x" },
+			"spec": {
+				"title": %q,
+				"interval": "5m",
+				"items": [
+					{ "type": "dashboard_by_uid", "value": "xCmMwXdVz", "variables": { "host": [%q] } }
+				]
+			}
+		}`, otherOrgTitle, otherOrgVariableValue)),
+		metav1.CreateOptions{},
+	)
+	require.NoError(t, err)
+	require.NotEmpty(t, otherOrgPlaylist.GetName())
+	t.Cleanup(func() {
+		err := otherOrgClient.Resource.Delete(context.Background(), otherOrgPlaylist.GetName(), metav1.DeleteOptions{})
+		if err != nil && !apierrors.IsNotFound(err) {
+			t.Errorf("failed to clean up playlist %s: %v", otherOrgPlaylist.GetName(), err)
+		}
+	})
+
+	// A playlist in the anonymous identity's own organization: scoping anonymous access must
+	// not remove it, so this object has to stay readable without credentials.
+	anonOrgClient := helper.GetResourceClient(apis.ResourceClientArgs{
+		User: helper.Org1.Admin,
+		GVR:  gvr,
+	})
+	anonOrgPlaylist, err := anonOrgClient.Resource.Create(context.Background(),
+		helper.LoadYAMLOrJSON(`{
+			"apiVersion": "playlist.grafana.app/v1",
+			"kind": "Playlist",
+			"metadata": { "generateName": "x" },
+			"spec": {
+				"title": "Anonymous org playlist",
+				"interval": "5m",
+				"items": [
+					{ "type": "dashboard_by_uid", "value": "xCmMwXdVz", "variables": { "host": ["own-org-host"] } }
+				]
+			}
+		}`),
+		metav1.CreateOptions{},
+	)
+	require.NoError(t, err)
+	require.NotEmpty(t, anonOrgPlaylist.GetName())
+	t.Cleanup(func() {
+		err := anonOrgClient.Resource.Delete(context.Background(), anonOrgPlaylist.GetName(), metav1.DeleteOptions{})
+		if err != nil && !apierrors.IsNotFound(err) {
+			t.Errorf("failed to clean up playlist %s: %v", anonOrgPlaylist.GetName(), err)
+		}
+	})
+
+	for _, version := range []string{"v1", "v0alpha1"} {
+		t.Run(version, func(t *testing.T) {
+			collection := fmt.Sprintf("/apis/%s/%s/namespaces/%s/playlists", gvr.Group, version, otherNamespace)
+			name := otherOrgPlaylist.GetName()
+
+			// Every read shape the resource API serves for another organization's namespace.
+			// The watch bounds itself with timeoutSeconds so an allowed watch answers instead
+			// of streaming until the client times out.
+			for _, tc := range []struct {
+				verb string
+				path string
+				// nameInPath marks the requests that address the object by name. Their denial
+				// is reported through the standard Kubernetes Forbidden message, which echoes
+				// the name the caller itself put in the URL, so that name is not evidence of
+				// disclosure and only the stored spec is asserted against.
+				nameInPath bool
+			}{
+				{verb: "list", path: collection},
+				{verb: "watch", path: collection + "?watch=true&timeoutSeconds=1"},
+				{verb: "get", path: collection + "/" + name, nameInPath: true},
+				{verb: "get status", path: collection + "/" + name + "/status", nameInPath: true},
+			} {
+				t.Run(tc.verb, func(t *testing.T) {
+					// No User: the request carries no credentials, so it is served as the
+					// configured anonymous identity.
+					rsp := apis.DoRequest(helper, apis.RequestParams{
+						Method: http.MethodGet,
+						Path:   tc.path,
+					}, &apis.AnyResourceList{})
+
+					require.Equal(t, http.StatusForbidden, rsp.Response.StatusCode, string(rsp.Body))
+					require.NotNil(t, rsp.Status, string(rsp.Body))
+					require.Equal(t, metav1.StatusReasonForbidden, rsp.Status.Reason)
+					// DoRequest clears Result when the body is a Status, so a nil Result is
+					// how "the response carried no objects at all" reads here.
+					require.Nil(t, rsp.Result, "a denied read must carry no objects")
+					require.NotContains(t, string(rsp.Body), otherOrgVariableValue,
+						"another organization's variable values must never reach an anonymous reader")
+					require.NotContains(t, string(rsp.Body), otherOrgTitle,
+						"another organization's playlist titles must never reach an anonymous reader")
+					if !tc.nameInPath {
+						require.NotContains(t, string(rsp.Body), name,
+							"another organization's playlist names must never reach an anonymous reader")
+					}
+				})
+			}
+
+			t.Run("reads its own organization", func(t *testing.T) {
+				rsp := apis.DoRequest(helper, apis.RequestParams{
+					Method: http.MethodGet,
+					Path:   fmt.Sprintf("/apis/%s/%s/namespaces/%s/playlists", gvr.Group, version, anonNamespace),
+				}, &apis.AnyResourceList{})
+
+				require.Equal(t, http.StatusOK, rsp.Response.StatusCode, string(rsp.Body))
+				require.Nil(t, rsp.Status)
+				require.NotNil(t, rsp.Result)
+				require.Contains(t, string(rsp.Body), anonOrgPlaylist.GetName(),
+					"the anonymous identity must still read the organization it is configured for")
+				require.NotContains(t, string(rsp.Body), otherOrgVariableValue)
+			})
+		})
+	}
 }

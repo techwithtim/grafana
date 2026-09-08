@@ -3,31 +3,35 @@ import { Fragment, type KeyboardEvent, useId, useState } from 'react';
 
 import { type GrafanaTheme2 } from '@grafana/data';
 import { Trans, t } from '@grafana/i18n';
-import { Button, Field, IconButton, Input, useStyles2 } from '@grafana/ui';
+import { Alert, Button, Field, IconButton, Input, useStyles2 } from '@grafana/ui';
+
+import {
+  MAX_VALUES_PER_VARIABLE,
+  MAX_VARIABLE_NAME_LENGTH,
+  MAX_VARIABLE_VALUE_LENGTH,
+  MAX_VARIABLE_VALUES_TEXT_LENGTH,
+  MAX_VARIABLES_PER_ITEM,
+  isWithinCodePointLimit,
+  isWithinVariableBudget,
+} from './variableLimits';
 
 interface Props {
-  /**
-   * Template variable values stored on the playlist item: a variable name mapped to one or more
-   * values. An absent map means the item plays without variables.
-   */
   variables?: Record<string, string[]>;
   /**
    * Receives a complete replacement map, or `undefined` once the last variable is removed. The
-   * editor never mutates `variables`, which comes from the RTK Query cache.
+   * editor never mutates `variables`: that map belongs to the caller, and may be a value held in
+   * an RTK Query cache entry.
    */
   onChange: (next?: Record<string, string[]>) => void;
 }
 
-/** The two inputs a row is made of, used to attach an error and a keystroke to one of them. */
 type RowField = 'name' | 'values';
 
-/** The text a row currently shows, before it is normalized and committed. */
 interface RowDraft {
   name: string;
   values: string;
 }
 
-/** A validation message plus the input it belongs to, so it renders under the offending input. */
 interface RowError {
   field: RowField;
   message: string;
@@ -50,12 +54,9 @@ const EMPTY_DRAFT: RowDraft = { name: '', values: '' };
 const EMPTY_ROW_STATE: RowState = { drafts: new Map(), errors: new Map() };
 
 /**
- * Splits the comma-separated values input into the list stored on the playlist item.
- *
- * This is the only place playlist variable values are parsed: the playlist runtime receives
- * ready-made lists and serializes them with `urlUtil.toUrlParams`, so no downstream code re-parses
- * user text. A single value containing a comma cannot be expressed this way, which is a documented
- * limitation of the editor rather than an oversight.
+ * The only place playlist variable values are parsed: the runtime serializes the stored lists
+ * with `urlUtil.toUrlParams` and never re-splits them. Commas are delimiters with no escape, so
+ * a value containing one cannot be expressed here.
  */
 function parseValues(raw: string): string[] {
   return raw
@@ -64,7 +65,6 @@ function parseValues(raw: string): string[] {
     .filter(Boolean);
 }
 
-/** The text an untouched row shows: its committed name, and its values as the user would type them. */
 function draftFor(name: string, values: string[]): RowDraft {
   return { name, values: values.join(', ') };
 }
@@ -99,19 +99,16 @@ function reconcileRows(state: RowState, committed: Map<string, string[]>): RowSt
   return { drafts, errors };
 }
 
-/**
- * Edits the template variable values of one `dashboard_by_uid` playlist item.
- *
- * Each existing variable is one row of name and comma-separated values; the row below adds a new
- * variable. Rows are committed individually — on blur or Enter for existing rows, on the add button
- * or Enter for the new one — and a rejected row leaves the playlist item untouched.
- */
 export const PlaylistItemVariables = ({ variables, onChange }: Props) => {
   const styles = useStyles2(getStyles);
   const newNameId = useId();
   const newValuesId = useId();
 
-  const entries = Object.entries(variables ?? {});
+  // A stored map that breaks the budget is never enumerated: one row is several controls, and
+  // building them for every name is the exhaustion the budget exists to prevent. The message below
+  // takes the place of the rows.
+  const withinBudget = isWithinVariableBudget(variables);
+  const entries = withinBudget ? Object.entries(variables ?? {}) : [];
   const committed = new Map(entries);
   const committedNames = Array.from(committed.keys());
 
@@ -126,7 +123,21 @@ export const PlaylistItemVariables = ({ variables, onChange }: Props) => {
     setRowState({ drafts, errors });
   }
 
-  const validate = (name: string, values: string[], otherNames: string[]): RowError | undefined => {
+  /**
+   * The reason a row cannot be committed, or `undefined` when it can.
+   *
+   * The maxima are the same contract the playlist runtime and the API enforce, so a row the editor
+   * accepts is a row that is stored and played whole. Every message is fixed text carrying only the
+   * limit as a number: the name and the values are the untrusted content, and echoing either into
+   * the page is what a validation message must not do. `isNewVariable` adds the one check that
+   * belongs to the add row alone, since an existing row does not grow the map.
+   */
+  const validate = (
+    name: string,
+    values: string[],
+    otherNames: string[],
+    isNewVariable = false
+  ): RowError | undefined => {
     if (name === '') {
       return {
         field: 'name',
@@ -137,6 +148,42 @@ export const PlaylistItemVariables = ({ variables, onChange }: Props) => {
       return {
         field: 'values',
         message: t('playlist-edit.form.variables-value-required', 'Variable value is required'),
+      };
+    }
+    if (!isWithinCodePointLimit(name, MAX_VARIABLE_NAME_LENGTH)) {
+      return {
+        field: 'name',
+        message: t(
+          'playlist-edit.form.variables-name-too-long',
+          'Variable name cannot be longer than {{maxLength}} characters',
+          { maxLength: MAX_VARIABLE_NAME_LENGTH }
+        ),
+      };
+    }
+    if (values.length > MAX_VALUES_PER_VARIABLE) {
+      return {
+        field: 'values',
+        message: t('playlist-edit.form.variables-too-many-values', 'A variable cannot have more than {{max}} values', {
+          max: MAX_VALUES_PER_VARIABLE,
+        }),
+      };
+    }
+    if (values.some((value) => !isWithinCodePointLimit(value, MAX_VARIABLE_VALUE_LENGTH))) {
+      return {
+        field: 'values',
+        message: t(
+          'playlist-edit.form.variables-value-too-long',
+          'A variable value cannot be longer than {{maxLength}} characters',
+          { maxLength: MAX_VARIABLE_VALUE_LENGTH }
+        ),
+      };
+    }
+    if (isNewVariable && otherNames.length >= MAX_VARIABLES_PER_ITEM) {
+      return {
+        field: 'name',
+        message: t('playlist-edit.form.variables-too-many', 'A playlist item cannot have more than {{max}} variables', {
+          max: MAX_VARIABLES_PER_ITEM,
+        }),
       };
     }
     if (otherNames.includes(name)) {
@@ -163,7 +210,6 @@ export const PlaylistItemVariables = ({ variables, onChange }: Props) => {
     });
   };
 
-  /** Returns a row to its committed text by dropping its draft and its error, and nothing else. */
   const clearRow = (name: string) => {
     setRowState((previous) => {
       if (!previous.drafts.has(name) && !previous.errors.has(name)) {
@@ -201,7 +247,6 @@ export const PlaylistItemVariables = ({ variables, onChange }: Props) => {
 
     const next = new Map<string, string[]>();
     for (const [committedName, committedValues] of committed) {
-      // Replacing the key in place keeps a renamed variable at its position in the list.
       next.set(
         committedName === name ? nextName : committedName,
         committedName === name ? nextValues : committedValues
@@ -212,15 +257,13 @@ export const PlaylistItemVariables = ({ variables, onChange }: Props) => {
 
   const updateNewDraft = (field: RowField, value: string) => {
     setNewDraft((previous) => (field === 'name' ? { ...previous, name: value } : { ...previous, values: value }));
-    // Field-scoped for the same reason as the existing rows: a missing name is still missing while
-    // the values are being retyped.
     setNewError((previous) => (previous?.field === field ? undefined : previous));
   };
 
   const commitNewRow = () => {
     const name = newDraft.name.trim();
     const values = parseValues(newDraft.values);
-    const error = validate(name, values, committedNames);
+    const error = validate(name, values, committedNames, true);
     if (error) {
       setNewError(error);
       return;
@@ -253,10 +296,30 @@ export const PlaylistItemVariables = ({ variables, onChange }: Props) => {
     commit();
   };
 
+  if (!withinBudget) {
+    // Editing what cannot be represented would either drop variables the item still plays or
+    // rebuild the whole map on every keystroke, so the item is left exactly as it is stored.
+    return (
+      <div className={styles.container}>
+        <Alert
+          severity="error"
+          title={t('playlist-edit.form.variables-over-budget-title', 'These template variables cannot be edited')}
+        >
+          <Trans i18nKey="playlist-edit.form.variables-over-budget-body">
+            The variables stored on this playlist item are beyond the limits the editor supports. Remove the playlist
+            item and add it again to set its variables.
+          </Trans>
+        </Alert>
+      </div>
+    );
+  }
+
+  // The `maxLength` on the inputs below is a conservative typing bound and nothing more: the DOM
+  // counts UTF-16 code units, so it stops an astral character after half as many of them as the
+  // limit allows and cannot be made to count anything else. What decides acceptance is `validate`
+  // above, which counts the Unicode code points the contract is stated in.
   return (
     <div className={styles.container}>
-      {/* One grid for every row, so the name and values columns line up across all rows including
-          the add row, whose third cell is empty because it has no remove button. */}
       <div className={styles.grid}>
         {entries.map(([name, values]) => {
           const draft = drafts.get(name) ?? draftFor(name, values);
@@ -271,6 +334,7 @@ export const PlaylistItemVariables = ({ variables, onChange }: Props) => {
               >
                 <Input
                   value={draft.name}
+                  maxLength={MAX_VARIABLE_NAME_LENGTH}
                   aria-label={t('playlist-edit.form.variables-name-aria-label', 'Variable name for {{variableName}}', {
                     variableName: name,
                   })}
@@ -287,6 +351,7 @@ export const PlaylistItemVariables = ({ variables, onChange }: Props) => {
               >
                 <Input
                   value={draft.values}
+                  maxLength={MAX_VARIABLE_VALUES_TEXT_LENGTH}
                   aria-label={t('playlist-edit.form.variables-values-aria-label', 'Values for {{variableName}}', {
                     variableName: name,
                   })}
@@ -320,6 +385,7 @@ export const PlaylistItemVariables = ({ variables, onChange }: Props) => {
           <Input
             id={newNameId}
             value={newDraft.name}
+            maxLength={MAX_VARIABLE_NAME_LENGTH}
             placeholder={t('playlist-edit.form.variables-name-placeholder', 'Variable name')}
             onChange={(event) => updateNewDraft('name', event.currentTarget.value)}
             onKeyDown={(event) => handleKeyDown(event, commitNewRow)}
@@ -334,6 +400,7 @@ export const PlaylistItemVariables = ({ variables, onChange }: Props) => {
           <Input
             id={newValuesId}
             value={newDraft.values}
+            maxLength={MAX_VARIABLE_VALUES_TEXT_LENGTH}
             placeholder={t('playlist-edit.form.variables-values-placeholder', 'Values, comma-separated')}
             onChange={(event) => updateNewDraft('values', event.currentTarget.value)}
             onKeyDown={(event) => handleKeyDown(event, commitNewRow)}
@@ -385,7 +452,6 @@ function getStyles(theme: GrafanaTheme2) {
       },
     }),
     remove: css({
-      // Lines the button up with the input beside it rather than the top of the cell.
       marginBlockStart: theme.spacing(0.5),
     }),
     add: css({

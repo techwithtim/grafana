@@ -9,21 +9,9 @@ import (
 	v1 "github.com/grafana/grafana/apps/playlist/pkg/apis/playlist/v1"
 )
 
-// TestExampleConverterPreservesVariables pins the three properties the optional per-item
-// variables field depends on: the converter's JSON round trip carries every name and every
-// value of a populated map without knowing about the field, an item that has no variables is
-// re-encoded without the key at all so a playlist stored by an older Grafana keeps its exact
-// wire format, and an item whose map is present but empty is re-encoded exactly like one that
-// omits the key.
 func TestExampleConverterPreservesVariables(t *testing.T) {
-	// The source version has to differ from the target version. Convert short-circuits and
-	// hands back the input bytes untouched when the source and target GVKs are equal, which
-	// would satisfy every assertion below without the conversion ever running. Both versions
-	// declare the same API group, so only the version differs and the guards still pass.
-	//
-	// The items repeat one dashboard UID with a different variable state each - several names
-	// and values, no variables key at all, and a present but empty map - so every shape the
-	// optional field can arrive in crosses versions in one pass and is asserted by index.
+	// The source version has to differ from the target version: Convert hands back the input
+	// bytes untouched when the source and target GVKs are equal, so no conversion would run.
 	raw := k8s.RawKind{
 		APIVersion: "playlist.grafana.app/v0alpha1",
 		Kind:       "Playlist",
@@ -69,8 +57,6 @@ func TestExampleConverterPreservesVariables(t *testing.T) {
 		t.Fatalf("len(out.Spec.Items) = %d, want %d", len(out.Spec.Items), 3)
 	}
 
-	// Every name and value of the populated map has to come through, in order, and nothing
-	// else: an equality check on the whole map fails on a dropped, added or overwritten entry.
 	want := map[string][]string{"host": {"a", "b"}, "cluster": {"c"}}
 	if got := out.Spec.Items[0].Variables; !reflect.DeepEqual(got, want) {
 		t.Errorf("out.Spec.Items[0].Variables = %#v, want %#v", got, want)

@@ -1157,7 +1157,6 @@
         ],
         "properties": {
           "type": {
-            "description": "type of the item.",
             "type": "string",
             "enum": [
               "dashboard_by_tag",
@@ -1170,12 +1169,14 @@
             "type": "string"
           },
           "variables": {
-            "description": "Optional template variable values applied when this item is played (dashboard_by_uid only).\nEach key is a variable name; its value is a list of one or more values for that variable.\nA multi-value variable is expressed by several list elements under the same key.",
+            "description": "Optional template variable values applied when this item is played (dashboard_by_uid only).\nEach key is a variable name; its value is a list of one or more values for that variable.\nA multi-value variable is expressed by several list elements under the same key.\nThe collection is bounded, because every value is expanded into a dashboard URL and into the\neditor's controls: an item accepts at most 32 variables, a variable name of at most 128\ncharacters, and at most 64 values of at most 1024 characters each. A character means one\nUnicode code point everywhere the limit is applied. The last two maxima are part of this\nschema; the first two are enforced on every write, which is the only place this schema\nlanguage can express them.",
             "type": "object",
             "additionalProperties": {
               "type": "array",
+              "maxItems": 64,
               "items": {
-                "type": "string"
+                "type": "string",
+                "maxLength": 1024
               }
             }
           }
@@ -1194,7 +1195,9 @@
             "type": "string"
           },
           "items": {
+            "description": "The list is bounded: every viewer that plays the playlist walks all of it, loading a\ndashboard and pushing a history entry for each item.",
             "type": "array",
+            "maxItems": 1000,
             "items": {
               "$ref": "#/components/schemas/com.github.grafana.grafana.apps.playlist.pkg.apis.playlist.v0alpha1.PlaylistItem"
             }

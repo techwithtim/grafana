@@ -20,9 +20,7 @@ import { usePlaylistItems } from './usePlaylistItems';
 interface Props {
   onSubmit: (playlist: Playlist) => void | Promise<void>;
   playlist: Playlist;
-  /** Renders a repository selector at the top of the form. */
   showRepositorySelect?: boolean;
-  /** Repositories to choose from (may be empty). */
   repositories?: RepositoryView[];
   /** Selected repository name. Empty string = "no repository" (save to Grafana). */
   selectedRepository?: string;
@@ -53,20 +51,17 @@ export const PlaylistForm = ({
 
   const { items, addByUID, addByTag, deleteItem, moveItem, updateItemVariables } = usePlaylistItems(propItems);
 
-  // When the selector is locked the repository can't be changed, so derive the value from the
-  // playlist (its managing repository, or "no repository" when unmanaged). Otherwise it's controlled.
   const repositoryFieldValue = disableRepositorySelect
     ? isManagedByRepository(playlist)
       ? (getManagerIdentity(playlist) ?? '')
       : ''
-    : selectedRepository; // undefined leaves nothing selected (placeholder)
+    : selectedRepository;
 
   const doSubmit = async (specUpdates: Playlist['spec']) => {
     setSaving(true);
-    // Strip UI-only properties (dashboards) from items before submission. An item that carries
-    // no variables is submitted without the property at all rather than with an empty or
-    // undefined one, so playlists without template variables serialize exactly as they did
-    // before the field existed.
+    // `dashboards` is UI-only state, and an empty or undefined variables map is omitted rather
+    // than submitted, so an item without template variables keeps the variable-less API payload
+    // shape.
     const apiItems = items.map(({ dashboards, variables, ...item }) =>
       variables && Object.keys(variables).length > 0 ? { ...item, variables } : item
     );
@@ -131,7 +126,6 @@ export const PlaylistForm = ({
                 <RepositorySelect
                   repositories={repositories}
                   value={repositoryFieldValue}
-                  // readOnly already disables the Combobox, so onChange can't fire when locked.
                   onChange={onRepositoryChange ?? (() => {})}
                   readOnly={disableRepositorySelect}
                 />

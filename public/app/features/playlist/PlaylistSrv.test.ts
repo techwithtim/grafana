@@ -1,7 +1,7 @@
 import { type Store } from 'redux';
 import configureMockStore from 'redux-mock-store';
 
-import { locationService } from '@grafana/runtime';
+import { locationService, logWarning } from '@grafana/runtime';
 import { setStore } from 'app/store/store';
 
 import { type Playlist, type PlaylistSpec } from '../../api/clients/playlist/v1';
@@ -9,16 +9,32 @@ import { type DashboardQueryResult } from '../search/service/types';
 
 import { PlaylistSrv } from './PlaylistSrv';
 import { type PlaylistItemUI } from './types';
+import { loadDashboards } from './utils';
+import {
+  MAX_ENCODED_VARIABLES_LENGTH,
+  MAX_VALUES_PER_VARIABLE,
+  MAX_VARIABLE_NAME_LENGTH,
+  MAX_VARIABLE_VALUE_LENGTH,
+  MAX_VARIABLES_PER_ITEM,
+} from './variableLimits';
+
+// Only the warning is replaced. Everything else the service uses from this module, the real
+// locationService above all, stays exactly as it is, because the cases below assert on the URLs it
+// actually records.
+jest.mock('@grafana/runtime', () => ({
+  ...jest.requireActual('@grafana/runtime'),
+  logWarning: jest.fn(),
+}));
 
 jest.mock('./utils', () => ({
-  loadDashboards: (items: PlaylistItemUI[]) => {
+  loadDashboards: jest.fn((items: PlaylistItemUI[]) => {
     return Promise.resolve(
       items.map((v) => ({
-        ...v, // same item with dashboard URLs filled in
+        ...v,
         dashboards: [{ url: `/url/to/${v.value}` } as unknown as DashboardQueryResult],
       }))
     );
-  },
+  }),
 }));
 
 const mockPlaylist: Playlist = {
@@ -56,15 +72,12 @@ const mockWindowLocation = (): [jest.Mock, () => void] => {
   const oldLocation = win.location;
   const hrefMock = jest.fn();
 
-  // JSDom defines window in a way that you cannot tamper with location so this seems to be the only way to change it.
-  // https://github.com/facebook/jest/issues/5124#issuecomment-446659510
-  //@ts-ignore
-  delete win.location;
+  // jsdom's window.location cannot be reassigned, so the property is deleted before being replaced
+  Reflect.deleteProperty(win, 'location');
 
   win.location = {} as Location;
 
-  // Only mocking href as that is all this test needs, but otherwise there is lots of things missing, so keep that
-  // in mind if this is reused.
+  // The double implements only href; any other Location member a test needs must be added here explicitly
   Object.defineProperty(window.location, 'href', {
     set: hrefMock,
     get: hrefMock,
@@ -75,7 +88,6 @@ const mockWindowLocation = (): [jest.Mock, () => void] => {
   return [hrefMock, unmock];
 };
 
-// Kept separate from mockPlaylist so the cases that predate variables keep their original two-item fixture.
 function playlistWithItems(items: PlaylistSpec['items']): Playlist {
   return {
     apiVersion: 'playlist.grafana.app/v1',
@@ -92,6 +104,30 @@ function playlistWithItems(items: PlaylistSpec['items']): Playlist {
   };
 }
 
+// Exactly at, and exactly one over, each per-variable maximum. The values are alphanumeric so that
+// what is counted against the URL budget and what is written into the query are the same length.
+const nameAtLimit = 'n'.repeat(MAX_VARIABLE_NAME_LENGTH);
+const nameOverLimit = 'n'.repeat(MAX_VARIABLE_NAME_LENGTH + 1);
+const valueAtLimit = 'v'.repeat(MAX_VARIABLE_VALUE_LENGTH);
+const valueOverLimit = 'v'.repeat(MAX_VARIABLE_VALUE_LENGTH + 1);
+const valuesAtLimit = Array.from({ length: MAX_VALUES_PER_VARIABLE }, (_, index) => `v${index}`);
+const valuesOverLimit = Array.from({ length: MAX_VALUES_PER_VARIABLE + 1 }, (_, index) => `v${index}`);
+
+// One code point each, but not one UTF-16 code unit each: `é` is one unit and `𝄞` is two, so a
+// limit measured with `String.prototype.length` refuses strings of these that the schema, and the
+// API enforcing it, accept. Neither is one character once encoded either — `é` costs six and `𝄞`
+// twelve — which is why the cases below give an item one variable wherever the URL budget would
+// otherwise be the rule that decides the outcome.
+const BMP_CHARACTER = 'é';
+const ASTRAL_CHARACTER = '𝄞';
+
+// The two characters above, and the cases the encoder expands, are exercised for both a name and a
+// value, so each case names the character it builds its strings from.
+const nonAsciiCharacters: Array<{ desc: string; character: string }> = [
+  { desc: 'a non-ASCII character from the basic plane', character: BMP_CHARACTER },
+  { desc: 'an astral character', character: ASTRAL_CHARACTER },
+];
+
 // The MemoryHistory that records the visited URLs is not part of the locationService interface, so the
 // cast reaching it lives here only, rather than being repeated in every case that reads a pushed URL.
 function getHistoryEntries(): Location[] {
@@ -102,6 +138,26 @@ function getHistoryEntries(): Location[] {
 function getLastHistoryEntry(): Location {
   const entries = getHistoryEntries();
   return entries[entries.length - 1];
+}
+
+// The URL the srv treats as its own is private, so the cast reaching it lives here only.
+function getValidPlaylistUrl(srv: PlaylistSrv): string {
+  return (srv as unknown as { validPlaylistUrl: string }).validPlaylistUrl;
+}
+
+/**
+ * The `var-` parameters of a pushed search string, exactly as they were written into it.
+ *
+ * The budget is a budget on characters of the pushed URL, so the cases that assert it read the
+ * string the history entry holds rather than re-encoding the variables themselves — the whole
+ * point of the limit is what the browser and any proxy in front of it receive.
+ */
+function varPortionOf(search: string): string {
+  return search
+    .slice(1)
+    .split('&')
+    .filter((param) => param.startsWith('var-'))
+    .join('&');
 }
 
 describe('PlaylistSrv', () => {
@@ -116,7 +172,6 @@ describe('PlaylistSrv', () => {
     srv = createPlaylistSrv();
     [hrefMock, unmockLocation] = mockWindowLocation();
 
-    // This will be cached in the srv when start() is called
     hrefMock.mockReturnValue(initialUrl);
   });
 
@@ -167,37 +222,27 @@ describe('PlaylistSrv', () => {
   it('storeUpdated should not stop playlist when navigating to next dashboard', async () => {
     await srv.start(mockPlaylist);
 
-    // eslint-disable-next-line
-    expect((srv as any).validPlaylistUrl).toBe('/url/to/aaa');
+    expect(getValidPlaylistUrl(srv)).toBe('/url/to/aaa');
 
     srv.next();
 
-    // eslint-disable-next-line
-    expect((srv as any).validPlaylistUrl).toBe('/url/to/bbb');
+    expect(getValidPlaylistUrl(srv)).toBe('/url/to/bbb');
     expect(srv.state.isPlaying).toBe(true);
   });
 
   it('should replace playlist start page in history when starting playlist', async () => {
-    // Start at playlists page
     locationService.push('/playlists');
 
-    // Navigate to playlist start page
     locationService.push('/playlists/play/foo');
 
-    // Start the playlist
     await srv.start(mockPlaylist);
 
-    // Get history entries via the underlying MemoryHistory (test-env only)
-    const history = locationService.getHistory();
-    const entries = (history as unknown as { base: { entries: Location[] } }).base.entries;
+    const entries = getHistoryEntries();
 
-    // The current entry should be the first dashboard
     expect(entries[entries.length - 1].pathname).toBe('/url/to/aaa');
 
-    // The previous entry should be the playlists page, not the start page
     expect(entries[entries.length - 2].pathname).toBe('/playlists');
 
-    // Verify the start page (/playlists/play/foo) is not in history
     const hasStartPage = entries.some((entry: { pathname: string }) => entry.pathname === '/playlists/play/foo');
     expect(hasStartPage).toBe(false);
   });
@@ -247,6 +292,36 @@ describe('PlaylistSrv', () => {
     const { search } = getLastHistoryEntry();
     expect(search).toBe('?var-h%26y=v');
     expect(Array.from(new URLSearchParams(search).keys())).toEqual(['var-h&y']);
+  });
+
+  it('emits a value of "[object Object]" as a single parameter instead of decomposing it', async () => {
+    await srv.start(
+      playlistWithItems([{ type: 'dashboard_by_uid', value: 'aaa', variables: { x: ['[object Object]'] } }])
+    );
+
+    const { search } = getLastHistoryEntry();
+    expect(search).toBe('?var-x=%5Bobject%20Object%5D');
+    expect(new URLSearchParams(search).getAll('var-x')).toEqual(['[object Object]']);
+  });
+
+  it('emits one parameter per value when a multi-value variable contains "[object Object]"', async () => {
+    await srv.start(
+      playlistWithItems([{ type: 'dashboard_by_uid', value: 'aaa', variables: { x: ['[object Object]', 'plain'] } }])
+    );
+
+    const { search } = getLastHistoryEntry();
+    expect(search).toBe('?var-x=%5Bobject%20Object%5D&var-x=plain');
+    expect(new URLSearchParams(search).getAll('var-x')).toEqual(['[object Object]', 'plain']);
+  });
+
+  it('percent-encodes a variable name of "[object Object]" into a single key', async () => {
+    await srv.start(
+      playlistWithItems([{ type: 'dashboard_by_uid', value: 'aaa', variables: { '[object Object]': ['v'] } }])
+    );
+
+    const { search } = getLastHistoryEntry();
+    expect(search).toBe('?var-%5Bobject%20Object%5D=v');
+    expect(Array.from(new URLSearchParams(search).keys())).toEqual(['var-[object Object]']);
   });
 
   it.each<{ desc: string; variables: Record<string, string[]> }>([
@@ -311,6 +386,224 @@ describe('PlaylistSrv', () => {
     expect(pushSpy).toHaveBeenCalledWith('/url/to/aaa?var-host=two');
     expect(replaceSpy).toHaveBeenCalledTimes(1);
     expect(srv.state.isPlaying).toBe(true);
+  });
+
+  it('adds no history entry for a playlist with no items', async () => {
+    const entryCountBefore = getHistoryEntries().length;
+    const entryBefore = getLastHistoryEntry();
+
+    await srv.start(playlistWithItems([]));
+
+    expect(getHistoryEntries()).toHaveLength(entryCountBefore);
+    expect(getLastHistoryEntry()).toBe(entryBefore);
+  });
+
+  it('adds no history entry when no item resolves to a dashboard', async () => {
+    // The default stub resolves one dashboard per item, while a search that matches nothing resolves
+    // the item with an empty dashboard list, which is what leaves the playlist with no entries.
+    jest.mocked(loadDashboards).mockResolvedValueOnce([{ type: 'dashboard_by_uid', value: 'aaa', dashboards: [] }]);
+    const entryCountBefore = getHistoryEntries().length;
+    const entryBefore = getLastHistoryEntry();
+
+    await srv.start(playlistWithItems([{ type: 'dashboard_by_uid', value: 'aaa' }]));
+
+    expect(getHistoryEntries()).toHaveLength(entryCountBefore);
+    expect(getLastHistoryEntry()).toBe(entryBefore);
+  });
+
+  it('applies a variable name, a value count and a value length that sit exactly on their limits', async () => {
+    await srv.start(
+      playlistWithItems([
+        {
+          type: 'dashboard_by_uid',
+          value: 'aaa',
+          variables: { [nameAtLimit]: ['ok'], many: valuesAtLimit, big: [valueAtLimit] },
+        },
+      ])
+    );
+
+    const params = new URLSearchParams(getLastHistoryEntry().search);
+    expect(params.getAll(`var-${nameAtLimit}`)).toEqual(['ok']);
+    expect(params.getAll('var-many')).toEqual(valuesAtLimit);
+    expect(params.getAll('var-big')).toEqual([valueAtLimit]);
+    expect(srv.state.isPlaying).toBe(true);
+  });
+
+  it.each<{ desc: string; variables: Record<string, string[]> }>([
+    { desc: 'a name one character over the limit', variables: { [nameOverLimit]: ['x'], host: ['a'] } },
+    { desc: 'one value more than the limit', variables: { many: valuesOverLimit, host: ['a'] } },
+    { desc: 'a value one character over the limit', variables: { big: [valueOverLimit], host: ['a'] } },
+  ])('drops the variable with $desc and keeps the in-budget variables of the same item', async ({ variables }) => {
+    await srv.start(playlistWithItems([{ type: 'dashboard_by_uid', value: 'aaa', variables }]));
+
+    // The whole pair is dropped rather than truncated, and playback is not interrupted by it.
+    expect(getLastHistoryEntry().search).toBe('?var-host=a');
+    expect(srv.state.isPlaying).toBe(true);
+  });
+
+  it('applies the variables an item may hold and drops the one past that count', async () => {
+    const variables: Record<string, string[]> = {};
+    for (let index = 0; index <= MAX_VARIABLES_PER_ITEM; index++) {
+      variables[`k${index}`] = ['v'];
+    }
+
+    await srv.start(playlistWithItems([{ type: 'dashboard_by_uid', value: 'aaa', variables }]));
+
+    const params = new URLSearchParams(getLastHistoryEntry().search);
+    expect(Array.from(params.keys())).toHaveLength(MAX_VARIABLES_PER_ITEM);
+    expect(params.getAll(`var-k${MAX_VARIABLES_PER_ITEM - 1}`)).toEqual(['v']);
+    expect(params.has(`var-k${MAX_VARIABLES_PER_ITEM}`)).toBe(false);
+    expect(srv.state.isPlaying).toBe(true);
+  });
+
+  it('keeps the var- portion of the pushed URL inside the total budget when the variables together exceed it', async () => {
+    // Every variable here is in budget on its own and costs 1033 characters of the total: 4 for
+    // `var-`, 3 for the name, 1 for `=`, the value's 1024, and the separator it is joined with.
+    // Seven of them fit inside 8192 and the eighth does not, so the rest of the item is dropped.
+    const variables: Record<string, string[]> = {};
+    for (let index = 0; index < 20; index++) {
+      variables[`k${String(index).padStart(2, '0')}`] = [valueAtLimit];
+    }
+
+    await srv.start(playlistWithItems([{ type: 'dashboard_by_uid', value: 'aaa', variables }]));
+
+    const { search } = getLastHistoryEntry();
+    expect(varPortionOf(search).length).toBeLessThanOrEqual(MAX_ENCODED_VARIABLES_LENGTH);
+    expect(Array.from(new URLSearchParams(search).keys())).toHaveLength(7);
+    expect(srv.state.isPlaying).toBe(true);
+  });
+
+  it.each<{ desc: string; characters: string }>([
+    { desc: 'apostrophes', characters: "'" },
+    { desc: 'the characters ! ( ) and *', characters: '!()*' },
+  ])(
+    'keeps the pushed var- query inside the total budget when the values are made of $desc',
+    async ({ characters }) => {
+      // The serializer encodes in the style of AngularJS, which turns each of these into a
+      // three-character escape that `encodeURIComponent` leaves as one. Twenty variables of a
+      // value at the per-value limit therefore emit around 60 KB of query, and the budget only
+      // holds if what it measures is what is written: each of these values contributes 3072
+      // characters, so at most two of them can be applied.
+      const value = characters.repeat(MAX_VARIABLE_VALUE_LENGTH / characters.length);
+      const variables: Record<string, string[]> = {};
+      for (let index = 0; index < 20; index++) {
+        variables[`k${String(index).padStart(2, '0')}`] = [value];
+      }
+
+      await srv.start(playlistWithItems([{ type: 'dashboard_by_uid', value: 'aaa', variables }]));
+
+      const { search } = getLastHistoryEntry();
+      const varPortion = varPortionOf(search);
+      expect(varPortion.length).toBeLessThanOrEqual(MAX_ENCODED_VARIABLES_LENGTH);
+      // Playback still applies what fits, so the assertion above is not passing on an empty query.
+      expect(varPortion.length).toBeGreaterThan(0);
+      expect(new URLSearchParams(search).getAll('var-k00')).toEqual([value]);
+      expect(srv.state.isPlaying).toBe(true);
+    }
+  );
+
+  it('pushes only the variables an item may hold, and keeps playing, for a map of thousands of keys', async () => {
+    const variables: Record<string, string[]> = {};
+    for (let index = 0; index < 5000; index++) {
+      variables[`k${String(index).padStart(4, '0')}`] = ['v'];
+    }
+
+    await srv.start(playlistWithItems([{ type: 'dashboard_by_uid', value: 'aaa', variables }]));
+
+    const params = new URLSearchParams(getLastHistoryEntry().search);
+    expect(Array.from(params.keys())).toHaveLength(MAX_VARIABLES_PER_ITEM);
+    expect(params.getAll('var-k0000')).toEqual(['v']);
+    expect(params.has(`var-k${String(MAX_VARIABLES_PER_ITEM).padStart(4, '0')}`)).toBe(false);
+    expect(srv.state.isPlaying).toBe(true);
+    // The walk stops at the item's variable maximum, so the counts alone would claim nothing was
+    // over budget. The flag is what says the remaining keys were never looked at, and the context
+    // carries nothing else — a name or a value is exactly what must not reach telemetry.
+    expect(logWarning).toHaveBeenCalledTimes(1);
+    expect(logWarning).toHaveBeenCalledWith(expect.any(String), {
+      appliedVariables: String(MAX_VARIABLES_PER_ITEM),
+      droppedVariables: '0',
+      variablesLeftUninspected: 'true',
+    });
+  });
+
+  it.each(nonAsciiCharacters)(
+    'applies a variable whose name is exactly the limit in code points of $desc',
+    async ({ character }) => {
+      const name = character.repeat(MAX_VARIABLE_NAME_LENGTH);
+
+      await srv.start(playlistWithItems([{ type: 'dashboard_by_uid', value: 'aaa', variables: { [name]: ['ok'] } }]));
+
+      expect(new URLSearchParams(getLastHistoryEntry().search).getAll(`var-${name}`)).toEqual(['ok']);
+      expect(srv.state.isPlaying).toBe(true);
+    }
+  );
+
+  it.each(nonAsciiCharacters)(
+    'drops a variable whose name is one code point over the limit in $desc',
+    async ({ character }) => {
+      const name = character.repeat(MAX_VARIABLE_NAME_LENGTH + 1);
+
+      await srv.start(
+        playlistWithItems([{ type: 'dashboard_by_uid', value: 'aaa', variables: { [name]: ['ok'], host: ['a'] } }])
+      );
+
+      expect(getLastHistoryEntry().search).toBe('?var-host=a');
+      expect(srv.state.isPlaying).toBe(true);
+    }
+  );
+
+  it('applies a value that is exactly the limit in code points of a basic-plane character', async () => {
+    const value = BMP_CHARACTER.repeat(MAX_VARIABLE_VALUE_LENGTH);
+
+    await srv.start(playlistWithItems([{ type: 'dashboard_by_uid', value: 'aaa', variables: { big: [value] } }]));
+
+    expect(new URLSearchParams(getLastHistoryEntry().search).getAll('var-big')).toEqual([value]);
+    expect(srv.state.isPlaying).toBe(true);
+  });
+
+  it('applies an astral value that only a UTF-16 measurement of the limit would refuse', async () => {
+    // Half the limit plus one astral characters are two code units past the limit as `length`
+    // counts it, and just over half of it in the code points the limit is stated in. The astral
+    // value at exactly the limit belongs to the editor's suite: twelve encoded characters each put
+    // 1024 of them past the URL budget, which is the case below.
+    const value = ASTRAL_CHARACTER.repeat(MAX_VARIABLE_VALUE_LENGTH / 2 + 1);
+
+    await srv.start(playlistWithItems([{ type: 'dashboard_by_uid', value: 'aaa', variables: { big: [value] } }]));
+
+    expect(new URLSearchParams(getLastHistoryEntry().search).getAll('var-big')).toEqual([value]);
+    expect(srv.state.isPlaying).toBe(true);
+  });
+
+  it('leaves out an astral value at the code-point limit because its encoded form exceeds the URL budget', async () => {
+    const value = ASTRAL_CHARACTER.repeat(MAX_VARIABLE_VALUE_LENGTH);
+
+    await srv.start(
+      playlistWithItems([{ type: 'dashboard_by_uid', value: 'aaa', variables: { big: [value], host: ['a'] } }])
+    );
+
+    // The value is within every per-variable maximum; what refuses it is the total encoded budget,
+    // and the item plays with the variable that fits.
+    expect(getLastHistoryEntry().search).toBe('?var-host=a');
+    expect(srv.state.isPlaying).toBe(true);
+  });
+
+  it.each(nonAsciiCharacters)('drops a value one code point over the limit in $desc', async ({ character }) => {
+    const value = character.repeat(MAX_VARIABLE_VALUE_LENGTH + 1);
+
+    await srv.start(
+      playlistWithItems([{ type: 'dashboard_by_uid', value: 'aaa', variables: { big: [value], host: ['a'] } }])
+    );
+
+    expect(getLastHistoryEntry().search).toBe('?var-host=a');
+    expect(srv.state.isPlaying).toBe(true);
+  });
+
+  it('pushes the same search string for an in-budget item as it did before the budget existed', async () => {
+    await srv.start(
+      playlistWithItems([{ type: 'dashboard_by_uid', value: 'aaa', variables: { host: ['a', 'b'], region: ['eu'] } }])
+    );
+
+    expect(getLastHistoryEntry().search).toBe('?var-host=a&var-host=b&var-region=eu');
   });
 
   it('reloads the page after 3 cycles when the items carry variables', async () => {

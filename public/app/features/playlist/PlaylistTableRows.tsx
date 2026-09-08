@@ -15,8 +15,6 @@ import { type PlaylistItemUI } from './types';
 interface Props {
   items: PlaylistItemUI[];
   onDelete: (idx: number) => void;
-  /** Indexes whose template variable editor is open. Owned by `PlaylistTable`, which collapses
-   * every editor on a reorder or a deletion so an open one cannot end up attached to another item. */
   expanded: Set<number>;
   onToggleExpanded: (index: number) => void;
   onVariablesChange: (index: number, variables?: Record<string, string[]>) => void;
@@ -109,8 +107,9 @@ export const PlaylistTableRows = ({ items, onDelete, expanded, onToggleExpanded,
   return (
     <>
       {items.map((item, index) => {
-        // Only dashboards added by UID can carry template variables, so the deprecated
-        // dashboard_by_id type and tag items are matched out rather than assumed away.
+        // Only dashboard_by_uid items support this editor, so tag rows and the deprecated
+        // dashboard_by_id rows are excluded. The item type allows variables on any item, so a
+        // payload may carry them elsewhere, but the UI and the runtime apply them to UID items only.
         const hasVariableEditor = item.type === 'dashboard_by_uid';
         const isExpanded = expanded.has(index);
         const panelId = `${panelIdPrefix}-${index}`;
@@ -118,9 +117,9 @@ export const PlaylistTableRows = ({ items, onDelete, expanded, onToggleExpanded,
         return (
           <Draggable key={`${index}/${item.value}`} draggableId={`${index}`} index={index}>
             {(provided) => (
-              // The draggable root is a plain wrapper rather than the row itself, so the variables
-              // panel can be a sibling of the row: nested inside it, the panel would read as a cell
-              // of that row and its controls would belong to the row's accessibility tree.
+              // The draggable root is a plain wrapper rather than the row itself, so the variables panel can be a
+              // sibling of the row: a role="row" may own only cell, gridcell, columnheader and rowheader elements,
+              // so nesting the panel breaks that structure and folds its controls into the row's accessibility subtree.
               <div ref={provided.innerRef} {...provided.draggableProps}>
                 <div className={styles.row} role="row">
                   <div
@@ -216,8 +215,6 @@ function getStyles(theme: GrafanaTheme2) {
       textAlign: 'right',
     }),
     variables: css({
-      // Indents the editor to the start of its row's label, past the type icon, so the panel reads
-      // as belonging to the row above it. The editor draws its own surface, so nothing else is set.
       paddingInlineStart: theme.spacing(3),
     }),
     variablesSummary: css({

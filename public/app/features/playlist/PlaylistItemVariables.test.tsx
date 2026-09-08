@@ -1,12 +1,41 @@
-import { render, screen, waitFor } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { useState } from 'react';
 
 import { PlaylistItemVariables } from './PlaylistItemVariables';
+import {
+  MAX_VALUES_PER_VARIABLE,
+  MAX_VARIABLE_NAME_LENGTH,
+  MAX_VARIABLE_VALUE_LENGTH,
+  MAX_VARIABLES_PER_ITEM,
+} from './variableLimits';
 
 const NAME_REQUIRED = 'Variable name is required';
 const VALUE_REQUIRED = 'Variable value is required';
 const DUPLICATE_NAME = 'A variable with this name already exists';
+const NAME_TOO_LONG = `Variable name cannot be longer than ${MAX_VARIABLE_NAME_LENGTH} characters`;
+const TOO_MANY_VALUES = `A variable cannot have more than ${MAX_VALUES_PER_VARIABLE} values`;
+const VALUE_TOO_LONG = `A variable value cannot be longer than ${MAX_VARIABLE_VALUE_LENGTH} characters`;
+const TOO_MANY_VARIABLES = `A playlist item cannot have more than ${MAX_VARIABLES_PER_ITEM} variables`;
+const NOT_EDITABLE = 'These template variables cannot be edited';
+
+/**
+ * Text that is longer than an input's own `maxLength` can only be committed the way a browser
+ * commits a paste or an autofill, which is what this sets: `userEvent.type` respects `maxLength`
+ * and would silently stop at the boundary the assertion is about.
+ */
+function setInputText(input: HTMLElement, text: string) {
+  fireEvent.change(input, { target: { value: text } });
+}
+
+/** A map of `count` single-value variables, used to sit either side of the per-item maximum. */
+function manyVariables(count: number): Record<string, string[]> {
+  const variables: Record<string, string[]> = {};
+  for (let index = 0; index < count; index++) {
+    variables[`k${index}`] = ['v'];
+  }
+  return variables;
+}
 
 function setup(jsx: JSX.Element) {
   return {
@@ -60,12 +89,10 @@ function ControlledEditor({
   );
 }
 
-/** The name input of the row that adds a new variable, labelled instead of aria-labelled. */
 function newName() {
   return screen.getByRole('textbox', { name: 'Variable name' });
 }
 
-/** The values input of the row that adds a new variable. */
 function newValues() {
   return screen.getByRole('textbox', { name: 'Values (comma-separated)' });
 }
@@ -100,6 +127,61 @@ const rejectedAdditions: Array<{
     values: 'b',
     error: DUPLICATE_NAME,
   },
+];
+
+/** One character, one value or one variable past each maximum, entered into the add row. */
+const rejectedLimits: Array<{ desc: string; name: string; values: string; error: string }> = [
+  {
+    desc: 'the name is one character over the limit',
+    name: 'n'.repeat(MAX_VARIABLE_NAME_LENGTH + 1),
+    values: 'a',
+    error: NAME_TOO_LONG,
+  },
+  {
+    desc: 'one value more than the limit is entered',
+    name: 'host',
+    values: Array.from({ length: MAX_VALUES_PER_VARIABLE + 1 }, (_, index) => `v${index}`).join(','),
+    error: TOO_MANY_VALUES,
+  },
+  {
+    desc: 'a value is one character over the limit',
+    name: 'host',
+    values: 'v'.repeat(MAX_VARIABLE_VALUE_LENGTH + 1),
+    error: VALUE_TOO_LONG,
+  },
+];
+
+/**
+ * A character that is one code point and two UTF-16 code units, so a limit counted with
+ * `String.prototype.length` refuses at half the length the contract allows.
+ */
+const ASTRAL_CHARACTER = '𝄞';
+
+/** One astral code point past the name and the value maximum, entered into the add row. */
+const astralOverLimits: Array<{ desc: string; name: string; values: string; error: string }> = [
+  {
+    desc: 'the name is one astral code point over the limit',
+    name: ASTRAL_CHARACTER.repeat(MAX_VARIABLE_NAME_LENGTH + 1),
+    values: 'a',
+    error: NAME_TOO_LONG,
+  },
+  {
+    desc: 'a value is one astral code point over the limit',
+    name: 'host',
+    values: ASTRAL_CHARACTER.repeat(MAX_VARIABLE_VALUE_LENGTH + 1),
+    error: VALUE_TOO_LONG,
+  },
+];
+
+/** Stored maps the editor cannot render, one per maximum they exceed. */
+const unrenderableMaps: Array<{ desc: string; variables: Record<string, string[]> }> = [
+  { desc: 'more variables than the limit', variables: manyVariables(MAX_VARIABLES_PER_ITEM + 1) },
+  { desc: 'a name longer than the limit', variables: { ['n'.repeat(MAX_VARIABLE_NAME_LENGTH + 1)]: ['a'] } },
+  {
+    desc: 'more values than the limit',
+    variables: { host: Array.from({ length: MAX_VALUES_PER_VARIABLE + 1 }, (_, index) => `v${index}`) },
+  },
+  { desc: 'a value longer than the limit', variables: { host: ['v'.repeat(MAX_VARIABLE_VALUE_LENGTH + 1)] } },
 ];
 
 const rejectedEdits: Array<{ desc: string; field: 'name' | 'values'; text: string; error: string }> = [
@@ -181,9 +263,8 @@ describe('PlaylistItemVariables', () => {
   it('commits the new variable on Enter in the values input without submitting the surrounding form', async () => {
     const onChange = jest.fn();
     const submitSpy = jest.fn();
-    // The editor renders inside the playlist form in production. Enter on an input only reaches
-    // the implicit submission path when the form holds a submit control, so this button is what
-    // gives the "form was not submitted" assertion below its teeth.
+    // The playlist form this editor renders inside carries a Save submit control, so this harness
+    // carries one too and Enter here runs the same risk it runs in production.
     const { user } = setup(
       <form
         onSubmit={(event) => {
@@ -527,4 +608,148 @@ describe('PlaylistItemVariables', () => {
     rerender(<PlaylistItemVariables variables={{ a: ['1'], b: ['2'] }} onChange={onChange} />);
     expect(rowValues('a')).toHaveValue('1');
   });
+
+  it('accepts a name, a value count and a value length that sit exactly on their limits', async () => {
+    const onChange = jest.fn();
+    const { user } = setup(<PlaylistItemVariables onChange={onChange} />);
+
+    const name = 'n'.repeat(MAX_VARIABLE_NAME_LENGTH);
+    const values = [
+      ...Array.from({ length: MAX_VALUES_PER_VARIABLE - 1 }, (_, index) => `v${index}`),
+      'v'.repeat(MAX_VARIABLE_VALUE_LENGTH),
+    ];
+
+    setInputText(newName(), name);
+    setInputText(newValues(), values.join(', '));
+    await user.click(addButton());
+
+    await waitFor(() => {
+      expect(onChange).toHaveBeenCalledWith({ [name]: values });
+    });
+    expect(onChange).toHaveBeenCalledTimes(1);
+  });
+
+  it('accepts a name and a value of exactly the limit in astral code points', async () => {
+    const onChange = jest.fn();
+    const { user } = setup(<PlaylistItemVariables onChange={onChange} />);
+
+    // Twice as many UTF-16 code units as the limit allows, and exactly as many code points as it
+    // allows, which is the unit the schema and the API state it in. The text is committed the way
+    // a paste is, because the inputs' own `maxLength` counts the code units.
+    const name = ASTRAL_CHARACTER.repeat(MAX_VARIABLE_NAME_LENGTH);
+    const value = ASTRAL_CHARACTER.repeat(MAX_VARIABLE_VALUE_LENGTH);
+
+    setInputText(newName(), name);
+    setInputText(newValues(), value);
+    await user.click(addButton());
+
+    await waitFor(() => {
+      expect(onChange).toHaveBeenCalledWith({ [name]: [value] });
+    });
+    expect(onChange).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(astralOverLimits)('shows "$error" and does not call onChange when $desc', async ({ name, values, error }) => {
+    const onChange = jest.fn();
+    const { user } = setup(<PlaylistItemVariables onChange={onChange} />);
+
+    setInputText(newName(), name);
+    setInputText(newValues(), values);
+    await user.click(addButton());
+
+    await waitFor(() => {
+      expect(screen.getByRole('alert')).toHaveTextContent(error);
+    });
+    expect(onChange).not.toHaveBeenCalled();
+  });
+
+  it('shows the name error and does not call onChange when an existing row is renamed one astral code point over the limit', async () => {
+    const onChange = jest.fn();
+    const { user } = setup(<PlaylistItemVariables variables={{ host: ['a'] }} onChange={onChange} />);
+
+    await user.click(rowName('host'));
+    setInputText(rowName('host'), ASTRAL_CHARACTER.repeat(MAX_VARIABLE_NAME_LENGTH + 1));
+    await user.tab();
+
+    await waitFor(() => {
+      expect(screen.getByRole('alert')).toHaveTextContent(NAME_TOO_LONG);
+    });
+    expect(onChange).not.toHaveBeenCalled();
+  });
+
+  it('bounds the text its inputs accept to the name and values limits', () => {
+    render(<PlaylistItemVariables variables={{ host: ['a'] }} onChange={jest.fn()} />);
+
+    expect(rowName('host')).toHaveAttribute('maxlength', String(MAX_VARIABLE_NAME_LENGTH));
+    expect(newName()).toHaveAttribute('maxlength', String(MAX_VARIABLE_NAME_LENGTH));
+    // The values input holds a whole comma-separated list, so its bound is the list's, not one
+    // value's, and it is sized so a full in-budget list can still be pasted.
+    expect(rowValues('host')).toHaveAttribute('maxlength', '8192');
+    expect(newValues()).toHaveAttribute('maxlength', '8192');
+  });
+
+  it.each(rejectedLimits)('shows "$error" and does not call onChange when $desc', async ({ name, values, error }) => {
+    const onChange = jest.fn();
+    const { user } = setup(<PlaylistItemVariables onChange={onChange} />);
+
+    setInputText(newName(), name);
+    setInputText(newValues(), values);
+    await user.click(addButton());
+
+    await waitFor(() => {
+      expect(screen.getByRole('alert')).toHaveTextContent(error);
+    });
+    expect(onChange).not.toHaveBeenCalled();
+  });
+
+  it('shows the value-count error and does not call onChange when an existing row is given more values than the limit', async () => {
+    const onChange = jest.fn();
+    const { user } = setup(<PlaylistItemVariables variables={{ host: ['a'] }} onChange={onChange} />);
+
+    await user.click(rowValues('host'));
+    setInputText(
+      rowValues('host'),
+      Array.from({ length: MAX_VALUES_PER_VARIABLE + 1 }, (_, index) => `v${index}`).join(',')
+    );
+    await user.tab();
+
+    await waitFor(() => {
+      expect(screen.getByRole('alert')).toHaveTextContent(TOO_MANY_VALUES);
+    });
+    // The rejected text stays in the row for the user to correct, exactly as the other rejections
+    // leave it, and the playlist item itself is untouched.
+    expect(onChange).not.toHaveBeenCalled();
+  });
+
+  it('renders an item holding the maximum number of variables and refuses to add one more', async () => {
+    const onChange = jest.fn();
+    const { user } = setup(
+      <PlaylistItemVariables variables={manyVariables(MAX_VARIABLES_PER_ITEM)} onChange={onChange} />
+    );
+
+    // Two inputs per row, plus the two of the add row.
+    expect(screen.getAllByRole('textbox')).toHaveLength(2 * MAX_VARIABLES_PER_ITEM + 2);
+
+    await user.type(newName(), 'extra');
+    await user.type(newValues(), 'v');
+    await user.click(addButton());
+
+    await waitFor(() => {
+      expect(screen.getByRole('alert')).toHaveTextContent(TOO_MANY_VARIABLES);
+    });
+    expect(onChange).not.toHaveBeenCalled();
+  });
+
+  it.each(unrenderableMaps)(
+    'renders one fixed message and no rows when the stored variables hold $desc',
+    ({ variables }) => {
+      const onChange = jest.fn();
+      render(<PlaylistItemVariables variables={variables} onChange={onChange} />);
+
+      expect(screen.getByRole('alert')).toHaveTextContent(NOT_EDITABLE);
+      expect(screen.queryAllByRole('textbox')).toHaveLength(0);
+      expect(screen.queryByRole('button', { name: 'Add variable' })).not.toBeInTheDocument();
+      expect(onChange).not.toHaveBeenCalled();
+    }
+  );
 });

@@ -1,6 +1,5 @@
 package playlist
 
-// Playlist model
 type Playlist struct {
 	Id       int64  `json:"id,omitempty" db:"id"`
 	UID      string `json:"uid" xorm:"uid" db:"uid"`
@@ -8,19 +7,16 @@ type Playlist struct {
 	Interval string `json:"interval" db:"interval"`
 	OrgId    int64  `json:"-" db:"org_id"`
 
-	// Added for kubernetes migration + synchronization
-	// Hidden from json because this is used for openapi generation
-	// Using int64 rather than time.Time to avoid database issues with time support
+	// Unix timestamps avoid driver-specific time handling in the legacy migration path.
 	CreatedAt int64 `json:"-" db:"created_at"`
 	UpdatedAt int64 `json:"-" db:"updated_at"`
 }
 
 type PlaylistDTO struct {
 	// Unique playlist identifier. Generated on creation, either by the
-	// creator of the playlist of by the application.
+	// creator of the playlist or by the application.
 	Uid string `json:"uid" db:"uid"`
 
-	// Name of the playlist.
 	Name string `json:"name"`
 
 	// Interval sets the time between switching views in a playlist.
@@ -29,24 +25,18 @@ type PlaylistDTO struct {
 	// The ordered list of items that the playlist will iterate over.
 	Items []PlaylistItemDTO `json:"items"`
 
-	// Returned for k8s
 	CreatedAt int64 `json:"-" db:"created_at"`
-
-	// Returned for k8s
 	UpdatedAt int64 `json:"-" db:"updated_at"`
+	OrgID     int64 `json:"-" db:"org_id"`
 
-	// Returned for k8s
-	OrgID int64 `json:"-" db:"org_id"`
-
-	// Returned for k8s and added as an annotation
+	// The legacy ID is carried in the deprecated internal-ID annotation and omitted from JSON.
 	Id int64 `json:"-" db:"id"`
 }
 
 type PlaylistItemDTO struct {
-	// Title is an unused property -- it will be removed in the future
+	// Title is a deprecated legacy field retained for compatibility and omitted when unset.
 	Title *string `json:"title,omitempty"`
 
-	// Type of the item.
 	Type string `json:"type"`
 
 	// Value depends on type and describes the playlist item.
@@ -76,10 +66,6 @@ type PlaylistItem struct {
 
 type Playlists []*Playlist
 
-//
-// COMMANDS
-//
-
 type UpdatePlaylistCommand struct {
 	OrgId    int64          `json:"-"`
 	UID      string         `json:"uid"`
@@ -102,12 +88,7 @@ type DeletePlaylistCommand struct {
 	OrgId int64
 }
 
-//
-// QUERIES
-//
-
 type GetPlaylistsQuery struct {
-	// NOTE: the frontend never sends this query
 	Name  string
 	Limit int
 	OrgId int64

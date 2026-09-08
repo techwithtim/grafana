@@ -1,13 +1,14 @@
 import { type Location } from 'history';
 import { pickBy } from 'lodash';
 
-import { locationUtil, urlUtil, rangeUtil, type UrlQueryMap } from '@grafana/data';
-import { locationService } from '@grafana/runtime';
+import { locationUtil, urlUtil, rangeUtil, type UrlQueryValue } from '@grafana/data';
+import { locationService, logWarning } from '@grafana/runtime';
 import { StateManagerBase } from 'app/core/services/StateManagerBase';
 
 import { type Playlist } from '../../api/clients/playlist/v1';
 
 import { loadDashboards } from './utils';
+import { boundedItemVariables, hasItemVariables } from './variableLimits';
 
 const queryParamsToPreserve: { [key: string]: boolean } = {
   kiosk: true,
@@ -29,9 +30,14 @@ interface PlaylistUrlEntry {
   variables?: Record<string, string[]>;
 }
 
+interface UrlQueryParam {
+  name: string;
+  value: UrlQueryValue;
+}
+
 export class PlaylistSrv extends StateManagerBase<PlaylistSrvState> {
   private nextTimeoutId: ReturnType<typeof setTimeout> | undefined;
-  private entries: PlaylistUrlEntry[] = []; // the URLs we need to load, with the variable values to apply to each
+  private entries: PlaylistUrlEntry[] = [];
   private index = 0;
   declare private interval: number;
   declare private startUrl: string;
@@ -55,20 +61,48 @@ export class PlaylistSrv extends StateManagerBase<PlaylistSrvState> {
     this.validPlaylistUrl = nextDashboardUrl;
     this.nextTimeoutId = setTimeout(() => this.next(), this.interval);
 
-    const params: UrlQueryMap = { ...filteredParams };
-    for (const [name, values] of Object.entries(entry.variables ?? {})) {
-      // An empty name would still be serialized, as a nameless `var-=value` parameter
-      if (!name.trim() || !values.length) {
-        continue;
+    // Given a map, the serializer decomposes a value whose `String()` is `[object Object]` into indexed
+    // parameters, and that string is a legal variable value. A flat name/value list is encoded and
+    // emitted verbatim instead, one parameter per value.
+    const params: UrlQueryParam[] = [];
+    const addParam = (name: string, value: UrlQueryValue) => {
+      if (Array.isArray(value)) {
+        for (const single of value) {
+          params.push({ name, value: single });
+        }
+        return;
       }
-      params[`var-${name}`] = values;
+      params.push({ name, value });
+    };
+
+    for (const [name, value] of Object.entries(filteredParams)) {
+      addParam(name, value);
+    }
+
+    // A playlist is stored data, so its variables are untrusted: the budget bounds how much is
+    // expanded into this one history entry. Pairs that exceed it are left out rather than
+    // truncated, and playback continues with the rest. The budget measures a pair as one
+    // `var-<name>=<value>` parameter per value, which is exactly what the flat list emits for the
+    // string values it admits, so the measurement stays character for character the pushed query.
+    const { pairs, dropped, uninspected } = boundedItemVariables(entry.variables);
+    for (const [name, values] of pairs) {
+      addParam(`var-${name}`, values);
+    }
+
+    if (dropped > 0 || uninspected) {
+      // Counts and one flag: a variable name or value is exactly the untrusted content this
+      // warning must not carry into telemetry. `variablesLeftUninspected` is what keeps the two
+      // counts honest — the walk stops at the item's variable maximum, so a map holding more than
+      // that has keys the counts above never saw and cannot speak for.
+      logWarning('Playlist item variables exceeded the supported limits and were not applied', {
+        droppedVariables: String(dropped),
+        appliedVariables: String(pairs.length),
+        variablesLeftUninspected: String(uninspected),
+      });
     }
 
     const urlWithParams = nextDashboardUrl + '?' + urlUtil.toUrlParams(params);
 
-    // When starting the playlist from the PlaylistStartPage component using the playlist URL, we want to replace the
-    // history entry to support the back button
-    // When starting the playlist from the playlist modal, we want to push a new history entry
     if (replaceHistoryEntry) {
       locationService.getHistory().replace(urlWithParams);
     } else {
@@ -100,7 +134,6 @@ export class PlaylistSrv extends StateManagerBase<PlaylistSrvState> {
     this.next();
   }
 
-  // Detect url changes not caused by playlist srv and stop playlist
   locationUpdated(location: Location) {
     if (location.pathname !== this.validPlaylistUrl) {
       this.stop();
@@ -115,12 +148,10 @@ export class PlaylistSrv extends StateManagerBase<PlaylistSrvState> {
 
     this.setState({ isPlaying: true });
 
-    // setup location tracking
     this.locationListenerUnsub = locationService.getHistory().listen(this.locationUpdated);
     const entries: PlaylistUrlEntry[] = [];
 
     if (!playlist.spec?.items?.length) {
-      // alert
       return;
     }
 
@@ -128,11 +159,12 @@ export class PlaylistSrv extends StateManagerBase<PlaylistSrvState> {
 
     const items = await loadDashboards(playlist.spec?.items);
     for (const item of items) {
-      // Variable values address a single dashboard, so only items selected by uid carry them
+      // Variable values address a single dashboard, so only items selected by uid carry them.
+      // `hasItemVariables` returns at the first own key: whether a map is empty is a yes or no,
+      // and `Object.keys(...).length` would answer it by allocating an array of every name a
+      // stored map holds.
       const variables =
-        item.type === 'dashboard_by_uid' && item.variables && Object.keys(item.variables).length
-          ? item.variables
-          : undefined;
+        item.type === 'dashboard_by_uid' && hasItemVariables(item.variables) ? item.variables : undefined;
 
       if (item.dashboards) {
         for (const dash of item.dashboards) {
@@ -142,7 +174,6 @@ export class PlaylistSrv extends StateManagerBase<PlaylistSrvState> {
     }
 
     if (!entries.length) {
-      // alert... not found, etc
       return;
     }
 

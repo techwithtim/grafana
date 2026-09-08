@@ -9,7 +9,6 @@ import { loadDashboards } from './utils';
 export function usePlaylistItems(playlistItems?: PlaylistItemUI[]) {
   const [items, setItems] = useState<PlaylistItemUI[]>(playlistItems ?? []);
 
-  // Attach dashboards if any were missing
   useAsync(async () => {
     for (const item of items) {
       if (!item.dashboards) {
@@ -31,8 +30,9 @@ export function usePlaylistItems(playlistItems?: PlaylistItemUI[]) {
             merged = true;
             return { ...prevItem, dashboards: match.dashboards };
           });
-          // Keep the same array when nothing matched, so an item added mid-flight cannot
-          // bounce this effect between renders.
+          // A load that resolves after the items it described are gone matches nothing. Returning
+          // the same array leaves the state identity untouched, so this effect — which depends on
+          // `items` — is not re-run by an update that changed nothing.
           return merged ? next : prev;
         });
         return;
@@ -76,7 +76,7 @@ export function usePlaylistItems(playlistItems?: PlaylistItemUI[]) {
   const moveItem = useCallback(
     (src: number, dst: number) => {
       if (src === dst || !items[src]) {
-        return; // nothing to do
+        return;
       }
       const update = Array.from(items);
       const [removed] = update.splice(src, 1);
@@ -106,9 +106,9 @@ export function usePlaylistItems(playlistItems?: PlaylistItemUI[]) {
           return item;
         }
 
-        // Items originate from the RTK Query cache, so build a new object rather than
-        // mutating this one. An empty map drops the property altogether, keeping items
-        // without variables serialized exactly as they were before.
+        // An item may be owned by the caller or by the RTK Query cache, so build a new object
+        // rather than mutating this one. An empty map drops the property altogether, so an item
+        // without variables keeps the variable-less payload shape.
         const { variables: _replaced, ...rest } = item;
         return variables && Object.keys(variables).length > 0 ? { ...rest, variables } : rest;
       });

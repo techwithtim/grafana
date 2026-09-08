@@ -120,7 +120,6 @@ function saveButton() {
   return screen.getByRole('button', { name: /save/i });
 }
 
-/** One per `dashboard_by_uid` row, in row order; tag rows have no variable editor. */
 function disclosureButtons() {
   return screen.getAllByRole('button', { name: 'Template variables' });
 }
@@ -142,7 +141,6 @@ function rowWrapper(index: number): HTMLElement {
   return wrapper;
 }
 
-/** The disclosure belonging to the row at `index`, never the nth disclosure of the whole table. */
 function rowDisclosure(index: number) {
   return within(rows()[index]).getByRole('button', { name: 'Template variables' });
 }
@@ -165,13 +163,11 @@ function variableEditorFor(index: number): HTMLElement {
   return region;
 }
 
-/** Expands the row at `index` and returns the panel its disclosure controls. */
 async function openVariableEditor(user: UserEvent, index: number): Promise<HTMLElement> {
   await user.click(rowDisclosure(index));
   return variableEditorFor(index);
 }
 
-/** The add row's inputs are labelled, where an existing variable's inputs are aria-labelled. */
 function newVariableName(editor: HTMLElement) {
   return within(editor).getByRole('textbox', { name: 'Variable name' });
 }
@@ -184,12 +180,6 @@ function addVariableButton(editor: HTMLElement) {
   return within(editor).getByRole('button', { name: 'Add variable' });
 }
 
-/**
- * Commits one variable through the editor of the row at `index`, leaving the editor open, and
- * returns that editor's region so a caller can keep asserting inside it. Expansion and every query
- * below it go through that row's disclosure and the region it controls, so an editor left open on
- * another row — including one holding the same dashboard — cannot answer in its place.
- */
 async function addVariable(user: UserEvent, index: number, name: string, values: string): Promise<HTMLElement> {
   const editor = await openVariableEditor(user, index);
   await user.type(newVariableName(editor), name);
@@ -605,8 +595,6 @@ describe('PlaylistForm', () => {
           status: {},
         });
       });
-      // The items reach the form from the RTK Query cache, so the edits above must have produced
-      // new objects rather than writing through to the ones passed in.
       expect(playlist.spec.items).toEqual([
         { type: 'dashboard_by_uid', value: 'uid_1', variables: { host: ['Host1'] } },
         { type: 'dashboard_by_uid', value: 'uid_2', variables: { host: ['Host2'] } },

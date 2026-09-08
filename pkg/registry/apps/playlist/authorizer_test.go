@@ -5,16 +5,19 @@ import (
 	"strings"
 	"testing"
 
+	claims "github.com/grafana/authlib/types"
 	"github.com/open-feature/go-sdk/openfeature"
 	"github.com/open-feature/go-sdk/openfeature/memprovider"
 	oftesting "github.com/open-feature/go-sdk/openfeature/testing"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apiserver/pkg/authorization/authorizer"
 
 	"github.com/grafana/grafana/pkg/apimachinery/identity"
 	"github.com/grafana/grafana/pkg/infra/log"
 	"github.com/grafana/grafana/pkg/services/accesscontrol"
+	grafanaauthorizer "github.com/grafana/grafana/pkg/services/apiserver/auth/authorizer"
 	"github.com/grafana/grafana/pkg/services/featuremgmt"
 	"github.com/grafana/grafana/pkg/setting"
 )
@@ -301,4 +304,177 @@ func TestGetAuthorizerToggleOff(t *testing.T) {
 			assert.Equal(t, authorizer.DecisionNoOpinion, decision, "verb: %s", verb)
 		}
 	})
+}
+
+// playlistAttributes builds the request attributes the apiserver derives from a playlist
+// resource URL, for the given served version and namespace.
+func playlistAttributes(requester identity.Requester, version, namespace, verb, name, subresource string) authorizer.AttributesRecord {
+	return authorizer.AttributesRecord{
+		User:            requester,
+		Verb:            verb,
+		APIGroup:        "playlist.grafana.app",
+		APIVersion:      version,
+		Resource:        "playlists",
+		Subresource:     subresource,
+		Namespace:       namespace,
+		Name:            name,
+		ResourceRequest: true,
+	}
+}
+
+// TestAuthorizationChainOrgIsolation exercises the playlist authorizer inside the
+// authorization chain the apiserver actually builds, instead of on its own. That chain is
+// where the organization boundary is drawn: the namespace authorizer runs before the
+// per-API authorizer, so a request for another organization's namespace has to be denied
+// before any playlist permission is evaluated, whatever the playlist authorizer or the org
+// role authorizer would say about the verb. Both served versions register the same
+// authorizer, so both are checked.
+//
+// The identity under test is the one the anonymous auth client builds: bound to the
+// organization configured for anonymous access, carrying that organization's namespace and
+// the configured role. It must read its own organization and nothing else.
+func TestAuthorizationChainOrgIsolation(t *testing.T) {
+	const (
+		ownNamespace     = "default" // the organization anonymous access is configured for (org 1)
+		foreignNamespace = "org-2"   // another tenant's namespace, taken from the request URL
+		playlistName     = "aaa"
+	)
+	servedVersions := []string{"v1", "v0alpha1"}
+
+	anonymous := &identity.StaticRequester{
+		Type:      claims.TypeAnonymous,
+		OrgID:     1,
+		Namespace: ownNamespace,
+		OrgRole:   identity.RoleViewer,
+	}
+	// Same identity with the None role: while playlistsRBAC is off the playlist authorizer
+	// answers Allow for reads instead of deferring, which is the strongest grant the chain
+	// can produce for playlists and so the sharpest test of the organization boundary.
+	anonymousNone := &identity.StaticRequester{
+		Type:      claims.TypeAnonymous,
+		OrgID:     1,
+		Namespace: ownNamespace,
+		OrgRole:   identity.RoleNone,
+	}
+	grafanaAdmin := &identity.StaticRequester{
+		Type:           claims.TypeUser,
+		UserID:         1,
+		OrgID:          1,
+		Namespace:      ownNamespace,
+		OrgRole:        identity.RoleAdmin,
+		IsGrafanaAdmin: true,
+	}
+
+	// newChain mirrors how the apiserver assembles authorization: the built-in chain, with
+	// this installer's authorizer registered for every version it serves. hasPermission is
+	// what the access control service would answer once playlistsRBAC is on.
+	newChain := func(t *testing.T, rbac bool, hasPermission bool) *grafanaauthorizer.GrafanaAuthorizer {
+		installer := installerWithToggle(t, rbac, &mockAccessControl{
+			evaluateFunc: func(context.Context, identity.Requester, accesscontrol.Evaluator) (bool, error) {
+				return hasPermission, nil
+			},
+		})
+		chain := grafanaauthorizer.NewGrafanaBuiltInSTAuthorizer()
+		for _, version := range servedVersions {
+			chain.Register(schema.GroupVersion{Group: "playlist.grafana.app", Version: version}, installer.GetAuthorizer())
+		}
+		return chain
+	}
+
+	// Every read shape the resource API serves, including the status subresource.
+	reads := []struct {
+		verb        string
+		name        string
+		subresource string
+	}{
+		{verb: "list"},
+		{verb: "watch"},
+		{verb: "get", name: playlistName},
+		{verb: "get", name: playlistName, subresource: "status"},
+	}
+
+	for _, version := range servedVersions {
+		t.Run(version, func(t *testing.T) {
+			ctx := identity.WithRequester(context.Background(), anonymous)
+
+			t.Run("another organization's namespace is denied", func(t *testing.T) {
+				// playlistsRBAC off is the default, and the configuration in which the playlist
+				// authorizer expresses no opinion for a Viewer and the org role authorizer
+				// allows the read verbs.
+				chain := newChain(t, false, false)
+				for _, read := range reads {
+					decision, reason, err := chain.Authorize(ctx,
+						playlistAttributes(anonymous, version, foreignNamespace, read.verb, read.name, read.subresource))
+					require.NoError(t, err)
+					assert.Equal(t, authorizer.DecisionDeny, decision, "verb: %s%s", read.verb, read.subresource)
+					assert.Equal(t, "invalid org", reason, "verb: %s%s", read.verb, read.subresource)
+				}
+			})
+
+			t.Run("another organization's namespace is denied even with playlist permissions", func(t *testing.T) {
+				// The organization boundary precedes permission evaluation: a grant that would
+				// satisfy playlists:read in the caller's own organization must not carry over
+				// into someone else's namespace.
+				chain := newChain(t, true, true)
+				for _, read := range reads {
+					decision, reason, err := chain.Authorize(ctx,
+						playlistAttributes(anonymous, version, foreignNamespace, read.verb, read.name, read.subresource))
+					require.NoError(t, err)
+					assert.Equal(t, authorizer.DecisionDeny, decision, "verb: %s%s", read.verb, read.subresource)
+					assert.Equal(t, "invalid org", reason, "verb: %s%s", read.verb, read.subresource)
+				}
+			})
+
+			t.Run("its own organization is still readable", func(t *testing.T) {
+				// Scoping the anonymous identity must not take away the access it is configured
+				// for, or anonymous viewing breaks.
+				chain := newChain(t, false, false)
+				for _, read := range reads {
+					decision, _, err := chain.Authorize(ctx,
+						playlistAttributes(anonymous, version, ownNamespace, read.verb, read.name, read.subresource))
+					require.NoError(t, err)
+					assert.Equal(t, authorizer.DecisionAllow, decision, "verb: %s%s", read.verb, read.subresource)
+				}
+			})
+
+			t.Run("writes in its own organization stay denied", func(t *testing.T) {
+				chain := newChain(t, false, false)
+				for _, verb := range []string{"create", "update", "patch", "delete", "deletecollection"} {
+					decision, _, err := chain.Authorize(ctx,
+						playlistAttributes(anonymous, version, ownNamespace, verb, "", ""))
+					require.NoError(t, err)
+					assert.Equal(t, authorizer.DecisionDeny, decision, "verb: %s", verb)
+				}
+			})
+
+			t.Run("the None role read grant cannot escape the organization", func(t *testing.T) {
+				chain := newChain(t, false, false)
+				noneCtx := identity.WithRequester(context.Background(), anonymousNone)
+				for _, read := range reads {
+					decision, reason, err := chain.Authorize(noneCtx,
+						playlistAttributes(anonymousNone, version, foreignNamespace, read.verb, read.name, read.subresource))
+					require.NoError(t, err)
+					assert.Equal(t, authorizer.DecisionDeny, decision, "verb: %s%s", read.verb, read.subresource)
+					assert.Equal(t, "invalid org", reason, "verb: %s%s", read.verb, read.subresource)
+				}
+				// In its own organization that grant still applies, so the deny above is the
+				// namespace boundary and not a loss of the hotfix.
+				decision, _, err := chain.Authorize(noneCtx,
+					playlistAttributes(anonymousNone, version, ownNamespace, "list", "", ""))
+				require.NoError(t, err)
+				assert.Equal(t, authorizer.DecisionAllow, decision)
+			})
+
+			t.Run("grafana admins keep their cross-organization access", func(t *testing.T) {
+				// The namespace authorizer grants server admins any valid namespace on purpose;
+				// scoping anonymous identities must not narrow that.
+				chain := newChain(t, false, false)
+				adminCtx := identity.WithRequester(context.Background(), grafanaAdmin)
+				decision, _, err := chain.Authorize(adminCtx,
+					playlistAttributes(grafanaAdmin, version, foreignNamespace, "list", "", ""))
+				require.NoError(t, err)
+				assert.Equal(t, authorizer.DecisionAllow, decision)
+			})
+		})
+	}
 }

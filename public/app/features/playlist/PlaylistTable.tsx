@@ -15,7 +15,7 @@ interface Props {
 }
 
 export const PlaylistTable = ({ items, deleteItem, moveItem, onVariablesChange }: Props) => {
-  // Rows are identified by position and the same dashboard may now appear several times with
+  // Rows are identified by position and the same dashboard UID can appear several times with
   // different variables, so an editor left open across a move or a deletion would re-attach to a
   // different item. Every structural change therefore collapses all open editors.
   const [expanded, setExpanded] = useState<Set<number>>(new Set());
