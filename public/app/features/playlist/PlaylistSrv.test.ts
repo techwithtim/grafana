@@ -4,7 +4,7 @@ import configureMockStore from 'redux-mock-store';
 import { locationService } from '@grafana/runtime';
 import { setStore } from 'app/store/store';
 
-import { type Playlist } from '../../api/clients/playlist/v1';
+import { type Playlist, type PlaylistSpec } from '../../api/clients/playlist/v1';
 import { type DashboardQueryResult } from '../search/service/types';
 
 import { PlaylistSrv } from './PlaylistSrv';
@@ -74,6 +74,31 @@ const mockWindowLocation = (): [jest.Mock, () => void] => {
   };
   return [hrefMock, unmock];
 };
+
+// Kept separate from mockPlaylist so the cases that predate variables keep their original two-item fixture.
+function playlistWithItems(items: PlaylistSpec['items']): Playlist {
+  return {
+    apiVersion: 'playlist.grafana.app/v1',
+    kind: 'Playlist',
+    spec: {
+      interval: '1s',
+      title: 'The display',
+      items,
+    },
+    metadata: {
+      name: 'xyz',
+    },
+    status: {},
+  };
+}
+
+// The MemoryHistory that records the visited URLs is not part of the locationService interface, so the
+// cast reaching it lives here only, rather than being repeated in every case that reads a pushed URL.
+function getLastHistoryEntry(): Location {
+  const history = locationService.getHistory();
+  const entries = (history as unknown as { base: { entries: Location[] } }).base.entries;
+  return entries[entries.length - 1];
+}
 
 describe('PlaylistSrv', () => {
   let srv: PlaylistSrv;
@@ -170,5 +195,114 @@ describe('PlaylistSrv', () => {
     // Verify the start page (/playlists/play/foo) is not in history
     const hasStartPage = entries.some((entry: { pathname: string }) => entry.pathname === '/playlists/play/foo');
     expect(hasStartPage).toBe(false);
+  });
+
+  it('repeats the var- parameter once per value for an item with a multi-value variable', async () => {
+    await srv.start(playlistWithItems([{ type: 'dashboard_by_uid', value: 'aaa', variables: { host: ['a', 'b'] } }]));
+
+    const entry = getLastHistoryEntry();
+    expect(entry.pathname).toBe('/url/to/aaa');
+    expect(entry.search).toBe('?var-host=a&var-host=b');
+  });
+
+  it('emits no var- parameter and keeps only whitelisted parameters for an item without variables', async () => {
+    locationService.push('/playlists/foo?orgId=3&from=now-5m');
+
+    await srv.start(playlistWithItems([{ type: 'dashboard_by_uid', value: 'aaa' }]));
+
+    expect(getLastHistoryEntry().search).toBe('?orgId=3');
+  });
+
+  it('emits no var- parameter for a variable-less item that directly follows a variable-bearing item', async () => {
+    await srv.start(
+      playlistWithItems([
+        { type: 'dashboard_by_uid', value: 'aaa', variables: { host: ['a'] } },
+        { type: 'dashboard_by_uid', value: 'bbb' },
+      ])
+    );
+
+    expect(getLastHistoryEntry().search).toBe('?var-host=a');
+
+    srv.next();
+
+    const entry = getLastHistoryEntry();
+    expect(entry.pathname).toBe('/url/to/bbb');
+    expect(entry.search).toBe('');
+  });
+
+  it('percent-encodes a variable value containing a space and reserved characters', async () => {
+    await srv.start(playlistWithItems([{ type: 'dashboard_by_uid', value: 'aaa', variables: { x: ['a b&c=d'] } }]));
+
+    expect(getLastHistoryEntry().search).toBe('?var-x=a%20b%26c%3Dd');
+  });
+
+  it('percent-encodes a variable name containing an ampersand so the query parses to a single key', async () => {
+    await srv.start(playlistWithItems([{ type: 'dashboard_by_uid', value: 'aaa', variables: { 'h&y': ['v'] } }]));
+
+    const { search } = getLastHistoryEntry();
+    expect(search).toBe('?var-h%26y=v');
+    expect(Array.from(new URLSearchParams(search).keys())).toEqual(['var-h&y']);
+  });
+
+  it.each<{ desc: string; variables: Record<string, string[]> }>([
+    { desc: 'an empty variable name', variables: { '': ['x'], host: ['a'] } },
+    { desc: 'a whitespace-only variable name', variables: { '   ': ['x'], host: ['a'] } },
+    { desc: 'a variable with an empty value list', variables: { empty: [], host: ['a'] } },
+  ])('skips $desc and emits only the valid var- parameter', async ({ variables }) => {
+    await srv.start(playlistWithItems([{ type: 'dashboard_by_uid', value: 'aaa', variables }]));
+
+    expect(getLastHistoryEntry().search).toBe('?var-host=a');
+  });
+
+  it('keeps kiosk from the starting location but drops a var- parameter already in the URL', async () => {
+    locationService.push('/playlists/foo?kiosk&var-host=old');
+
+    await srv.start(playlistWithItems([{ type: 'dashboard_by_uid', value: 'aaa', variables: { host: ['a', 'b'] } }]));
+
+    expect(getLastHistoryEntry().search).toBe('?kiosk=true&var-host=a&var-host=b');
+  });
+
+  it('emits no var- parameter for a dashboard_by_tag item that carries variables', async () => {
+    await srv.start(playlistWithItems([{ type: 'dashboard_by_tag', value: 'graph-ng', variables: { host: ['a'] } }]));
+
+    const entry = getLastHistoryEntry();
+    expect(entry.pathname).toBe('/url/to/graph-ng');
+    expect(entry.search).toBe('');
+  });
+
+  it('pushes a distinct URL and keeps playing for a second item on the same dashboard with different variables', async () => {
+    await srv.start(
+      playlistWithItems([
+        { type: 'dashboard_by_uid', value: 'aaa', variables: { host: ['one'] } },
+        { type: 'dashboard_by_uid', value: 'aaa', variables: { host: ['two'] } },
+      ])
+    );
+
+    const first = getLastHistoryEntry();
+    expect(first.pathname).toBe('/url/to/aaa');
+    expect(first.search).toBe('?var-host=one');
+
+    srv.next();
+
+    const second = getLastHistoryEntry();
+    expect(second.pathname).toBe('/url/to/aaa');
+    expect(second.search).toBe('?var-host=two');
+    expect(srv.state.isPlaying).toBe(true);
+  });
+
+  it('reloads the page after 3 cycles when the items carry variables', async () => {
+    await srv.start(
+      playlistWithItems([
+        { type: 'dashboard_by_uid', value: 'aaa', variables: { host: ['a'] } },
+        { type: 'dashboard_by_uid', value: 'bbb', variables: { host: ['b'] } },
+      ])
+    );
+
+    for (let i = 0; i < 6; i++) {
+      srv.next();
+    }
+
+    expect(hrefMock).toHaveBeenCalledTimes(2);
+    expect(hrefMock).toHaveBeenLastCalledWith(initialUrl);
   });
 });

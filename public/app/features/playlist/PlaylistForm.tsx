@@ -51,7 +51,7 @@ export const PlaylistForm = ({
     return () => getGrafanaSearcher().tags({ kind: ['dashboard'] });
   }, []);
 
-  const { items, addByUID, addByTag, deleteItem, moveItem } = usePlaylistItems(propItems);
+  const { items, addByUID, addByTag, deleteItem, moveItem, updateItemVariables } = usePlaylistItems(propItems);
 
   // When the selector is locked the repository can't be changed, so derive the value from the
   // playlist (its managing repository, or "no repository" when unmanaged). Otherwise it's controlled.
@@ -133,7 +133,12 @@ export const PlaylistForm = ({
               </Box>
             )}
 
-            <PlaylistTable items={items} deleteItem={deleteItem} moveItem={moveItem} />
+            <PlaylistTable
+              items={items}
+              deleteItem={deleteItem}
+              moveItem={moveItem}
+              onVariablesChange={updateItemVariables}
+            />
 
             <FieldSet label={t('playlist-edit.form.heading', 'Add dashboards')}>
               <Field label={t('playlist-edit.form.add-title-label', 'Add by title')}>
