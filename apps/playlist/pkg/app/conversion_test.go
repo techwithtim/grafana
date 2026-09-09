@@ -266,6 +266,29 @@ func TestValidatePlaylistObject(t *testing.T) {
 			want: []string{"FieldValueInvalid spec.items[0].variables[ ]"},
 		},
 		{
+			name: "zero width space only variable name",
+			// U+200B is not Unicode whitespace, so trimming spaces admitted it and playback
+			// then emitted an invisible `var-%E2%80%8B` parameter. The full invisible-character
+			// catalogue is in app_test.go; these two are the cases the layers disagreed on.
+			items: []itemFixture{{
+				itemType:  "dashboard_by_uid",
+				value:     "xCmMwXdVz",
+				variables: map[string][]string{"\u200b": {"a"}},
+			}},
+			want: []string{"FieldValueInvalid spec.items[0].variables[\u200b]"},
+		},
+		{
+			name: "byte order mark only variable name",
+			// U+FEFF was stored by the API and then skipped by playback, so the two layers
+			// disagreed about whether the variable existed at all.
+			items: []itemFixture{{
+				itemType:  "dashboard_by_uid",
+				value:     "xCmMwXdVz",
+				variables: map[string][]string{"\ufeff": {"a"}},
+			}},
+			want: []string{"FieldValueInvalid spec.items[0].variables[\ufeff]"},
+		},
+		{
 			name: "nil value list",
 			items: []itemFixture{{
 				itemType:  "dashboard_by_uid",

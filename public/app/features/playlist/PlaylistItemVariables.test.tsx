@@ -185,8 +185,51 @@ function CollapsibleSettleHarness({
   );
 }
 
+/**
+ * The editor inside a real form with a real submit button, which is the shape `PlaylistForm` gives
+ * it. Pressing that button is the interaction the editor has to survive: the press moves focus out
+ * of the field being edited before the click that submits has been delivered, so anything
+ * committed on the way out changes the height of this panel while the pointer is still down — and
+ * the button it is aimed at is below the panel.
+ */
+function SubmitHarness({
+  initial,
+  onChange,
+  onSettle,
+}: {
+  initial?: Record<string, string[]>;
+  onChange: (next?: Record<string, string[]>) => void;
+  onSettle: (settled: boolean) => void;
+}) {
+  const { commitScope, settlePendingVariables } = usePlaylistVariablesCommit();
+  const [current, setCurrent] = useState<Record<string, string[]> | undefined>(initial);
+  return (
+    <PlaylistVariablesCommitContext.Provider value={commitScope}>
+      <form
+        onSubmit={(event) => {
+          event.preventDefault();
+          onSettle(settlePendingVariables());
+        }}
+      >
+        <PlaylistItemVariables
+          variables={current}
+          onChange={(next) => {
+            setCurrent(next);
+            onChange(next);
+          }}
+        />
+        <button type="submit">Save</button>
+      </form>
+    </PlaylistVariablesCommitContext.Provider>
+  );
+}
+
 function settleButton() {
   return screen.getByRole('button', { name: 'Settle' });
+}
+
+function submitButton() {
+  return screen.getByRole('button', { name: 'Save' });
 }
 
 /** The accessible names of the committed rows' name inputs, in the order they are rendered. */
@@ -408,6 +451,22 @@ const enterCommits: Array<{
 }> = [
   { desc: 'name', field: 'name', text: 'cluster', expected: { cluster: ['a', 'b'], region: ['eu'] } },
   { desc: 'values', field: 'values', text: 'x', expected: { host: ['x'], region: ['eu'] } },
+];
+
+/** Every character that reorders the text around it, one per formatting class Unicode defines. */
+const BIDI_CONTROLS = /[\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/;
+
+const bidiControls: Array<{ desc: string; control: string }> = [
+  { desc: 'a right-to-left override', control: '\u202E' },
+  { desc: 'a left-to-right override', control: '\u202D' },
+  { desc: 'a right-to-left embedding', control: '\u202B' },
+  { desc: 'a left-to-right embedding', control: '\u202A' },
+  { desc: 'a pop directional formatting', control: '\u202C' },
+  { desc: 'a first-strong isolate', control: '\u2068' },
+  { desc: 'a pop directional isolate', control: '\u2069' },
+  { desc: 'a left-to-right mark', control: '\u200E' },
+  { desc: 'a right-to-left mark', control: '\u200F' },
+  { desc: 'an Arabic letter mark', control: '\u061C' },
 ];
 
 describe('PlaylistItemVariables', () => {
@@ -1018,7 +1077,7 @@ describe('PlaylistItemVariables', () => {
     expect(screen.getAllByRole('textbox')).toHaveLength(2);
   });
 
-  it('adds the variable in the add row when focus leaves the row', async () => {
+  it('keeps the variable in the add row when focus leaves it, and adds nothing', async () => {
     const onChange = jest.fn();
     const { user } = setup(
       <>
@@ -1029,14 +1088,16 @@ describe('PlaylistItemVariables', () => {
 
     await user.type(newName(), 'draft1');
     await user.type(newValues(), 'd1');
-    // Collapsing the panel, deleting a row and saving the playlist all begin by moving focus out
-    // of this row, and each of them would otherwise discard what is in it without a word.
+    // Adding the variable here is what used to move whatever sits below this panel — the playlist's
+    // own Save button — between the press and the release of a click on it, so the click never
+    // reached it. The row is added by the add button, by Enter, or by the settle a save asks for.
     await user.click(screen.getByRole('button', { name: 'Elsewhere' }));
 
-    await waitFor(() => {
-      expect(onChange).toHaveBeenCalledWith({ draft1: ['d1'] });
-    });
-    expect(onChange).toHaveBeenCalledTimes(1);
+    expect(onChange).not.toHaveBeenCalled();
+    expect(newName()).toHaveValue('draft1');
+    expect(newValues()).toHaveValue('d1');
+    expect(screen.getByText(PENDING_HINT)).toBeInTheDocument();
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
   });
 
   it('does not add anything or report anything when focus moves between the add row controls', async () => {
@@ -1044,7 +1105,8 @@ describe('PlaylistItemVariables', () => {
     const { user } = setup(<PlaylistItemVariables onChange={onChange} />);
 
     await user.type(newName(), 'host');
-    // Name to values to the add button and back: the row is being filled in, not left.
+    // Name to values and back: the row is being filled in, and nothing about that is a request to
+    // add it.
     await user.click(newValues());
     await user.type(newValues(), 'a');
     await user.click(newName());
@@ -1076,7 +1138,7 @@ describe('PlaylistItemVariables', () => {
     expect(onChange).not.toHaveBeenCalled();
   });
 
-  it('reports a half-filled add row when focus leaves it instead of dropping the text', async () => {
+  it('keeps a half-filled add row as it is when focus leaves it, without a message', async () => {
     const onChange = jest.fn();
     const { user } = setup(
       <>
@@ -1088,10 +1150,16 @@ describe('PlaylistItemVariables', () => {
     await user.type(newName(), 'draft1');
     await user.click(screen.getByRole('button', { name: 'Elsewhere' }));
 
-    await waitFor(() => {
-      expect(screen.getByRole('alert')).toHaveTextContent(VALUE_REQUIRED);
-    });
+    // Nothing has been asked for yet, so nothing is refused: a message under a field the user is
+    // still filling in reports a mistake they have not made. The row is refused when it is added,
+    // and when a save settles it.
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
     expect(newName()).toHaveValue('draft1');
+    expect(onChange).not.toHaveBeenCalled();
+
+    await user.click(addButton());
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(VALUE_REQUIRED);
     expect(onChange).not.toHaveBeenCalled();
   });
 
@@ -1113,6 +1181,57 @@ describe('PlaylistItemVariables', () => {
       expect(screen.queryByText(PENDING_HINT)).not.toBeInTheDocument();
     });
     expect(onChange).toHaveBeenCalledWith({ host: ['a'] });
+  });
+
+  it('leaves an edited row for the submit to commit when the blur hands focus to a submit control', async () => {
+    const onChange = jest.fn();
+    const { user } = setup(<SubmitHarness initial={{ host: ['a'] }} onChange={onChange} onSettle={jest.fn()} />);
+    const values = rowValues('host');
+
+    await user.clear(values);
+    await user.type(values, 'b');
+    // The moment a press on Save reaches the browser: focus has left the field and the click that
+    // submits has not been delivered. Committing now inserts a message or a row above the button.
+    fireEvent.focusOut(values, { relatedTarget: submitButton() });
+
+    expect(onChange).not.toHaveBeenCalled();
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    expect(values).toHaveValue('b');
+  });
+
+  it('commits an edited row once for a single press on the submit control', async () => {
+    const onChange = jest.fn();
+    const onSettle = jest.fn();
+    const { user } = setup(<SubmitHarness initial={{ host: ['a'] }} onChange={onChange} onSettle={onSettle} />);
+
+    await user.clear(rowValues('host'));
+    await user.type(rowValues('host'), 'b');
+    await user.click(submitButton());
+
+    // One press, one commit, and the submit it belongs to went through: this is the press that
+    // used to be swallowed by the panel growing underneath it.
+    await waitFor(() => {
+      expect(onSettle).toHaveBeenCalledWith(true);
+    });
+    expect(onChange).toHaveBeenCalledTimes(1);
+    expect(onChange).toHaveBeenCalledWith({ host: ['b'] });
+  });
+
+  it('adds the text still in the add row for a single press on the submit control', async () => {
+    const onChange = jest.fn();
+    const onSettle = jest.fn();
+    const { user } = setup(<SubmitHarness onChange={onChange} onSettle={onSettle} />);
+
+    await user.type(newName(), 'oneclick');
+    await user.type(newValues(), 'o1, o2');
+    await user.click(submitButton());
+
+    await waitFor(() => {
+      expect(onSettle).toHaveBeenCalledWith(true);
+    });
+    expect(onChange).toHaveBeenCalledTimes(1);
+    expect(onChange).toHaveBeenCalledWith({ oneclick: ['o1', 'o2'] });
+    expect(onSettle).toHaveBeenCalledTimes(1);
   });
 
   it('adds the text still in the add row when the form settles, and lets the form go on', async () => {
@@ -1580,6 +1699,46 @@ describe('PlaylistItemVariables', () => {
       });
       expect(rowName(name)).toHaveValue(name);
       expect(screen.getByRole('button', { name: `Remove variable ${name}` })).toBeInTheDocument();
+    });
+
+    it.each(bidiControls)(
+      'names the controls of a variable holding $desc after the text it stores, in logical order',
+      ({ control }) => {
+        const name = `host${control}1`;
+        render(<PlaylistItemVariables variables={variableMap([[name, ['a']]])} onChange={jest.fn()} />);
+
+        // The control is dropped from the names, so what they describe is the order the stored
+        // characters are in rather than the order the character reverses them into. Resolving these
+        // queries by accessible name is the assertion.
+        const nameInput = screen.getByRole('textbox', { name: 'Variable name for host1' });
+        const valuesInput = screen.getByRole('textbox', { name: 'Values for host1' });
+        expect(screen.getByRole('button', { name: 'Remove variable host1' })).toBeInTheDocument();
+        expect(nameInput.getAttribute('aria-label')).not.toMatch(BIDI_CONTROLS);
+        expect(valuesInput.getAttribute('aria-label')).not.toMatch(BIDI_CONTROLS);
+
+        // The item is unchanged: the fields show exactly what it stores, character for character,
+        // and what is saved and played is that text and not the text the labels describe.
+        expect(nameInput).toHaveValue(name);
+        expect(valuesInput).toHaveValue('a');
+      }
+    );
+
+    it('keeps a bidirectional override out of the names of a variable added through the editor', async () => {
+      const value = '\u202eRTL\u202c';
+      const { onChange } = changeSpy();
+      const { user } = setup(<ControlledEditor initial={{}} onChange={onChange} />);
+
+      await user.type(newName(), 'host');
+      await user.type(newValues(), value);
+      await user.click(addButton());
+
+      // Stored as typed, described without the control: the two are different jobs done to the
+      // same text, and only the description is rewritten.
+      await waitFor(() => {
+        expect(onChange).toHaveBeenCalledWith({ host: [value] });
+      });
+      expect(rowValues('host')).toHaveValue(value);
+      expect(rowValues('host').getAttribute('aria-label')).not.toMatch(BIDI_CONTROLS);
     });
 
     it('renders a script or image tag in a variable name as text and never as an element', () => {

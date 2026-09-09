@@ -1,9 +1,10 @@
 import { DragDropContext, Droppable, type DropResult } from '@hello-pangea/dnd';
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useContext, useEffect, useRef, useState } from 'react';
 
 import { t } from '@grafana/i18n';
 import { ConfirmModal, FieldSet } from '@grafana/ui';
 
+import { PlaylistVariablesCommitContext } from './PlaylistItemVariables';
 import { PlaylistTableRows } from './PlaylistTableRows';
 import { type PlaylistItemUI } from './types';
 import { usePlaylistItemKeys } from './usePlaylistItems';
@@ -37,6 +38,9 @@ interface PendingDelete {
 const ROW_INDEX_ATTRIBUTE = 'data-playlist-item-index';
 const DRAG_HANDLE_SELECTOR = '[data-playlist-item-drag-handle]';
 
+/** What the open editors committed during one settle, by the row position each belongs to. */
+type SettledVariables = Map<number, Record<string, string[]> | undefined>;
+
 export const PlaylistTable = ({ items, deleteItem, moveItem, onVariablesChange }: Props) => {
   // Rows are identified by position and the same dashboard UID can appear several times with
   // different variables, so an editor left open across a move or a deletion would re-attach to a
@@ -52,21 +56,52 @@ export const PlaylistTable = ({ items, deleteItem, moveItem, onVariablesChange }
   const editedKeys = useRef(new Set<string>());
   const itemKeys = usePlaylistItemKeys(items);
 
-  const toggleExpanded = useCallback((index: number) => {
-    setExpanded((previous) => {
-      const next = new Set(previous);
-      if (next.has(index)) {
-        next.delete(index);
-      } else {
-        next.add(index);
-      }
-      return next;
-    });
-  }, []);
+  // The scope the playlist form provides, holding the editors it has open. Undefined only where
+  // this table is rendered outside that form, which is a test fixture rather than the product.
+  const commitScope = useContext(PlaylistVariablesCommitContext);
+  /** Where a settle in progress records what it committed, and nothing at any other time. */
+  const settleInProgress = useRef<SettledVariables | undefined>(undefined);
+
+  /**
+   * Commits what the open editors are holding, and reports what they committed by row position.
+   *
+   * Every change this component makes either takes an editor away — collapsing a row, deleting a
+   * row, lifting one for a drag — or moves the item a row stands for, and a variable typed into an
+   * editor but not yet added is only in that editor. So it is committed first, while the rows are
+   * still the rows it was typed into: settling afterwards would apply it to whichever item had
+   * taken that position.
+   */
+  const settleOpenEditors = useCallback((): SettledVariables => {
+    const settled: SettledVariables = new Map();
+    settleInProgress.current = settled;
+    try {
+      commitScope?.settle();
+    } finally {
+      settleInProgress.current = undefined;
+    }
+    return settled;
+  }, [commitScope]);
+
+  const toggleExpanded = useCallback(
+    (index: number) => {
+      settleOpenEditors();
+      setExpanded((previous) => {
+        const next = new Set(previous);
+        if (next.has(index)) {
+          next.delete(index);
+        } else {
+          next.add(index);
+        }
+        return next;
+      });
+    },
+    [settleOpenEditors]
+  );
 
   const collapseAll = useCallback(() => {
+    settleOpenEditors();
     setExpanded((previous) => (previous.size === 0 ? previous : new Set()));
-  }, []);
+  }, [settleOpenEditors]);
 
   const focusRow = useCallback((index: number) => {
     const list = listRef.current;
@@ -129,21 +164,32 @@ export const PlaylistTable = ({ items, deleteItem, moveItem, onVariablesChange }
     setFocusPlan(plan);
   };
 
-  const unsavedVariableCount = (index: number) => {
+  /**
+   * How many unsaved variables the row at `index` would lose if it were removed.
+   *
+   * `settled` is what the settle that has just run committed, and it takes precedence over the
+   * item: those maps reach the item list on the next render, which is after this deletion has been
+   * decided, so a variable the user typed and never added would otherwise be counted as absent and
+   * discarded without a word.
+   */
+  const unsavedVariableCount = (index: number, settled: SettledVariables) => {
     const key = itemKeys[index];
     if (!key || !editedKeys.current.has(key)) {
       return 0;
     }
 
     const item = items[index];
-    return item ? Object.keys(item.variables ?? {}).length : 0;
+    const variables = settled.has(index) ? settled.get(index) : item?.variables;
+    return item ? Object.keys(variables ?? {}).length : 0;
   };
 
   const onDelete = (index: number) => {
     // Planned here rather than on confirmation, because the confirmation dialog takes focus away
-    // from the row before the user answers it.
+    // from the row before the user answers it. Planned before the settle too, since the plan is
+    // read off where focus is now.
     const plan = planFocusAfterDelete(index);
-    const variableCount = unsavedVariableCount(index);
+    const settled = settleOpenEditors();
+    const variableCount = unsavedVariableCount(index, settled);
     if (variableCount > 0) {
       setPendingDelete({ index, variableCount, plan });
       return;
@@ -165,11 +211,17 @@ export const PlaylistTable = ({ items, deleteItem, moveItem, onVariablesChange }
     if (key) {
       editedKeys.current.add(key);
     }
+    // A settle reaches this the same way an ordinary edit does, so it is recorded for whatever
+    // asked for the settle to read back before the change it is about to make.
+    settleInProgress.current?.set(index, variables);
     onVariablesChange(index, variables);
   };
 
   const onDragEnd = (d: DropResult) => {
-    setExpanded(new Set());
+    // The lift collapsed the editors already; going through the same call is what settles anything
+    // an editor is still holding for a drag that reached this without one, and the settle sees the
+    // positions the rows had before the move.
+    collapseAll();
     if (d.destination) {
       moveItem(d.source.index, d.destination?.index);
     }

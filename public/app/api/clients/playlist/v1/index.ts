@@ -1,8 +1,17 @@
+import { lastValueFrom } from 'rxjs';
+
 import { normalizeError } from '@grafana/api-clients';
-import { generatedAPI, type Playlist, type PlaylistSpec } from '@grafana/api-clients/rtkq/playlist/v1';
+import {
+  BASE_URL,
+  generatedAPI,
+  type ListPlaylistApiArg,
+  type Playlist,
+  type PlaylistList,
+  type PlaylistSpec,
+} from '@grafana/api-clients/rtkq/playlist/v1';
 import { isObject } from '@grafana/data';
 import { t } from '@grafana/i18n';
-import { getBackendSrv, isFetchError } from '@grafana/runtime';
+import { type FetchResponse, getBackendSrv, isFetchError } from '@grafana/runtime';
 
 import { createErrorNotification, createSuccessNotification } from '../../../../core/copy/appNotification';
 import { notifyApp } from '../../../../core/reducers/appNotification';
@@ -56,8 +65,76 @@ export function getPlaylistErrorMessage(error: unknown): string {
   }
 }
 
+/**
+ * Maximum number of requests one unbounded playlist list query is allowed to make.
+ *
+ * The apiserver returns a list in chunks once the response outgrows its size budget (2 MiB in
+ * unified storage) and hands back a `metadata.continue` token for the remainder, so reading a
+ * whole namespace can take several requests. The cap is what keeps that walk finite: a server
+ * that keeps answering with a token would otherwise make this query request and accumulate
+ * without limit. When the walk stops at the cap the merged result keeps its continue token,
+ * which is how the list page knows that what it holds is incomplete and says so.
+ */
+export const PLAYLIST_LIST_MAX_PAGES = 20;
+
+/**
+ * Reads the remaining chunks of a list response and merges them into the first one.
+ *
+ * The pages come out of the RTK Query cache, so nothing is mutated: the result is a new object
+ * with a new items array. Its `metadata.continue` is empty once the namespace has been read to
+ * the end, and still carries the outstanding token when the walk stopped at the page cap or a
+ * continuation request failed — a failed continuation degrades to "these loaded, and they are
+ * not all of them" rather than failing the whole query and showing nothing.
+ */
+async function listAllPlaylists(first: PlaylistList, arg: ListPlaylistApiArg): Promise<PlaylistList> {
+  // Annotated, not inferred: the token is both sent with a request and read back from its
+  // response, and without a declared type that round trip is a circular inference.
+  let token: string | undefined = first.metadata?.continue;
+  if (!token) {
+    // One chunk held the whole namespace, which is the ordinary case.
+    return first;
+  }
+
+  let items = [...(first.items ?? [])];
+  const requested = new Set<string>();
+
+  for (let page = 1; page < PLAYLIST_LIST_MAX_PAGES && token && !requested.has(token); page++) {
+    requested.add(token);
+    try {
+      const response: FetchResponse<PlaylistList> = await lastValueFrom(
+        getBackendSrv().fetch<PlaylistList>({
+          method: 'GET',
+          url: `${BASE_URL}/playlists`,
+          // A continued list repeats the parameters that decide which playlists it contains and
+          // carries no resourceVersion: the token already pins the snapshot it continues.
+          params: { fieldSelector: arg.fieldSelector, labelSelector: arg.labelSelector, continue: token },
+          showErrorAlert: false,
+        })
+      );
+      items = items.concat(response.data.items ?? []);
+      token = response.data.metadata?.continue;
+    } catch {
+      // Stop, keeping the token so the truncation is reported rather than hidden.
+      break;
+    }
+  }
+
+  return { ...first, items, metadata: { ...first.metadata, continue: token ?? '' } };
+}
+
 export const playlistAPIv1 = generatedAPI.enhanceEndpoints({
   endpoints: {
+    listPlaylist: {
+      transformResponse: async (response: PlaylistList, _meta: unknown, arg: ListPlaylistApiArg) => {
+        // A caller that asked for a single page — with a limit, a continue token, a pinned
+        // resourceVersion or a watch — gets exactly the page it asked for. Only the unbounded
+        // list, which is what every playlist surface issues, is walked to the end here.
+        if (arg.limit != null || arg.continue || arg.resourceVersion || arg.watch) {
+          return response;
+        }
+        return listAllPlaylists(response, arg);
+      },
+    },
     getPlaylist: {
       transformResponse: async (response: Playlist) => {
         await migrateInternalIDs(response.spec);

@@ -2,10 +2,14 @@ package clients
 
 import (
 	"context"
+	"math"
 	"net/http"
+	"slices"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	claims "github.com/grafana/authlib/types"
 	"github.com/grafana/grafana/pkg/infra/tracing"
@@ -183,4 +187,68 @@ func TestGrafana_AuthenticatePassword(t *testing.T) {
 			assert.EqualValues(t, tt.expectedIdentity, identity)
 		})
 	}
+}
+
+// TestGrafana_AuthenticatePassword_UnknownLoginHashesLikeKnownLogin pins the fix for the
+// username-enumeration side channel: the password hash comparison is the dominant cost of
+// an authentication attempt, so a login that does not resolve to a user must still pay it,
+// otherwise the response time discloses which logins exist.
+//
+// The measurement is deliberately a LOWER bound and is calibrated against this host: an
+// overloaded or slow machine can only make the measured path take longer than the hashing
+// work it performs, so a lower bound cannot flake, whereas an upper bound would. Without
+// the equalizing comparison the not-found path returns in microseconds - roughly two
+// orders of magnitude under the reference - so the assertion genuinely fails on the
+// unfixed code.
+func TestGrafana_AuthenticatePassword_UnknownLoginHashesLikeKnownLogin(t *testing.T) {
+	const (
+		password = "password"
+		samples  = 5
+	)
+
+	// Reference cost of one password hash on this host, produced exactly as the
+	// authentication path produces it. The minimum sample is the least load-contaminated.
+	reference := time.Duration(math.MaxInt64)
+	for range samples {
+		start := time.Now()
+		_, err := util.EncodePassword(password, decoySalt)
+		require.NoError(t, err)
+		if elapsed := time.Since(start); elapsed < reference {
+			reference = elapsed
+		}
+	}
+
+	// FakeUserService.GetByLoginWithPassword delegates to GetByLogin, which returns
+	// ExpectedUser/ExpectedError, so this drives the user.ErrUserNotFound branch.
+	userService := &usertest.FakeUserService{ExpectedError: user.ErrUserNotFound}
+	c := ProvideGrafana(setting.NewCfg(), userService, tracing.InitializeTracerForTest())
+
+	durations := make([]time.Duration, 0, samples)
+	for range samples {
+		start := time.Now()
+		identity, err := c.AuthenticatePassword(context.Background(), &authn.Request{OrgID: 1}, "login-that-never-existed", password)
+		durations = append(durations, time.Since(start))
+
+		// Equalizing the cost must not change the authentication outcome.
+		assert.Nil(t, identity)
+		assert.ErrorIs(t, err, errIdentityNotFound)
+	}
+
+	slices.Sort(durations)
+	median := durations[len(durations)/2]
+
+	// Half the reference absorbs measurement noise while remaining unreachable without
+	// actually performing the hash.
+	require.GreaterOrEqual(t, median, reference/2,
+		"unknown login failed in %s, under half the %s cost of a single password hash: the failure path skips the hash comparison and leaks whether a login exists",
+		median, reference)
+
+	// The decoy inputs must stay the size of real stored credentials - salts are
+	// util.GetRandomString(10) and stored hashes are util.EncodePassword's 50 bytes
+	// hex-encoded - so the hashing and the constant-time comparison do the same amount of
+	// work as they do for a login that resolves to a user.
+	assert.Len(t, decoySalt, 10)
+	hashed, err := util.EncodePassword(password, decoySalt)
+	require.NoError(t, err)
+	assert.Len(t, decoyHash, len(hashed))
 }

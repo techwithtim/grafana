@@ -4,13 +4,11 @@ import {
   createContext,
   useContext,
   useEffect,
-  useCallback,
   useId,
   useLayoutEffect,
   useMemo,
   useRef,
   useState,
-  type FocusEvent,
   type KeyboardEvent,
 } from 'react';
 
@@ -25,6 +23,7 @@ import {
   MAX_VARIABLE_VALUE_LENGTH,
   MAX_VARIABLE_VALUES_TEXT_LENGTH,
   MAX_VARIABLES_PER_ITEM,
+  isBlankVariableName,
   isWithinCodePointLimit,
   isWithinVariableBudget,
 } from './variableLimits';
@@ -98,16 +97,28 @@ const EMPTY_ROW_STATE: RowState = { drafts: new Map(), errors: new Map() };
 type SettleOutcome = 'settled' | 'blocked';
 
 /**
- * The link between the editors open under a form and that form's submit.
+ * The link between the editors open under a form and the moments their text has to be honoured.
  *
  * An editor holds text that is not yet part of the playlist item — a half-typed add row, or a row
- * being edited — and the form has no other way to learn of it. Submitting regardless is what makes
- * a save either drop what the user typed or store the value they had just replaced, both while
- * reporting success.
+ * being edited — and nothing above it can see that text. Going ahead regardless is what makes a
+ * save either drop what the user typed or store the value they had just replaced, both while
+ * reporting success, and what makes collapsing a row throw away the variable in it.
+ *
+ * Two callers ask for a settle: the form, before it submits, and the table, before a change to
+ * which rows are open or to the item list takes an editor away. The table settles *before* it
+ * changes anything, so what an editor commits is applied to the row it was typed into rather than
+ * to whichever item takes that position afterwards.
  */
 export interface PlaylistVariablesCommitScope {
   /** Registers an open editor and returns the function that removes it again. */
   register: (settle: () => SettleOutcome) => () => void;
+  /**
+   * Commits what every open editor is holding and reports whether the caller may go on: an editor
+   * that cannot commit its text shows a message for it and makes the answer `false`. Each editor
+   * is asked even after one has refused, so one row's rejected text cannot leave another row's
+   * valid text uncommitted.
+   */
+  settle: () => boolean;
 }
 
 export const PlaylistVariablesCommitContext = createContext<PlaylistVariablesCommitScope | undefined>(undefined);
@@ -115,10 +126,8 @@ export const PlaylistVariablesCommitContext = createContext<PlaylistVariablesCom
 /**
  * Gives a form the scope to provide to the editors below it, and the check to run before it saves.
  *
- * `settlePendingVariables` returns whether the form may go on: every open editor commits what it
- * can and shows a message for what it cannot, and a single refusal makes the answer `false`. Each
- * editor is asked even after one has refused, so one row's rejected text cannot leave another
- * row's valid text uncommitted.
+ * `settlePendingVariables` is the scope's own `settle`, named for the one caller that decides
+ * something by its answer: a submit that must not go ahead while an editor is refusing text.
  */
 export function usePlaylistVariablesCommit(): {
   commitScope: PlaylistVariablesCommitScope;
@@ -135,23 +144,58 @@ export function usePlaylistVariablesCommit(): {
           editors.delete(settle);
         };
       },
+      settle: () => {
+        let settled = true;
+        // A copy, because an editor that commits re-renders its parent, and a set being iterated
+        // is not the place to discover a registration or a removal.
+        for (const settle of Array.from(editorsRef.current)) {
+          if (settle() === 'blocked') {
+            settled = false;
+          }
+        }
+        return settled;
+      },
     }),
     []
   );
 
-  const settlePendingVariables = useCallback(() => {
-    let settled = true;
-    // A copy, because an editor that commits re-renders its parent, and a set being iterated is
-    // not the place to discover a registration or a removal.
-    for (const settle of Array.from(editorsRef.current)) {
-      if (settle() === 'blocked') {
-        settled = false;
-      }
-    }
-    return settled;
-  }, []);
+  return { commitScope, settlePendingVariables: commitScope.settle };
+}
 
-  return { commitScope, settlePendingVariables };
+/**
+ * Unicode's explicit bidirectional formatting characters: the overrides and embeddings, their
+ * terminator, the isolates and the directional marks.
+ */
+const BIDI_CONTROLS = /[\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/g;
+
+/**
+ * User-supplied text as a label, a tooltip or a summary may carry it.
+ *
+ * A variable name and its values are free text, and text holding a bidirectional override renders
+ * in an order its characters do not have: a value stored as `\u202eHost1` reads as `1tsoH`, and
+ * the override goes on reversing whatever follows it inside the same string — the `name=` it
+ * belongs to, the next pair of the summary, the words of the label itself. A label that describes
+ * the item as holding something other than what it holds misrepresents the item, so these
+ * characters are dropped from the text the labels are built out of.
+ *
+ * Only the description is affected. What the item stores, what the inputs show and what playback
+ * sends are the characters the user typed: those are data, and this editor never rewrites them.
+ */
+export function inLogicalOrder(text: string): string {
+  return text.replace(BIDI_CONTROLS, '');
+}
+
+/**
+ * Whether focus is being handed to a control that submits the enclosing form.
+ *
+ * Committing a row while that is happening puts a validation message, or a whole new row, above
+ * the control between the press and the release of one click, which moves the control out from
+ * under the pointer so the click never reaches it — a press on Save that does nothing at all.
+ * Nothing is lost by leaving the commit to the submit, because the submit settles every open
+ * editor before it sends anything.
+ */
+function isSubmitControl(element: EventTarget | null): boolean {
+  return (element instanceof HTMLButtonElement || element instanceof HTMLInputElement) && element.type === 'submit';
 }
 
 /**
@@ -242,7 +286,6 @@ export const PlaylistItemVariables = ({ variables, itemPosition, onChange }: Pro
   const styles = useStyles2(getStyles);
   const newNameId = useId();
   const newValuesId = useId();
-  const newAddId = useId();
 
   // A stored map that breaks the budget is never enumerated: one row is several controls, and
   // building them for every name is the exhaustion the budget exists to prevent. The message below
@@ -255,18 +298,6 @@ export const PlaylistItemVariables = ({ variables, itemPosition, onChange }: Pro
   const [rowState, setRowState] = useState<RowState>(EMPTY_ROW_STATE);
   const [newDraft, setNewDraft] = useState<RowDraft>(EMPTY_DRAFT);
   const [newError, setNewError] = useState<RowError | undefined>(undefined);
-
-  /**
-   * Set when leaving the add row committed it, and consumed by an explicit commit that then finds
-   * the row empty.
-   *
-   * Pressing the add button both leaves the row and asks for it to be added. Where the browser
-   * reports the button as the new focus target the leaving is not a commit at all and this never
-   * applies; where it reports no target — some browsers do not focus a button on a mouse press —
-   * the row is committed on the way out and the click that follows would otherwise be read as an
-   * attempt to add an empty variable and answer it with a message about a row that was just added.
-   */
-  const committedOnLeaveRef = useRef(false);
 
   // Reconciling against the committed names as they arrive, rather than in an effect, means the
   // rows below already read the reconciled state; the write only carries it into the next render.
@@ -384,7 +415,10 @@ export const PlaylistItemVariables = ({ variables, itemPosition, onChange }: Pro
     otherNames: string[],
     isNewVariable = false
   ): RowError | undefined => {
-    if (name === '') {
+    // Blank rather than `=== ''`: the name arrives trimmed, and `trim()` leaves a name written in
+    // zero-width or control characters intact — a name nobody can see, type or ask about, which the
+    // API refuses on the same rule. Reported as a missing name, which is what it is.
+    if (isBlankVariableName(name)) {
       return {
         field: 'name',
         message: t('playlist-edit.form.variables-name-required', 'Variable name is required'),
@@ -515,9 +549,6 @@ export const PlaylistItemVariables = ({ variables, itemPosition, onChange }: Pro
   const updateNewDraft = (field: RowField, value: string) => {
     setNewDraft((previous) => (field === 'name' ? { ...previous, name: value } : { ...previous, values: value }));
     setNewError((previous) => (previous?.field === field ? undefined : previous));
-    // Typing is a new attempt, so the row being empty from here on is the user's doing and is
-    // answered as such.
-    committedOnLeaveRef.current = false;
   };
 
   /** Whether the add row holds text the user has typed and not yet added. */
@@ -526,20 +557,14 @@ export const PlaylistItemVariables = ({ variables, itemPosition, onChange }: Pro
   /**
    * Adds the variable in the add row, or reports why it cannot be added.
    *
-   * `leavingRow` distinguishes the two ways this happens. Asked for explicitly — the add button or
-   * Enter — an empty row is an attempt to add nothing and is answered with the missing-name
-   * message, which is the only feedback that request can produce. Reached by leaving the row, an
-   * empty row is simply a row that was never used, and saying anything about it would put a
-   * message under a field the user never touched.
+   * Reached only from the two things that ask for the row to be added — the add button and Enter —
+   * so an empty row here is an attempt to add nothing and is answered with the missing-name
+   * message. Leaving the row does not come through here at all: focus moving away is not a request
+   * to add anything, and the row keeps its text until the user adds it or the playlist is saved.
    */
-  const commitNewRow = ({ leavingRow = false }: { leavingRow?: boolean } = {}) => {
+  const commitNewRow = () => {
     const name = newDraft.name.trim();
     const values = parseValues(newDraft.values);
-
-    if (!newRowHasText && (leavingRow || committedOnLeaveRef.current)) {
-      committedOnLeaveRef.current = false;
-      return;
-    }
 
     const error = validate(name, values, committedNames, true);
     if (error) {
@@ -549,43 +574,20 @@ export const PlaylistItemVariables = ({ variables, itemPosition, onChange }: Pro
 
     setNewError(undefined);
     setNewDraft(EMPTY_DRAFT);
-    committedOnLeaveRef.current = leavingRow;
     // Building the map through Object.fromEntries defines every name as an own property of the
     // result. Assigning one would let a variable named `__proto__` rewrite the map's prototype
     // instead of appearing in it, losing the variable the user just added.
     onChange(Object.fromEntries(new Map(entries).set(name, values)));
   };
 
-  /** Whether an element is one of the add row's own controls, so focus reaching it is not a leave. */
-  const isNewRowControl = (element: EventTarget | null) =>
-    element instanceof HTMLElement &&
-    (element.id === newNameId || element.id === newValuesId || element.id === newAddId);
-
   /**
-   * Commits the add row when focus leaves it, the way leaving a committed row's field commits that
-   * row.
+   * Commits every piece of uncommitted text at once and reports whether the caller may go on.
    *
-   * This is what carries a typed variable through the two moments it would otherwise be dropped
-   * without a word: collapsing the panel, which unmounts this component and everything in it, and
-   * saving the playlist. Both begin by moving focus out of this row — to the disclosure, to a
-   * delete control, to the save button — so the variable is added while the item is still the one
-   * the user was editing, before any collapse, reorder or deletion has moved it.
-   */
-  const handleNewRowBlur = (event: FocusEvent<HTMLInputElement>) => {
-    if (isNewRowControl(event.relatedTarget)) {
-      return;
-    }
-    commitNewRow({ leavingRow: true });
-  };
-
-  /**
-   * Commits every piece of uncommitted text at once and reports whether the form may save.
-   *
-   * Reached only from the enclosing form's submit, and it exists because a save is the last moment
-   * this text can still be honoured. Leaving a field is what normally commits it, so by the time a
-   * click on save arrives there is usually nothing here to do — but a submit can also arrive
-   * without any field having been left, and then this is the difference between saving what is on
-   * screen and saving what it replaced.
+   * Reached from the commit scope — the form before it submits, and the table before a change
+   * takes an editor away — and it exists because those are the last moments this text can still be
+   * honoured. It is also the only thing that adds the row the user typed but never added: leaving
+   * the row deliberately does not, so that pressing save cannot grow the panel between the press
+   * and the release of the same click and lose it.
    *
    * Everything is applied to one map and emitted once. Committing each row on its own would have
    * every commit rebuild the item from the same starting point, so the last would be the only one
@@ -641,7 +643,6 @@ export const PlaylistItemVariables = ({ variables, itemPosition, onChange }: Pro
       changed = true;
       setNewDraft(EMPTY_DRAFT);
       setNewError(undefined);
-      committedOnLeaveRef.current = false;
     } else {
       setNewError(undefined);
     }
@@ -661,9 +662,9 @@ export const PlaylistItemVariables = ({ variables, itemPosition, onChange }: Pro
     return blocked ? 'blocked' : 'settled';
   };
 
-  // The registration is made once per editor and calls whatever the latest render produced, so the
-  // form settles the text as it stands at the moment it submits rather than as it stood when this
-  // editor was opened.
+  // The registration is made once per editor and calls whatever the latest render produced, so a
+  // settle acts on the text as it stands at the moment it is asked for rather than as it stood
+  // when this editor was opened.
   const commitScope = useContext(PlaylistVariablesCommitContext);
   const settleRef = useRef(settlePending);
   useEffect(() => {
@@ -710,30 +711,30 @@ export const PlaylistItemVariables = ({ variables, itemPosition, onChange }: Pro
   // every editor of a dashboard this playlist lists more than once. Where the caller knows the
   // item's position, it is named too; where it does not, the names are exactly what they were.
   //
-  // Every one of these names interpolates the free text the user typed as the variable name, and
-  // escaping is turned off for those interpolations for the reason recorded at the remove control
-  // below: the name is set as an attribute value, which is never parsed as HTML, and the escaped
-  // spelling would disagree with the value shown in the input beside it.
+  // Every one of these names interpolates the free text the user typed as the variable name. Two
+  // things are done to that text before it becomes a name: escaping is turned off for the reason
+  // recorded at the remove control below, and the bidirectional controls are dropped so the name
+  // cannot describe a variable other than the one it belongs to.
   const nameFieldLabel = (variableName: string) =>
     itemPosition === undefined
       ? t('playlist-edit.form.variables-name-aria-label', 'Variable name for {{variableName}}', {
-          variableName,
+          variableName: inLogicalOrder(variableName),
           interpolation: { escapeValue: false },
         })
       : t(
           'playlist-edit.form.variables-name-aria-label-item',
           'Variable name for {{variableName}}, item {{itemPosition}}',
-          { variableName, itemPosition, interpolation: { escapeValue: false } }
+          { variableName: inLogicalOrder(variableName), itemPosition, interpolation: { escapeValue: false } }
         );
 
   const valuesFieldLabel = (variableName: string) =>
     itemPosition === undefined
       ? t('playlist-edit.form.variables-values-aria-label', 'Values for {{variableName}}', {
-          variableName,
+          variableName: inLogicalOrder(variableName),
           interpolation: { escapeValue: false },
         })
       : t('playlist-edit.form.variables-values-aria-label-item', 'Values for {{variableName}}, item {{itemPosition}}', {
-          variableName,
+          variableName: inLogicalOrder(variableName),
           itemPosition,
           interpolation: { escapeValue: false },
         });
@@ -796,6 +797,11 @@ export const PlaylistItemVariables = ({ variables, itemPosition, onChange }: Pro
                   placeholder={t('playlist-edit.form.variables-name-placeholder', 'Variable name')}
                   onChange={(event) => updateDraft(name, 'name', event.currentTarget.value)}
                   onBlur={(event) => {
+                    // A submit is about to settle this row itself, and committing it here would
+                    // move the button out from under the click that started the submit.
+                    if (isSubmitControl(event.relatedTarget)) {
+                      return;
+                    }
                     // Where the blur is taking focus is where focus belongs after the commit, so it
                     // is recorded before the commit that may destroy the element it names.
                     recordCommitFocusTarget(event.relatedTarget);
@@ -828,6 +834,9 @@ export const PlaylistItemVariables = ({ variables, itemPosition, onChange }: Pro
                   placeholder={t('playlist-edit.form.variables-values-placeholder', 'Values, comma-separated')}
                   onChange={(event) => updateDraft(name, 'values', event.currentTarget.value)}
                   onBlur={(event) => {
+                    if (isSubmitControl(event.relatedTarget)) {
+                      return;
+                    }
                     recordCommitFocusTarget(event.relatedTarget);
                     commitRow(name);
                   }}
@@ -865,7 +874,7 @@ export const PlaylistItemVariables = ({ variables, itemPosition, onChange }: Pro
                  * a text node, and neither is ever parsed as HTML.
                  */
                 tooltip={t('playlist-edit.form.variables-remove', 'Remove variable {{variableName}}', {
-                  variableName: name,
+                  variableName: inLogicalOrder(name),
                   interpolation: { escapeValue: false },
                 })}
               />
@@ -908,7 +917,9 @@ export const PlaylistItemVariables = ({ variables, itemPosition, onChange }: Pro
             maxLength={MAX_VARIABLE_NAME_TEXT_LENGTH}
             placeholder={t('playlist-edit.form.variables-name-placeholder', 'Variable name')}
             onChange={(event) => updateNewDraft('name', event.currentTarget.value)}
-            onBlur={handleNewRowBlur}
+            // Deliberately no onBlur: leaving these two fields neither adds the variable nor
+            // reports anything about it. The row keeps what is in it, the note below says so, and
+            // adding it is the add button, Enter, or the settle the playlist's own save asks for.
             onKeyDown={(event) => handleKeyDown(event, () => commitNewRow())}
           />
         </Field>
@@ -924,14 +935,12 @@ export const PlaylistItemVariables = ({ variables, itemPosition, onChange }: Pro
             maxLength={MAX_VARIABLE_VALUES_TEXT_LENGTH}
             placeholder={t('playlist-edit.form.variables-values-placeholder', 'Values, comma-separated')}
             onChange={(event) => updateNewDraft('values', event.currentTarget.value)}
-            onBlur={handleNewRowBlur}
             onKeyDown={(event) => handleKeyDown(event, () => commitNewRow())}
           />
         </Field>
         <div />
 
         <Button
-          id={newAddId}
           className={styles.add}
           type="button"
           variant="secondary"

@@ -721,6 +721,75 @@ describe('PlaylistForm', () => {
       expect(onSubmitMock).toHaveBeenCalledTimes(1);
     });
 
+    /**
+     * The interaction that used to lose a save: with text in the add row, the press on Save moves
+     * focus out of the field, and adding the variable at that moment inserts a row into the panel
+     * above the button — which moves the button out from under the pointer before the click that
+     * submits has been delivered, so nothing is saved and nothing is said. Leaving the row now
+     * changes nothing at all, and the save is what adds the variable.
+     */
+    it('leaves a variable typed but never added in the add row when focus moves to another field', async () => {
+      const { onSubmitMock, user } = getTestContext(mockEmptyPlaylist);
+
+      await user.click(dashboardPickerButton());
+      const editor = await openVariableEditor(user, 0);
+      await user.type(newVariableName(editor), 'oneclick');
+      await user.type(newVariableValues(editor), 'o1, o2');
+
+      // The playlist's own Name field, which is where the QA report's own reproduction clicked.
+      await user.click(screen.getByRole('textbox', { name: 'Name' }));
+
+      expect(screen.queryByText('1 variable')).not.toBeInTheDocument();
+      expect(newVariableName(editor)).toHaveValue('oneclick');
+      expect(newVariableValues(editor)).toHaveValue('o1, o2');
+      expect(
+        within(editor).getByText('This variable is not added yet. Select Add variable to include it.')
+      ).toBeInTheDocument();
+      expect(onSubmitMock).not.toHaveBeenCalled();
+    });
+
+    /**
+     * A variable typed into an open editor is committed before the deletion that collapses it, so
+     * it belongs to the row it was typed into rather than to whichever item takes that position.
+     */
+    it('keeps a variable typed but never added with its own item when a row above it is deleted', async () => {
+      const { onSubmitMock, user } = getTestContext(playlistWithVariables());
+
+      const editor = await openVariableEditor(user, 1);
+      await user.type(newVariableName(editor), 'shard');
+      await user.type(newVariableValues(editor), 's1');
+
+      await user.click(within(rows()[0]).getByRole('button', { name: /delete playlist item/i }));
+
+      expect(disclosureStates()).toEqual(['false']);
+      await user.click(saveButton());
+
+      await waitFor(() => {
+        expect(onSubmitMock).toHaveBeenCalled();
+      });
+      expect(firstSubmittedPlaylist(onSubmitMock).spec.items).toEqual([
+        { type: 'dashboard_by_uid', value: 'uid_2', variables: { host: ['Host2'], shard: ['s1'] } },
+        { type: 'dashboard_by_tag', value: 'tag_A' },
+      ]);
+    });
+
+    it('points every collapsed disclosure at the variables panel of its own row', () => {
+      getTestContext(playlistWithVariables());
+
+      const controlled = disclosureButtons().map((button) => button.getAttribute('aria-controls'));
+      expect(disclosureStates()).toEqual(['false', 'false']);
+      expect(new Set(controlled).size).toBe(2);
+      controlled.forEach((panelId, index) => {
+        const panel = document.getElementById(panelId ?? '');
+        expect(panel).not.toBeNull();
+        // Named while collapsed and resolving to an element inside its own row, and hidden — so it
+        // is no more exposed than an absent panel is, and the reference is never left dangling.
+        expect(panel).toHaveAttribute('hidden');
+        expect(rows()[index].contains(panel)).toBe(true);
+      });
+      expect(screen.queryAllByRole('region')).toHaveLength(0);
+    });
+
     it('keeps a variable that was typed but never added when the row is collapsed and reopened', async () => {
       const { user } = getTestContext(mockEmptyPlaylist);
 

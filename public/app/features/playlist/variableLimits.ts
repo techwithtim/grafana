@@ -7,19 +7,25 @@
  * object decides how much work a viewer's tab does: how many parameters are percent-encoded into a
  * history entry, and how many React controls the editor builds.
  *
- * Every number below is a limit the browser applies and nothing else does. No server-side
- * counterpart mirrors them: the authoritative schema `apps/playlist/kinds/playlist.cue` declares
- * `variables?: [string]: [string, ...string]` with no maximum on the map, on a value list or on a
- * string, and the App SDK validator in `apps/playlist/pkg/app/app.go` is a no-op, so nothing on
- * either write path — the resource API or the legacy `/api/playlists` endpoints — rejects a
- * `variables` map that exceeds any of them. That is deliberate rather than an omission: refusing
- * bad variable input belongs to the editor, and the write paths stay as they were.
+ * The first four numbers below are enforced on both sides. The admission validator in
+ * `apps/playlist/pkg/app/app.go` mirrors them exactly — 32 variables for an item, 64 values for a
+ * variable, 128 code points for a name, 1024 for a value — and refuses a write that breaks one
+ * with HTTP 422 Invalid naming `spec.items[i].variables[name]`, on the resource API and on the
+ * legacy `/api/playlists` endpoints alike, which proxy through the same admission chain. So the
+ * two layers agree by construction: a map this editor accepts is a map the API stores, and a map
+ * the API refuses is one this editor would not have committed. Changing a number here without
+ * changing its counterpart there is what breaks that, and is the one edit this file must not
+ * receive alone.
  *
- * The consequence is the contract these helpers are written to. A stored map may be arbitrarily
- * larger than what is stated here, and both consumers must survive one: the editor refuses a map it
- * cannot render, and playback applies the pairs that fit and keeps playing rather than expanding
- * whatever it was handed. Raising a number here therefore widens only what this tab will do with
- * data the API already accepts; lowering one narrows it, and neither is a change to what is stored.
+ * The last two are the browser's own and have no server counterpart, because neither describes
+ * stored data: one bounds the URL this tab pushes and one bounds the text a single input holds.
+ *
+ * The helpers below stay defensive about a map that exceeds any of it, and must: the maxima are
+ * enforced from the moment they were added, not retroactively, so an object written before them —
+ * or one whose variables were within the four maxima yet still too large to put in a URL — is
+ * something both consumers have to survive. The editor refuses a map it cannot render, and
+ * playback applies the pairs that fit and keeps playing rather than expanding whatever it was
+ * handed.
  *
  * `PlaylistSrv` is a singleton constructed while its module graph is still loading, so this module
  * imports no React, no `@grafana/ui` and nothing that runs a side effect on import: any of those
@@ -31,26 +37,30 @@
 import { urlUtil } from '@grafana/data';
 
 /**
- * Template variables one playlist item may carry, in the editor and at playback. A stored item may
- * hold more, because no schema or admission check bounds the map.
+ * Template variables one playlist item may carry, in the editor, at playback and on a write. The
+ * admission validator refuses a wider map (`maxVariablesPerItem`), so a stored item holds more only
+ * if it was written before that rule existed.
  */
 export const MAX_VARIABLES_PER_ITEM = 32;
 
 /**
- * Values one template variable may carry, in the editor and at playback. A stored variable may hold
- * more, because no schema or admission check bounds the list.
+ * Values one template variable may carry, in the editor, at playback and on a write. The admission
+ * validator refuses a longer list (`maxValuesPerVariable`), so a stored variable holds more only if
+ * it was written before that rule existed.
  */
 export const MAX_VALUES_PER_VARIABLE = 64;
 
 /**
- * Unicode code points a template variable name may have, in the editor and at playback. A stored
- * name may be longer, because no schema or admission check bounds it.
+ * Unicode code points a template variable name may have, in the editor, at playback and on a write.
+ * The admission validator refuses a longer name (`maxVariableNameLength`), so a stored name is
+ * longer only if it was written before that rule existed.
  */
 export const MAX_VARIABLE_NAME_LENGTH = 128;
 
 /**
- * Unicode code points one template variable value may have, in the editor and at playback. A stored
- * value may be longer, because no schema or admission check bounds it.
+ * Unicode code points one template variable value may have, in the editor, at playback and on a
+ * write. The admission validator refuses a longer value (`maxVariableValueLength`), so a stored
+ * value is longer only if it was written before that rule existed.
  */
 export const MAX_VARIABLE_VALUE_LENGTH = 1024;
 
@@ -91,6 +101,35 @@ export const MAX_VARIABLE_NAME_TEXT_LENGTH = 1024;
 
 /** The prefix every playlist variable parameter carries, so a pair is measured as it is written. */
 const VAR_PARAM_PREFIX = 'var-';
+
+/**
+ * A name made only of characters that carry no glyph: whitespace, Unicode format characters (`Cf`,
+ * which is where U+200B ZERO WIDTH SPACE, U+FEFF, the zero-width joiners, the bidi controls and
+ * U+00AD SOFT HYPHEN live) and control characters (`Cc`).
+ *
+ * The character class is why this is a regular expression rather than a `trim()`. `String.trim()`
+ * strips U+FEFF but not U+200B, and Go's `strings.TrimSpace` strips neither, so a trim-based rule
+ * gave the editor, playback and the API three different answers for the same name: one stored an
+ * invisible name, one played it as `var-%E2%80%8B`, and one dropped it in silence.
+ *
+ * `^[…]*$` over a character class has one way to match each input, so it cannot backtrack — which
+ * matters, since what it is handed is stored data.
+ */
+const BLANK_VARIABLE_NAME = /^[\s\p{Cf}\p{Cc}]*$/u;
+
+/**
+ * Reports whether a variable name carries no character a person can see or type, in which case it
+ * is no name at all: it cannot be read in the editor, reproduced in a URL, or asked about.
+ *
+ * This is the one definition of an empty variable name in the browser — the editor refuses such a
+ * name and playback skips it — and it is mirrored by `isBlankVariableName` in
+ * `apps/playlist/pkg/app/app.go`, which refuses the same set on every write path. The three
+ * agreeing is the point: a name the editor rejects is a name the API rejects, and nothing invisible
+ * can be stored by one layer and then interpreted differently by another.
+ */
+export function isBlankVariableName(name: string): boolean {
+  return BLANK_VARIABLE_NAME.test(name);
+}
 
 /**
  * Reports whether `text` is at most `limit` Unicode code points long.
@@ -210,9 +249,11 @@ export function boundedItemVariables(variables?: Record<string, string[]>): Boun
     }
 
     const values = variables[name];
-    // An empty name would still be serialized, as a nameless `var-=value` parameter. Neither this
-    // nor an absent value list is a budget violation, so neither is reported as dropped.
-    if (!name.trim() || !Array.isArray(values) || values.length === 0) {
+    // A blank name would still be serialized — as a nameless `var-=value` parameter, or as an
+    // invisible `var-%E2%80%8B=value` one for a name written in zero-width characters — and neither
+    // is a variable any dashboard can resolve. Neither a blank name nor an absent value list is a
+    // budget violation, so neither is reported as dropped.
+    if (isBlankVariableName(name) || !Array.isArray(values) || values.length === 0) {
       continue;
     }
 

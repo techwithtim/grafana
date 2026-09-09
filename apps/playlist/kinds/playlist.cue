@@ -15,6 +15,10 @@ package playlist
 	// Optional template variable values applied when this item is played (dashboard_by_uid only).
 	// Each key is a variable name; its value is a list of one or more values for that variable.
 	// A multi-value variable is expressed by several list elements under the same key.
+	// A write is rejected when an item carries more than 32 variables, a variable carries more
+	// than 64 values, a name is longer than 128 Unicode code points, a value is longer than 1024
+	// Unicode code points, or a name or value is empty. A name of whitespace, invisible or
+	// control characters alone counts as empty.
 	variables?: [string]: [string, ...string]
 }
 

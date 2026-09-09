@@ -13571,6 +13571,11 @@
       "button": "Create playlist",
       "pro-tip": "You can use playlists to cycle dashboards on TVs without user control. <2>Learn more</2>",
       "title": "There are no playlists created yet"
+    },
+    "truncated": {
+      "message_one": "This list is too large to load completely, so it shows {{count}} playlist. Playlists it leaves out are missing from the search results as well.",
+      "message_other": "This list is too large to load completely, so it shows the first {{count}} playlists. Playlists it leaves out are missing from the search results as well.",
+      "title": "Not all playlists are shown"
     }
   },
   "playlists": {

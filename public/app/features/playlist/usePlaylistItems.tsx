@@ -73,27 +73,36 @@ export function usePlaylistItems(playlistItems?: PlaylistItemUI[]) {
     [items]
   );
 
-  const moveItem = useCallback(
-    (src: number, dst: number) => {
-      if (src === dst || !items[src]) {
-        return;
+  /*
+   * A structural change is a functional update rather than a new array built from the render's own
+   * item list, because it is not always the first update of its batch: the editor commits what the
+   * user typed into an open variables editor before the row holding it is moved or removed, and
+   * both changes are applied together. Building from the render's list would take a snapshot from
+   * before that commit and overwrite it — the playlist would then be saved without the variable,
+   * having reported nothing.
+   */
+  const moveItem = useCallback((src: number, dst: number) => {
+    setItems((prev) => {
+      if (src === dst || !prev[src]) {
+        return prev;
       }
-      const update = Array.from(items);
+      const update = Array.from(prev);
       const [removed] = update.splice(src, 1);
       update.splice(dst, 0, removed);
-      setItems(update);
-    },
-    [items]
-  );
+      return update;
+    });
+  }, []);
 
-  const deleteItem = useCallback(
-    (index: number) => {
-      const copy = items.slice();
+  const deleteItem = useCallback((index: number) => {
+    setItems((prev) => {
+      if (!prev[index]) {
+        return prev;
+      }
+      const copy = prev.slice();
       copy.splice(index, 1);
-      setItems(copy);
-    },
-    [items]
-  );
+      return copy;
+    });
+  }, []);
 
   const updateItemVariables = useCallback((index: number, variables?: Record<string, string[]>) => {
     setItems((prev) => {

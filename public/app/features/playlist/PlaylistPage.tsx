@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import { Trans, t } from '@grafana/i18n';
-import { ConfirmModal, EmptyState, LinkButton, TextLink } from '@grafana/ui';
+import { Alert, ConfirmModal, EmptyState, LinkButton, TextLink } from '@grafana/ui';
 import { Page } from 'app/core/components/Page/Page';
 import PageActionBar from 'app/core/components/PageActionBar/PageActionBar';
 import { useUrlParams } from 'app/core/navigation/hooks';
@@ -31,6 +31,12 @@ export const PlaylistPage = () => {
   const [searchQuery, setSearchQuery] = useState('');
   const allPlaylists = useMemo(() => data?.items ?? [], [data?.items]);
   const playlists = useMemo(() => searchPlaylists(allPlaylists, searchQuery), [searchQuery, allPlaylists]);
+
+  // The client follows the apiserver's continue tokens, so a token left on the response it hands
+  // back means the namespace holds more playlists than could be read. Search runs over what was
+  // loaded, so those playlists are missing from the results too — which is exactly what makes
+  // hiding this dangerous: an incomplete list is indistinguishable from a complete one.
+  const isTruncated = Boolean(data?.metadata?.continue);
 
   const [startPlaylist, setStartPlaylist] = useState<Playlist | undefined>();
   const [playlistToDelete, setPlaylistToDelete] = useState<Playlist | undefined>();
@@ -135,6 +141,18 @@ export const PlaylistPage = () => {
         {newPrURL && <PreviewBannerViewPR prURL={newPrURL} isNewPr repoUrl={repoURL} branchInfo={branchInfo} />}
 
         {showSearch && <PageActionBar searchQuery={searchQuery} setSearchQuery={setSearchQuery} />}
+
+        {isTruncated && (
+          <Alert severity="warning" title={t('playlist-page.truncated.title', 'Not all playlists are shown')}>
+            {t('playlist-page.truncated.message', '', {
+              count: allPlaylists.length,
+              defaultValue_one:
+                'This list is too large to load completely, so it shows {{count}} playlist. Playlists it leaves out are missing from the search results as well.',
+              defaultValue_other:
+                'This list is too large to load completely, so it shows the first {{count}} playlists. Playlists it leaves out are missing from the search results as well.',
+            })}
+          </Alert>
+        )}
 
         {isLoading ? (
           <PlaylistPageList.Skeleton />

@@ -398,10 +398,35 @@ describe('PlaylistSrv', () => {
     { desc: 'an empty variable name', variables: { '': ['x'], host: ['a'] } },
     { desc: 'a whitespace-only variable name', variables: { '   ': ['x'], host: ['a'] } },
     { desc: 'a variable with an empty value list', variables: { empty: [], host: ['a'] } },
+    // U+200B is not whitespace to `trim()` in either language, so before the shared blank-name
+    // rule it reached the URL as an invisible `var-%E2%80%8B` parameter. U+FEFF is stripped by
+    // `trim()` but not by Go's, so it was stored and then silently skipped here. Both are now
+    // refused on write and skipped here, which is what makes the layers agree.
+    { desc: 'a zero-width-space variable name', variables: { '\u200b': ['x'], host: ['a'] } },
+    { desc: 'a byte-order-mark variable name', variables: { '\ufeff': ['x'], host: ['a'] } },
+    { desc: 'a soft-hyphen variable name', variables: { '\u00ad': ['x'], host: ['a'] } },
+    { desc: 'a control-character variable name', variables: { '\u0001': ['x'], host: ['a'] } },
+    {
+      desc: 'a variable name of mixed invisible characters',
+      variables: { '\u200b\u2060 \t': ['x'], host: ['a'] },
+    },
   ])('skips $desc and emits only the valid var- parameter', async ({ variables }) => {
     await srv.start(playlistWithItems([{ type: 'dashboard_by_uid', value: 'aaa', variables }]));
 
     expect(getLastHistoryEntry().search).toBe('?var-host=a');
+  });
+
+  it('applies a variable whose name only starts with an invisible character', async () => {
+    // The blank-name rule refuses a name made of invisible characters, not one that contains
+    // any: a name with something visible in it is a name, and dropping it would silently stop
+    // applying a variable the dashboard can resolve.
+    await srv.start(
+      playlistWithItems([{ type: 'dashboard_by_uid', value: 'aaa', variables: { '\u200bhost': ['a'] } }])
+    );
+
+    const { search } = getLastHistoryEntry();
+    expect(search).toBe('?var-%E2%80%8Bhost=a');
+    expect(new URLSearchParams(search).getAll('var-\u200bhost')).toEqual(['a']);
   });
 
   it('keeps kiosk from the starting location but drops a var- parameter already in the URL', async () => {

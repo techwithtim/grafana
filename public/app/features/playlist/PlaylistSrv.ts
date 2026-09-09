@@ -121,6 +121,10 @@ export class PlaylistSrv extends StateManagerBase<PlaylistSrvState> {
     // truncated, and playback continues with the rest. The budget measures a pair as one
     // `var-<name>=<value>` parameter per value, which is exactly what the flat list emits for the
     // string values it admits, so the measurement stays character for character the pushed query.
+    //
+    // The same walk drops a variable whose name carries no character a person can see or type —
+    // whitespace, zero-width or control characters alone — on the rule the editor and the API
+    // admission validator apply, so no item can put an unreadable `var-` parameter in this URL.
     const { pairs, dropped, uninspected } = boundedItemVariables(entry.variables);
     for (const [name, values] of pairs) {
       appendParam(params, `var-${name}`, values);

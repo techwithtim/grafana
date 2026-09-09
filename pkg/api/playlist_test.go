@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -20,6 +21,7 @@ import (
 	playlistv1 "github.com/grafana/grafana/apps/playlist/pkg/apis/playlist/v1"
 	"github.com/grafana/grafana/pkg/apimachinery/errutil"
 	"github.com/grafana/grafana/pkg/infra/log"
+	"github.com/grafana/grafana/pkg/registry/apps/playlist"
 	contextmodel "github.com/grafana/grafana/pkg/services/contexthandler/model"
 	"github.com/grafana/grafana/pkg/services/user"
 	"github.com/grafana/grafana/pkg/web"
@@ -31,23 +33,42 @@ import (
 // shape of the error body written back. Every legacy playlist error must be
 // {"message":…,"traceID":…} -- see writeError and playlistUID.
 
-// playlistTestTransport stands in for the API server. It records how many requests
-// reached it, which is how the tests below prove a malformed uid is rejected before
-// any request is built, and returns one canned response.
+// playlistTestResponse is one queued answer from the fake API server. Status and body
+// travel together because the paged-list tests need a later page to fail with its own
+// status while the earlier pages succeed.
+type playlistTestResponse struct {
+	statusCode int
+	body       []byte
+}
+
+// playlistTestTransport stands in for the API server. It records the requests that
+// reached it -- which is how the tests below prove a malformed uid is rejected before
+// any request is built, and how the paged-list tests read back the limit and continue
+// parameters the handler sent -- and answers each one with a canned response.
 type playlistTestTransport struct {
 	statusCode   int
 	responseBody []byte
-	requests     []*http.Request
+	// responses is an optional queue served one entry per request, in order, for the
+	// tests that walk a paged list. While it is empty -- which is always the case for
+	// the single-response tests -- every request is answered with statusCode and
+	// responseBody instead.
+	responses []playlistTestResponse
+	requests  []*http.Request
 }
 
 func (t *playlistTestTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	t.requests = append(t.requests, req)
+	statusCode, body := t.statusCode, t.responseBody
+	if len(t.responses) > 0 {
+		statusCode, body = t.responses[0].statusCode, t.responses[0].body
+		t.responses = t.responses[1:]
+	}
 	header := http.Header{}
 	header.Set("Content-Type", "application/json")
 	return &http.Response{
-		StatusCode: t.statusCode,
+		StatusCode: statusCode,
 		Header:     header,
-		Body:       io.NopCloser(bytes.NewReader(t.responseBody)),
+		Body:       io.NopCloser(bytes.NewReader(body)),
 		Request:    req,
 	}, nil
 }
@@ -120,6 +141,277 @@ func playlistTestBodyKeys(m map[string]any) []string {
 		keys = append(keys, k)
 	}
 	return keys
+}
+
+// playlistTestStored is one playlist as the resource API holds it, reduced to the two
+// fields the legacy list conversion reads: the object name (the legacy uid) and
+// spec.title (the legacy name, which the ?query= filter matches on).
+type playlistTestStored struct {
+	uid  string
+	name string
+}
+
+// playlistTestListPage renders one chunk of a namespace exactly as the resource API
+// returns it: a PlaylistList whose metadata.continue is populated when further chunks
+// follow and absent on the last one. kind and apiVersion are mandatory -- the
+// unstructured decoder rejects a body without a kind -- and every item needs
+// spec.title and spec.interval because UnstructuredToLegacyPlaylist reads both without
+// a type check.
+func playlistTestListPage(t *testing.T, continueToken string, stored ...playlistTestStored) []byte {
+	t.Helper()
+
+	items := make([]any, 0, len(stored))
+	for _, s := range stored {
+		items = append(items, map[string]any{
+			"apiVersion": "playlist.grafana.app/v1",
+			"kind":       "Playlist",
+			"metadata":   map[string]any{"name": s.uid},
+			"spec": map[string]any{
+				"title":    s.name,
+				"interval": "5m",
+				"items":    []any{},
+			},
+		})
+	}
+
+	metadata := map[string]any{}
+	if continueToken != "" {
+		metadata["continue"] = continueToken
+	}
+	page, err := json.Marshal(map[string]any{
+		"apiVersion": "playlist.grafana.app/v1",
+		"kind":       "PlaylistList",
+		"metadata":   metadata,
+		"items":      items,
+	})
+	require.NoError(t, err)
+	return page
+}
+
+// playlistTestLegacyListBody renders what web.Context.JSON writes for a legacy list
+// response: a bare JSON array of playlists with nothing wrapped around it. It mirrors
+// the encoder's rules rather than hardcoding one of them, because web.Env decides
+// whether the output is indented (DEV, the default under test) or compact (PROD, how
+// the server runs) and the byte-for-byte comparison must hold either way.
+func playlistTestLegacyListBody(t *testing.T, playlists []playlist.Playlist) string {
+	t.Helper()
+
+	buf := &bytes.Buffer{}
+	enc := json.NewEncoder(buf)
+	if web.Env != web.PROD {
+		enc.SetIndent("", "  ")
+	}
+	require.NoError(t, enc.Encode(playlists))
+	return buf.String()
+}
+
+// playlistTestListedUIDs decodes a legacy list body and returns the uids in the order
+// they were written, which is the order the pages arrived in.
+func playlistTestListedUIDs(t *testing.T, raw []byte) []string {
+	t.Helper()
+
+	listed := []playlist.Playlist{}
+	require.NoError(t, json.Unmarshal(raw, &listed), "response body must be a JSON array: %s", string(raw))
+	uids := make([]string, 0, len(listed))
+	for _, p := range listed {
+		uids = append(uids, p.UID)
+	}
+	return uids
+}
+
+// The resource API chunks a list response once it outgrows its size budget, so a
+// namespace can only be listed completely by following metadata.continue. These tests
+// cover that walk on the deprecated endpoint: it has no pagination of its own, so a
+// dropped chunk used to be indistinguishable from an empty namespace.
+func TestPlaylistSearch(t *testing.T) {
+	pageSize := fmt.Sprintf("%d", playlistSearchPageSize)
+
+	t.Run("follows continue tokens until the namespace is exhausted", func(t *testing.T) {
+		transport := &playlistTestTransport{
+			// The trailing single-response fallback is deliberately a page that would
+			// extend the walk: if the handler asked for a fourth page the request count
+			// below would catch it.
+			statusCode:   http.StatusOK,
+			responseBody: playlistTestListPage(t, "tok-unexpected", playlistTestStored{uid: "extra", name: "Extra"}),
+			responses: []playlistTestResponse{
+				{statusCode: http.StatusOK, body: playlistTestListPage(t, "tok-1",
+					playlistTestStored{uid: "uid-a", name: "A"}, playlistTestStored{uid: "uid-b", name: "B"})},
+				{statusCode: http.StatusOK, body: playlistTestListPage(t, "tok-2",
+					playlistTestStored{uid: "uid-c", name: "C"}, playlistTestStored{uid: "uid-d", name: "D"})},
+				{statusCode: http.StatusOK, body: playlistTestListPage(t, "",
+					playlistTestStored{uid: "uid-e", name: "E"})},
+			},
+		}
+		handler := newPlaylistTestHandler(transport)
+		c, recorder := newPlaylistTestContext(t, http.MethodGet, "/api/playlists", nil, nil)
+
+		handler.searchPlaylists(c)
+
+		assert.Equal(t, http.StatusOK, recorder.Code)
+		require.Len(t, transport.requests, 3, "one request per page, and no request after the token is empty")
+
+		first := transport.requests[0].URL.Query()
+		assert.Equal(t, pageSize, first.Get("limit"), "every page is requested with the page size")
+		assert.Empty(t, first.Get("continue"), "the first page starts the walk with no token")
+
+		second := transport.requests[1].URL.Query()
+		assert.Equal(t, pageSize, second.Get("limit"))
+		assert.Equal(t, "tok-1", second.Get("continue"), "page two must carry page one's token")
+
+		third := transport.requests[2].URL.Query()
+		assert.Equal(t, pageSize, third.Get("limit"))
+		assert.Equal(t, "tok-2", third.Get("continue"), "page three must carry page two's token")
+
+		assert.Equal(t, []string{"uid-a", "uid-b", "uid-c", "uid-d", "uid-e"},
+			playlistTestListedUIDs(t, recorder.Body.Bytes()), "every page's playlists, in server order")
+		assert.Empty(t, recorder.Header().Get("Warning"), "a completed walk is not a truncated list")
+	})
+
+	t.Run("stops at the page cap and says the list is incomplete", func(t *testing.T) {
+		// A server that never runs out of tokens. More pages are queued than the cap
+		// allows, so the request count proves the cap stopped the walk rather than the
+		// queue running dry.
+		responses := make([]playlistTestResponse, 0, playlistSearchMaxPages+5)
+		for i := 0; i < playlistSearchMaxPages+5; i++ {
+			responses = append(responses, playlistTestResponse{
+				statusCode: http.StatusOK,
+				body: playlistTestListPage(t, fmt.Sprintf("tok-%d", i),
+					playlistTestStored{uid: fmt.Sprintf("uid-%d", i), name: fmt.Sprintf("Playlist %d", i)}),
+			})
+		}
+		transport := &playlistTestTransport{statusCode: http.StatusOK, responses: responses}
+		handler := newPlaylistTestHandler(transport)
+		c, recorder := newPlaylistTestContext(t, http.MethodGet, "/api/playlists", nil, nil)
+
+		handler.searchPlaylists(c)
+
+		assert.Equal(t, http.StatusOK, recorder.Code)
+		assert.Len(t, transport.requests, playlistSearchMaxPages, "the walk must stop at the cap")
+
+		warning := recorder.Header().Get("Warning")
+		assert.Equal(t, playlistSearchTruncatedWarning, warning)
+		assert.True(t, strings.HasPrefix(warning, `299 - "`), "warn-code 299 and a quoted text: %s", warning)
+		assert.True(t, strings.HasSuffix(warning, `"`), "warn-code 299 and a quoted text: %s", warning)
+
+		// Truncation is signalled out of band only: the body stays the bare array every
+		// caller of this endpoint already parses.
+		body := recorder.Body.Bytes()
+		assert.Equal(t, byte('['), bytes.TrimSpace(body)[0], "body: %s", string(body))
+		assert.Len(t, playlistTestListedUIDs(t, body), playlistSearchMaxPages,
+			"the playlists gathered before the cap are still returned")
+	})
+
+	t.Run("stops when the server keeps handing back the same token", func(t *testing.T) {
+		// A non-advancing token would loop forever if the handler only checked for an
+		// empty one. Far more pages are queued than the two the handler should need.
+		responses := make([]playlistTestResponse, 0, 5)
+		for i := 0; i < 5; i++ {
+			responses = append(responses, playlistTestResponse{
+				statusCode: http.StatusOK,
+				body: playlistTestListPage(t, "stuck-token",
+					playlistTestStored{uid: fmt.Sprintf("uid-%d", i), name: fmt.Sprintf("Playlist %d", i)}),
+			})
+		}
+		transport := &playlistTestTransport{statusCode: http.StatusOK, responses: responses}
+		handler := newPlaylistTestHandler(transport)
+		c, recorder := newPlaylistTestContext(t, http.MethodGet, "/api/playlists", nil, nil)
+
+		handler.searchPlaylists(c)
+
+		assert.Equal(t, http.StatusOK, recorder.Code)
+		assert.Len(t, transport.requests, 2,
+			"the second page returns the token it was sent, which ends the walk")
+		assert.Equal(t, "stuck-token", transport.requests[1].URL.Query().Get("continue"))
+		assert.Equal(t, playlistSearchTruncatedWarning, recorder.Header().Get("Warning"),
+			"the walk ended with a token outstanding, so the list is incomplete")
+		assert.Equal(t, []string{"uid-0", "uid-1"}, playlistTestListedUIDs(t, recorder.Body.Bytes()))
+	})
+
+	t.Run("a single page is one request and the same body as before", func(t *testing.T) {
+		transport := &playlistTestTransport{
+			statusCode: http.StatusOK,
+			responseBody: playlistTestListPage(t, "",
+				playlistTestStored{uid: "uid-a", name: "A"}, playlistTestStored{uid: "uid-b", name: "B"}),
+		}
+		handler := newPlaylistTestHandler(transport)
+		c, recorder := newPlaylistTestContext(t, http.MethodGet, "/api/playlists", nil, nil)
+
+		handler.searchPlaylists(c)
+
+		assert.Equal(t, http.StatusOK, recorder.Code)
+		assert.Len(t, transport.requests, 1, "no continue token means no second request")
+		assert.Empty(t, recorder.Header().Get("Warning"))
+		// The wire contract of this deprecated endpoint is a bare JSON array of legacy
+		// playlists; paging must not have added an envelope, a field or a reordering.
+		expected := playlistTestLegacyListBody(t, []playlist.Playlist{
+			{UID: "uid-a", Name: "A", Interval: "5m"},
+			{UID: "uid-b", Name: "B", Interval: "5m"},
+		})
+		assert.Equal(t, expected, recorder.Body.String())
+	})
+
+	t.Run("an empty namespace is still an empty array", func(t *testing.T) {
+		transport := &playlistTestTransport{statusCode: http.StatusOK, responseBody: playlistTestListPage(t, "")}
+		handler := newPlaylistTestHandler(transport)
+		c, recorder := newPlaylistTestContext(t, http.MethodGet, "/api/playlists", nil, nil)
+
+		handler.searchPlaylists(c)
+
+		assert.Equal(t, http.StatusOK, recorder.Code)
+		assert.Len(t, transport.requests, 1)
+		assert.Empty(t, recorder.Header().Get("Warning"))
+		assert.Equal(t, playlistTestLegacyListBody(t, []playlist.Playlist{}), recorder.Body.String())
+	})
+
+	t.Run("the name filter applies to every page, not just the first", func(t *testing.T) {
+		transport := &playlistTestTransport{
+			statusCode: http.StatusOK,
+			responses: []playlistTestResponse{
+				{statusCode: http.StatusOK, body: playlistTestListPage(t, "tok-1",
+					playlistTestStored{uid: "uid-a", name: "Alpha one"},
+					playlistTestStored{uid: "uid-b", name: "Beta"})},
+				{statusCode: http.StatusOK, body: playlistTestListPage(t, "",
+					playlistTestStored{uid: "uid-c", name: "second ALPHA"},
+					playlistTestStored{uid: "uid-d", name: "Gamma"})},
+			},
+		}
+		handler := newPlaylistTestHandler(transport)
+		c, recorder := newPlaylistTestContext(t, http.MethodGet, "/api/playlists?query=alpha", nil, nil)
+
+		handler.searchPlaylists(c)
+
+		assert.Equal(t, http.StatusOK, recorder.Code)
+		require.Len(t, transport.requests, 2, "the filter is applied client-side, so every page is still fetched")
+		// The filter is case-insensitive and matches a substring, on both pages.
+		assert.Equal(t, []string{"uid-a", "uid-c"}, playlistTestListedUIDs(t, recorder.Body.Bytes()))
+		assert.Empty(t, recorder.Header().Get("Warning"))
+	})
+
+	t.Run("a list failure on a later page answers in the legacy envelope", func(t *testing.T) {
+		// Paging turns one list call into several, so the error path has to hold for a
+		// page other than the first: the caller must still get {message, traceID} and
+		// never a partial 200 body.
+		failure := []byte(`{"kind":"Status","apiVersion":"v1","metadata":{},"status":"Failure",` +
+			`"message":"etcdserver: request timed out","reason":"InternalError","code":500}`)
+		transport := &playlistTestTransport{
+			statusCode: http.StatusOK,
+			responses: []playlistTestResponse{
+				{statusCode: http.StatusOK, body: playlistTestListPage(t, "tok-1",
+					playlistTestStored{uid: "uid-a", name: "A"})},
+				{statusCode: http.StatusInternalServerError, body: failure},
+			},
+		}
+		handler := newPlaylistTestHandler(transport)
+		c, recorder := newPlaylistTestContext(t, http.MethodGet, "/api/playlists", nil, nil)
+
+		handler.searchPlaylists(c)
+
+		assert.Equal(t, http.StatusInternalServerError, recorder.Code)
+		require.Len(t, transport.requests, 2)
+		body := requireLegacyErrorEnvelope(t, recorder.Body.Bytes())
+		assert.Equal(t, "etcdserver: request timed out", body["message"])
+		assert.Empty(t, recorder.Header().Get("Warning"), "a failed list is an error, not a truncated list")
+	})
 }
 
 func TestPlaylistUIDValidation(t *testing.T) {
@@ -241,6 +533,36 @@ func TestPlaylistCreateUIDValidation(t *testing.T) {
 		assert.Equal(t, "invalid playlist uid", body["message"])
 		assert.Empty(t, transport.requests, "no request may reach the API server for an invalid uid")
 	})
+
+	// The relative path segments are only reachable through the body. A request path of
+	// "." or ".." is resolved before the router matches, so GET /api/playlists/. is
+	// served by the list route and :uid never holds either value; nothing normalises a
+	// request body, so these are the cases that exercise validatePlaylistUID's
+	// "."/".." rule over HTTP rather than leaving it merely present.
+	for _, uid := range []string{".", ".."} {
+		t.Run(fmt.Sprintf("a body uid of %q is rejected with 400 in the legacy envelope", uid), func(t *testing.T) {
+			transport := &playlistTestTransport{statusCode: http.StatusOK, responseBody: []byte(`{}`)}
+			handler := newPlaylistTestHandler(transport)
+			requestBody, err := json.Marshal(map[string]any{
+				"uid":      uid,
+				"name":     "QA",
+				"interval": "5m",
+				"items":    []any{},
+			})
+			require.NoError(t, err)
+			c, recorder := newPlaylistTestContext(t, http.MethodPost, "/api/playlists", nil, requestBody)
+
+			handler.createPlaylist(c)
+
+			assert.Equal(t, http.StatusBadRequest, recorder.Code)
+			body := requireLegacyErrorEnvelope(t, recorder.Body.Bytes())
+			assert.Equal(t, "invalid playlist uid", body["message"])
+			// The rejected uid and the validator's own wording are logged, never echoed.
+			assert.NotContains(t, recorder.Body.String(), uid+`"`)
+			assert.NotContains(t, recorder.Body.String(), "may not be")
+			assert.Empty(t, transport.requests, "no request may reach the API server for an invalid uid")
+		})
+	}
 
 	t.Run("an empty body uid keeps working and is generated downstream", func(t *testing.T) {
 		created := []byte(`{"apiVersion":"playlist.grafana.app/v1","kind":"Playlist",` +

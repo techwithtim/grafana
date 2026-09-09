@@ -9,7 +9,7 @@ import { Trans, t } from '@grafana/i18n';
 import { Icon, IconButton, useStyles2, Spinner, type IconName } from '@grafana/ui';
 import { TagBadge } from 'app/core/components/TagFilter/TagBadge';
 
-import { PlaylistItemVariables } from './PlaylistItemVariables';
+import { PlaylistItemVariables, inLogicalOrder } from './PlaylistItemVariables';
 import { type PlaylistItemUI } from './types';
 
 interface Props {
@@ -55,6 +55,10 @@ const ELLIPSIS = '…';
  * past the length this elides at. A stored map arrives as JSON rather than from the editor, so a
  * value list that is not an array of strings is summarized by its name alone instead of throwing
  * inside the row rendering it.
+ *
+ * Names and values pass through `inLogicalOrder`, because this summary puts several pieces of
+ * free text into one string: a bidirectional override in any of them would otherwise reorder the
+ * display of the `name=` it belongs to, of the pairs after it, and of the row's own name below.
  */
 function summarizeVariables(variables?: Record<string, string[]>): string | undefined {
   if (!variables) {
@@ -81,7 +85,8 @@ function summarizeVariables(variables?: Record<string, string[]>): string | unde
         if (typeof value !== 'string') {
           continue;
         }
-        joined = joined === '' ? value : `${joined}, ${value}`;
+        const text = inLogicalOrder(value);
+        joined = joined === '' ? text : `${joined}, ${text}`;
         // A code point is at most two UTF-16 units, so twice the elision length always holds as
         // many code points as the summary can show: joining beyond it cannot change the result.
         if (joined.length > SUMMARY_LENGTH * 2) {
@@ -89,14 +94,20 @@ function summarizeVariables(variables?: Record<string, string[]>): string | unde
         }
       }
     }
-    pairs.push(joined === '' ? name : `${name}=${joined}`);
+    // A name that is nothing but bidirectional controls has no text left to summarize, so its
+    // values stand for the pair rather than an `=` with nothing in front of it.
+    const label = inLogicalOrder(name);
+    pairs.push(label === '' ? joined : joined === '' ? label : `${label}=${joined}`);
   }
 
-  if (pairs.length === 0) {
+  // Nothing renderable — an item with no variables, and the payload-only case of a name and values
+  // that are both invisible. The row then reads exactly as a row without variables does, except
+  // for the count beside it, which is rendered from the map itself.
+  const summary = pairs.filter((pair) => pair !== '').join('; ');
+  if (summary === '') {
     return undefined;
   }
 
-  const summary = pairs.join('; ');
   // Elided by code point rather than by string index, so a name or value ending in an astral
   // character is not cut in half into a character that renders as a replacement glyph.
   const codePoints = Array.from(summary);
@@ -116,18 +127,21 @@ function summarizeVariables(variables?: Record<string, string[]>): string | unde
  * variables keeps exactly the name it has always had.
  *
  * An item's type and value are stored data, and the summary is built from stored variable text, so
- * both names interpolate text this component does not control. i18next escapes an interpolated
- * value for HTML by default, which would name the row after the entity spelling of the value
- * rather than the value itself. Escaping is turned off for these two interpolations alone, not for
- * the instance, because the default guards every t() result in the product that does reach HTML;
- * it is safe here because React sets this string as an attribute value, which is never parsed as
- * HTML.
+ * both names interpolate text this component does not control. Two things are done to that text.
+ * i18next escapes an interpolated value for HTML by default, which would name the row after the
+ * entity spelling of the value rather than the value itself; escaping is turned off for these
+ * interpolations alone, not for the instance, because the default guards every t() result in the
+ * product that does reach HTML, and it is safe here because React sets this string as an attribute
+ * value, which is never parsed as HTML. And the item's value goes through `inLogicalOrder`, so a
+ * bidirectional override stored in it cannot reorder the rest of the row's name — the summary is
+ * already built from text that has been through it.
  */
 function itemLabel(item: PlaylistItemUI, variablesSummary?: string): string {
+  const itemValue = inLogicalOrder(item.value);
   if (variablesSummary === undefined) {
     return t('playlist.playlist-table-rows.aria-label-playlist-item', 'Playlist item, {{itemType}}, {{itemValue}}', {
       itemType: item.type,
-      itemValue: item.value,
+      itemValue,
       interpolation: { escapeValue: false },
     });
   }
@@ -135,7 +149,7 @@ function itemLabel(item: PlaylistItemUI, variablesSummary?: string): string {
   return t(
     'playlist.playlist-table-rows.aria-label-playlist-item-variables',
     'Playlist item, {{itemType}}, {{itemValue}}, {{variablesSummary}}',
-    { itemType: item.type, itemValue: item.value, variablesSummary, interpolation: { escapeValue: false } }
+    { itemType: item.type, itemValue, variablesSummary, interpolation: { escapeValue: false } }
   );
 }
 
@@ -217,8 +231,14 @@ export const PlaylistTableRows = ({
       <>
         <Icon name={icon} className={styles.rightMargin} key="icon" />
         {info}
-        {item.type === 'dashboard_by_uid' && variablesSummary !== undefined && (
+        {item.type === 'dashboard_by_uid' && variableCount > 0 && (
           <>
+            {/*
+             * The count comes from the stored map rather than from the summary beside it, because
+             * the summary can be empty for a map that does hold variables: a name and values made
+             * only of invisible formatting characters leave no text to preview, and the item still
+             * has as many variables as it has.
+             */}
             <span key="variables-count" className={styles.variablesSummary}>
               {t('playlist.playlist-table-rows.variables-count', '', {
                 count: variableCount,
@@ -233,10 +253,12 @@ export const PlaylistTableRows = ({
              * The separator is hidden from assistive technology because the row's own accessible
              * name below carries the same summary without it.
              */}
-            <span key="variables-preview" className={styles.variablesSummary}>
-              <span aria-hidden="true">{'· '}</span>
-              {variablesSummary}
-            </span>
+            {variablesSummary !== undefined && (
+              <span key="variables-preview" className={styles.variablesSummary}>
+                <span aria-hidden="true">{'· '}</span>
+                {variablesSummary}
+              </span>
+            )}
           </>
         )}
       </>
@@ -285,11 +307,10 @@ export const PlaylistTableRows = ({
                         size="md"
                         onClick={() => onToggleExpanded(index)}
                         aria-expanded={isExpanded}
-                        // The panel is only in the document while the row is expanded, and
-                        // aria-controls has to name an element that exists: a collapsed row would
-                        // otherwise point assistive technology at an id nothing resolves to.
-                        // aria-expanded alone already announces the collapsed disclosure.
-                        aria-controls={isExpanded ? panelId : undefined}
+                        // Named in both states, which is what a disclosure is: the panel below is
+                        // in the document whether or not it is open, so this always resolves to the
+                        // element it names rather than to an id nothing answers to.
+                        aria-controls={panelId}
                         // The name is given as aria-label rather than as a tooltip, which an
                         // IconButton renders as a portal overlay that stays open while the button
                         // holds focus: after a click it lingers over the next row's disclosure,
@@ -315,10 +336,17 @@ export const PlaylistTableRows = ({
                     </div>
                   </div>
                 </div>
-                {hasVariableEditor && isExpanded && (
+                {hasVariableEditor && (
+                  // The panel the disclosure above names. It stays in the document while the row
+                  // is collapsed, and is hidden — so it is out of the accessibility tree, out of
+                  // the tab sequence and out of layout, exactly as an absent panel would be, while
+                  // the disclosure's `aria-controls` still resolves to a real element. The editor
+                  // itself is mounted only while the row is open: it is the part that holds state,
+                  // renders a control per variable and registers with the form's commit scope.
                   <div
                     id={panelId}
                     role="region"
+                    hidden={!isExpanded}
                     // The item value alone names both panels of a dashboard listed twice, leaving
                     // a screen-reader user unable to tell which row's editor they are in, so the
                     // row's position is part of the name. It is stable for as long as the panel is
@@ -326,15 +354,17 @@ export const PlaylistTableRows = ({
                     aria-label={t(
                       'playlist.playlist-table-rows.variables-panel',
                       'Template variables for {{itemValue}}, item {{itemPosition}}',
-                      { itemValue: item.value, itemPosition, interpolation: { escapeValue: false } }
+                      { itemValue: inLogicalOrder(item.value), itemPosition, interpolation: { escapeValue: false } }
                     )}
                     className={styles.variables}
                   >
-                    <PlaylistItemVariables
-                      variables={item.variables}
-                      itemPosition={itemPosition}
-                      onChange={(variables) => onVariablesChange(index, variables)}
-                    />
+                    {isExpanded && (
+                      <PlaylistItemVariables
+                        variables={item.variables}
+                        itemPosition={itemPosition}
+                        onChange={(variables) => onVariablesChange(index, variables)}
+                      />
+                    )}
                   </div>
                 )}
               </div>
@@ -386,6 +416,11 @@ function getStyles(theme: GrafanaTheme2) {
       fontSize: theme.typography.bodySmall.fontSize,
       whiteSpace: 'nowrap',
       flexShrink: 0,
+      // The summary is built out of stored variable text. Isolating it keeps whatever direction
+      // that text resolves to inside this element, so it cannot reorder the dashboard name or the
+      // count it sits beside — the counterpart, inside the string, of dropping the explicit
+      // bidirectional controls.
+      unicodeBidi: 'isolate',
     }),
   };
 }

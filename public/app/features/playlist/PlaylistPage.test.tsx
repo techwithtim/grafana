@@ -1,6 +1,6 @@
 import { act, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent, { type UserEvent } from '@testing-library/user-event';
-import { from, of } from 'rxjs';
+import { from, of, throwError } from 'rxjs';
 import { TestProvider } from 'test/helpers/TestProvider';
 
 import { locationService } from '@grafana/runtime';
@@ -9,6 +9,7 @@ import { contextSrv } from 'app/core/services/context_srv';
 import { AccessControlAction } from 'app/types/accessControl';
 
 import { createFetchResponse } from '../../../test/helpers/createFetchResponse';
+import { PLAYLIST_LIST_MAX_PAGES } from '../../api/clients/playlist/v1';
 import { backendSrv } from '../../core/services/backend_srv';
 
 import { PlaylistPage } from './PlaylistPage';
@@ -198,6 +199,183 @@ describe('PlaylistPage', () => {
           expect(screen.queryByRole('button', { name: /Delete playlist/i })).not.toBeInTheDocument();
         });
       });
+    });
+  });
+
+  // The apiserver returns a list in chunks once the response outgrows its size budget and hands
+  // back a continue token for the rest, which a single oversized playlist is enough to trigger.
+  // The page used to render the first chunk as if it were the whole namespace: the playlists in
+  // the later chunks had no card, and searching for one of them answered "No playlists found".
+  describe('when the apiserver returns the list in chunks', () => {
+    interface ListPage {
+      titles: string[];
+      /** The token this page hands back; absent on the last page of the namespace. */
+      continueToken?: string;
+    }
+
+    /**
+     * Answers the list request, and each continuation, with the next page — keyed on the continue
+     * token the request carried, so the recorded tokens prove which requests the page actually
+     * made rather than only how many.
+     */
+    function mockChunkedList(pages: ListPage[]) {
+      const listRequests: Array<string | undefined> = [];
+
+      jest.spyOn(backendSrv, 'fetch').mockImplementation((options) => {
+        if (!options.url.endsWith('/playlists')) {
+          return of(createFetchResponse({}));
+        }
+
+        const token: string | undefined = options.params?.continue;
+        listRequests.push(token);
+
+        const pageIndex = token === undefined ? 0 : pages.findIndex((page) => page.continueToken === token) + 1;
+        if (token !== undefined && pageIndex === 0) {
+          throw new Error(`continuation asked for an unknown token: ${token}`);
+        }
+        const page = pages[pageIndex];
+
+        return of(
+          createFetchResponse({
+            items: page.titles.map((title) => ({
+              spec: { title, interval: '10m', items: [] },
+              metadata: { name: title.replace(/\s/g, '-').toLowerCase(), uid: `uid-${title}` },
+            })),
+            metadata: page.continueToken ? { continue: page.continueToken } : {},
+          })
+        );
+      });
+
+      return listRequests;
+    }
+
+    /** Answers every list request with one playlist and a fresh token, so the namespace never ends. */
+    function mockEndlessList() {
+      const listRequests: Array<string | undefined> = [];
+
+      jest.spyOn(backendSrv, 'fetch').mockImplementation((options) => {
+        if (!options.url.endsWith('/playlists')) {
+          return of(createFetchResponse({}));
+        }
+
+        const served = listRequests.length;
+        listRequests.push(options.params?.continue);
+
+        return of(
+          createFetchResponse({
+            items: [
+              {
+                spec: { title: `Endless playlist ${served}`, interval: '10m', items: [] },
+                metadata: { name: `endless-${served}`, uid: `uid-endless-${served}` },
+              },
+            ],
+            metadata: { continue: `tok-${served}` },
+          })
+        );
+      });
+
+      return listRequests;
+    }
+
+    beforeEach(() => {
+      (contextSrv as jest.Mocked<typeof contextSrv>).isEditor = true;
+    });
+
+    it('follows the continue tokens and renders every playlist in the namespace', async () => {
+      const listRequests = mockChunkedList([
+        { titles: ['First chunk A', 'First chunk B'], continueToken: 'tok-1' },
+        { titles: ['Second chunk A'], continueToken: 'tok-2' },
+        { titles: ['Last chunk playlist'] },
+      ]);
+      setup();
+
+      expect(await screen.findByText('Last chunk playlist')).toBeInTheDocument();
+      expect(screen.getByText('First chunk A')).toBeInTheDocument();
+      expect(screen.getByText('First chunk B')).toBeInTheDocument();
+      expect(screen.getByText('Second chunk A')).toBeInTheDocument();
+      expect(screen.getAllByRole('button', { name: /start playlist/i })).toHaveLength(4);
+      // Each continuation carries the token the previous page handed back.
+      expect(listRequests).toEqual([undefined, 'tok-1', 'tok-2']);
+      expect(screen.queryByText('Not all playlists are shown')).not.toBeInTheDocument();
+    });
+
+    it('finds a playlist that only a later chunk contains', async () => {
+      mockChunkedList([{ titles: ['First chunk A'], continueToken: 'tok-1' }, { titles: ['Last chunk playlist'] }]);
+      const user = userEvent.setup();
+      setup();
+
+      expect(await screen.findByText('Last chunk playlist')).toBeInTheDocument();
+      await user.type(screen.getByPlaceholderText('Search by name or type'), 'Last chunk');
+
+      expect(await screen.findByText('Last chunk playlist')).toBeInTheDocument();
+      expect(screen.queryByText('First chunk A')).not.toBeInTheDocument();
+      expect(screen.queryByText('No playlists found')).not.toBeInTheDocument();
+    });
+
+    it('says the list is incomplete when the namespace outlasts the page budget', async () => {
+      const listRequests = mockEndlessList();
+      setup();
+
+      expect(await screen.findByText('Not all playlists are shown')).toBeInTheDocument();
+      expect(listRequests).toHaveLength(PLAYLIST_LIST_MAX_PAGES);
+      expect(
+        screen.getByText(
+          `This list is too large to load completely, so it shows the first ${PLAYLIST_LIST_MAX_PAGES} playlists. ` +
+            'Playlists it leaves out are missing from the search results as well.'
+        )
+      ).toBeInTheDocument();
+    });
+
+    it('keeps saying the list is incomplete when a search matches none of the playlists it loaded', async () => {
+      mockEndlessList();
+      const user = userEvent.setup();
+      setup();
+
+      expect(await screen.findByText('Not all playlists are shown')).toBeInTheDocument();
+      await user.type(screen.getByPlaceholderText('Search by name or type'), 'a playlist in the missing tail');
+
+      expect(await screen.findByText('No playlists found')).toBeInTheDocument();
+      // Without this, "No playlists found" claims the playlist does not exist.
+      expect(screen.getByText('Not all playlists are shown')).toBeInTheDocument();
+    });
+
+    it('shows the playlists it loaded and says the list is incomplete when a continuation fails', async () => {
+      const listRequests: Array<string | undefined> = [];
+      jest.spyOn(backendSrv, 'fetch').mockImplementation((options) => {
+        if (!options.url.endsWith('/playlists')) {
+          return of(createFetchResponse({}));
+        }
+        const token: string | undefined = options.params?.continue;
+        listRequests.push(token);
+        if (token) {
+          return throwError(() => ({ status: 500, data: { message: 'list failed' } }));
+        }
+        return of(
+          createFetchResponse({
+            items: [
+              {
+                spec: { title: 'Loaded before the failure', interval: '10m', items: [] },
+                metadata: { name: 'loaded-playlist', uid: 'uid-loaded' },
+              },
+            ],
+            metadata: { continue: 'tok-1' },
+          })
+        );
+      });
+      setup();
+
+      expect(await screen.findByText('Loaded before the failure')).toBeInTheDocument();
+      expect(await screen.findByText('Not all playlists are shown')).toBeInTheDocument();
+      expect(listRequests).toEqual([undefined, 'tok-1']);
+    });
+
+    it('makes exactly one request and shows no notice when the whole namespace fits in one chunk', async () => {
+      const listRequests = mockChunkedList([{ titles: ['Only playlist'] }]);
+      setup();
+
+      expect(await screen.findByText('Only playlist')).toBeInTheDocument();
+      expect(listRequests).toEqual([undefined]);
+      expect(screen.queryByText('Not all playlists are shown')).not.toBeInTheDocument();
     });
   });
 

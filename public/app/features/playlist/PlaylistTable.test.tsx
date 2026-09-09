@@ -9,6 +9,7 @@ import { act, fireEvent, render, screen, waitFor, within } from '@testing-librar
 import userEvent, { type UserEvent } from '@testing-library/user-event';
 import { useState, type ReactNode } from 'react';
 
+import { PlaylistVariablesCommitContext, usePlaylistVariablesCommit } from './PlaylistItemVariables';
 import { PlaylistTable } from './PlaylistTable';
 import { PlaylistTableRows } from './PlaylistTableRows';
 import { type PlaylistItemUI } from './types';
@@ -127,6 +128,19 @@ function setup(jsx: JSX.Element) {
 }
 
 /**
+ * The commit scope the playlist form provides in production. It is part of every fixture here
+ * because the table reaches through it before it collapses or removes a row: text typed into an
+ * open editor and not yet added exists nowhere else, and it has to be committed while the rows are
+ * still the rows it was typed into.
+ */
+function WithCommitScope({ children }: { children: ReactNode }) {
+  const { commitScope } = usePlaylistVariablesCommit();
+  return (
+    <PlaylistVariablesCommitContext.Provider value={commitScope}>{children}</PlaylistVariablesCommitContext.Provider>
+  );
+}
+
+/**
  * The spies stand in for the playlist form, which owns the item list: the rows therefore stay
  * exactly as they are after a move or a deletion, which is what makes the collapse observable.
  */
@@ -140,7 +154,14 @@ function renderTable(items: PlaylistItemUI[] = playlistItems()) {
     moveItem,
     onVariablesChange,
     ...setup(
-      <PlaylistTable items={items} deleteItem={deleteItem} moveItem={moveItem} onVariablesChange={onVariablesChange} />
+      <WithCommitScope>
+        <PlaylistTable
+          items={items}
+          deleteItem={deleteItem}
+          moveItem={moveItem}
+          onVariablesChange={onVariablesChange}
+        />
+      </WithCommitScope>
     ),
   };
 }
@@ -160,33 +181,35 @@ function StatefulTable({ initialItems, deleteItem, moveItem }: StatefulTableProp
   const [items, setItems] = useState(initialItems);
 
   return (
-    <PlaylistTable
-      items={items}
-      deleteItem={(index) => {
-        deleteItem(index);
-        setItems((previous) => previous.filter((_, i) => i !== index));
-      }}
-      moveItem={(src, dst) => {
-        moveItem(src, dst);
-        setItems((previous) => {
-          const next = Array.from(previous);
-          const [moved] = next.splice(src, 1);
-          next.splice(dst, 0, moved);
-          return next;
-        });
-      }}
-      onVariablesChange={(index, variables) =>
-        setItems((previous) =>
-          previous.map((item, i) => {
-            if (i !== index) {
-              return item;
-            }
-            const { variables: replaced, ...rest } = item;
-            return variables && Object.keys(variables).length > 0 ? { ...rest, variables } : rest;
-          })
-        )
-      }
-    />
+    <WithCommitScope>
+      <PlaylistTable
+        items={items}
+        deleteItem={(index) => {
+          deleteItem(index);
+          setItems((previous) => previous.filter((_, i) => i !== index));
+        }}
+        moveItem={(src, dst) => {
+          moveItem(src, dst);
+          setItems((previous) => {
+            const next = Array.from(previous);
+            const [moved] = next.splice(src, 1);
+            next.splice(dst, 0, moved);
+            return next;
+          });
+        }}
+        onVariablesChange={(index, variables) =>
+          setItems((previous) =>
+            previous.map((item, i) => {
+              if (i !== index) {
+                return item;
+              }
+              const { variables: replaced, ...rest } = item;
+              return variables && Object.keys(variables).length > 0 ? { ...rest, variables } : rest;
+            })
+          )
+        }
+      />
+    </WithCommitScope>
   );
 }
 
@@ -351,6 +374,9 @@ function confirmDialog() {
   return screen.queryByRole('dialog', { name: 'Delete playlist item' });
 }
 
+/** Every character that reorders the text around it, one per formatting class Unicode defines. */
+const BIDI_CONTROLS = /[\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/;
+
 describe('PlaylistTable', () => {
   beforeEach(() => {
     // The stubbed `DragDropContext` records every render, so the recorded props must not leak from
@@ -477,6 +503,48 @@ describe('PlaylistTable', () => {
     expect(rows()[2]).not.toHaveTextContent('variable');
   });
 
+  /**
+   * A row's summary and its accessible name are built out of stored variable text, and a
+   * bidirectional override in that text reorders the display of everything the same string puts
+   * after it — the `name=` it belongs to, the next pair, the row's own name. A row that reads as
+   * holding `LTR` while the item holds `RTL` describes the wrong item, so those characters are
+   * dropped from the description; isolating the summary is what keeps text that resolves to a
+   * direction of its own from reordering the dashboard name beside it.
+   */
+  it('describes a value holding a bidirectional override in the order the item stores it', () => {
+    renderTable([
+      {
+        type: 'dashboard_by_uid',
+        value: 'uid_1',
+        variables: { host: ['\u202eRTL\u202c', 'plain'] },
+        dashboards: [loadedDashboard('uid_1', 'Host dashboard')],
+      },
+    ]);
+
+    expect(rowNames()).toEqual(['Playlist item, dashboard_by_uid, uid_1, host=RTL, plain']);
+    expect(rows()[0]).toHaveTextContent('· host=RTL, plain');
+    expect(rows()[0].textContent).not.toMatch(BIDI_CONTROLS);
+    expect(rows()[0].getAttribute('aria-label')).not.toMatch(BIDI_CONTROLS);
+    expect(window.getComputedStyle(screen.getByText('1 variable')).unicodeBidi).toBe('isolate');
+  });
+
+  it('counts the variables of an item whose names and values are nothing but invisible controls', () => {
+    renderTable([
+      {
+        type: 'dashboard_by_uid',
+        value: 'uid_1',
+        variables: { '\u202e': ['\u202c'] },
+        dashboards: [loadedDashboard('uid_1', 'Host dashboard')],
+      },
+    ]);
+
+    // Nothing renderable is left to preview, and the item still holds the variable: the count comes
+    // from the stored map, and the row's name falls back to the one a row without variables has.
+    expect(screen.getByText('1 variable')).toBeInTheDocument();
+    expect(rowNames()).toEqual(['Playlist item, dashboard_by_uid, uid_1']);
+    expect(rows()[0].textContent).not.toMatch(BIDI_CONTROLS);
+  });
+
   it('closes an open variable editor when its own disclosure is clicked a second time', async () => {
     const { user } = renderTable();
 
@@ -509,25 +577,49 @@ describe('PlaylistTable', () => {
     expect(uidVariablesPanels().map((panel) => panel.getAttribute('id'))).toEqual(panelIds);
   });
 
-  // A collapsed row mounts no panel, so the attribute is absent rather than naming an id that
-  // resolves to nothing; `aria-expanded` is what announces the collapsed disclosure.
-  it('carries aria-controls only while the row it belongs to is expanded', async () => {
+  /**
+   * A disclosure names the panel it controls in both of its states, which is what makes it a
+   * disclosure rather than a button that happens to toggle something: the relationship is what
+   * assistive technology follows from the control to the content, and a collapsed row would
+   * otherwise offer no way to reach it.
+   *
+   * The panel it names is in the document either way — `hidden` while the row is collapsed, so it
+   * is out of the accessibility tree, out of the tab sequence and out of layout exactly as an
+   * absent panel would be, which is why the role queries below still see none. What the attribute
+   * must never do is name an id that resolves to nothing, and this is why it does not.
+   */
+  it('names its own variables panel from a collapsed disclosure as well as an expanded one', async () => {
     const { user } = renderTable();
 
     expect(disclosureStates()).toEqual(['false', 'false']);
-    expect(disclosureControls()).toEqual([null, null]);
+    const [firstPanelId, secondPanelId] = disclosureControls();
+    expect(firstPanelId).toEqual(expect.stringMatching(/\S/));
+    expect(secondPanelId).toEqual(expect.stringMatching(/\S/));
+    expect(firstPanelId).not.toEqual(secondPanelId);
+    for (const [index, panelId] of [firstPanelId, secondPanelId].entries()) {
+      const panel = document.getElementById(panelId ?? '');
+      expect(panel).not.toBeNull();
+      expect(panel).toHaveAttribute('hidden');
+      // The panel each disclosure names is the one inside its own row, which is the whole point of
+      // the reference on two rows holding the same dashboard.
+      expect(rows()[index].contains(panel)).toBe(true);
+    }
+    expect(variablesPanels()).toHaveLength(0);
 
     await user.click(disclosureButtons()[0]);
 
-    const [firstPanelId, secondPanelId] = disclosureControls();
-    expect(firstPanelId).toEqual(expect.stringMatching(/\S/));
-    expect(secondPanelId).toBeNull();
+    expect(disclosureStates()).toEqual(['true', 'false']);
+    expect(disclosureControls()).toEqual([firstPanelId, secondPanelId]);
     expect(uidVariablesPanels().map((panel) => panel.getAttribute('id'))).toEqual([firstPanelId]);
+    expect(document.getElementById(firstPanelId ?? '')).not.toHaveAttribute('hidden');
+    expect(document.getElementById(secondPanelId ?? '')).toHaveAttribute('hidden');
 
     await user.click(disclosureButtons()[0]);
 
     expect(disclosureStates()).toEqual(['false', 'false']);
-    expect(disclosureControls()).toEqual([null, null]);
+    expect(disclosureControls()).toEqual([firstPanelId, secondPanelId]);
+    expect(variablesPanels()).toHaveLength(0);
+    expect(document.getElementById(firstPanelId ?? '')).toHaveAttribute('hidden');
   });
 
   it('moves the item and collapses both open variable editors when a drag ends on a new position', async () => {
@@ -557,6 +649,57 @@ describe('PlaylistTable', () => {
     await waitFor(() => {
       expect(disclosureStates()).toEqual(['false', 'false']);
     });
+    expect(variablesPanels()).toHaveLength(0);
+  });
+
+  /**
+   * Text typed into an open editor and never added exists nowhere but that editor, and every
+   * structural change here takes the editor away. It is therefore committed first — while the row
+   * it was typed into is still at the position it was typed at, which is what the recorded call
+   * order proves. Settling afterwards would hand it to whichever item had taken that position.
+   */
+  it('adds a variable typed into an open editor to its own row before a deletion collapses the editors', async () => {
+    const { user, deleteItem, onVariablesChange } = renderTable();
+
+    await user.click(disclosureButtons()[1]);
+    const editor = editorFor(1);
+    await user.type(within(editor).getByRole('textbox', { name: 'Variable name' }), 'shard');
+    await user.type(within(editor).getByRole('textbox', { name: 'Values (comma-separated)' }), 's1');
+    expect(onVariablesChange).not.toHaveBeenCalled();
+
+    await user.click(deleteButtons()[0]);
+
+    expect(onVariablesChange).toHaveBeenCalledWith(1, { cluster: ['eu-west'], shard: ['s1'] });
+    expect(deleteItem).toHaveBeenCalledWith(0);
+    expect(onVariablesChange.mock.invocationCallOrder[0]).toBeLessThan(deleteItem.mock.invocationCallOrder[0]);
+    expect(variablesPanels()).toHaveLength(0);
+  });
+
+  it('adds a variable typed into an open editor to its own row before that row is collapsed', async () => {
+    const { user, onVariablesChange } = renderTable();
+
+    await user.click(disclosureButtons()[0]);
+    const editor = editorFor(0);
+    await user.type(within(editor).getByRole('textbox', { name: 'Variable name' }), 'shard');
+    await user.type(within(editor).getByRole('textbox', { name: 'Values (comma-separated)' }), 's1');
+
+    await user.click(disclosureButtons()[0]);
+
+    expect(onVariablesChange).toHaveBeenCalledWith(0, { host: ['Host1'], shard: ['s1'] });
+    expect(disclosureStates()).toEqual(['false', 'false']);
+  });
+
+  it('adds a variable typed into an open editor to its own row before the row is lifted for a drag', async () => {
+    const { user, onVariablesChange } = renderTable();
+
+    await user.click(disclosureButtons()[0]);
+    const editor = editorFor(0);
+    await user.type(within(editor).getByRole('textbox', { name: 'Variable name' }), 'shard');
+    await user.type(within(editor).getByRole('textbox', { name: 'Values (comma-separated)' }), 's1');
+
+    await beginDrag({ draggableId: draggableIds()[0] ?? '', mode: 'FLUID' });
+
+    expect(onVariablesChange).toHaveBeenCalledWith(0, { host: ['Host1'], shard: ['s1'] });
     expect(variablesPanels()).toHaveLength(0);
   });
 
@@ -723,6 +866,26 @@ describe('PlaylistTable', () => {
       await waitFor(() => {
         expect(activeElementName()).toBe('Template variables');
       });
+    });
+
+    it('counts a variable that was typed but never added, which the deletion would discard', async () => {
+      const { user, deleteItem } = renderStatefulTable();
+      await user.click(disclosureButtons()[0]);
+      const editor = editorFor(0);
+      await user.type(within(editor).getByRole('textbox', { name: 'Variable name' }), 'shard');
+      await user.type(within(editor).getByRole('textbox', { name: 'Values (comma-separated)' }), 'a, b');
+
+      await user.click(deleteButtons()[0]);
+
+      // The settle that runs before the row is judged is what puts the typed variable on the item,
+      // so the question asked names both of them rather than only the one that was already there.
+      const dialog = screen.getByRole('dialog', { name: 'Delete playlist item' });
+      expect(deleteItem).not.toHaveBeenCalled();
+      expect(
+        within(dialog).getByText(
+          'This item has 2 template variables that have not been saved yet. Deleting the item discards them.'
+        )
+      ).toBeInTheDocument();
     });
 
     it('keeps the row and its variables when the confirmation is dismissed', async () => {

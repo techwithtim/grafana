@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"context"
 	"encoding/json"
+	stderrors "errors"
 	"fmt"
 	"net/http"
 	"slices"
@@ -758,6 +759,260 @@ func doPlaylistTests(t *testing.T, helper *apis.K8sTestHelper) *apis.K8sTestHelp
 		require.Len(t, legacyGet.Result.Items, 2)
 		require.Equal(t, map[string][]string{"host": {"h1", "h2"}, "cluster": {"c1"}}, legacyGet.Result.Items[0].Variables)
 		require.Nil(t, legacyGet.Result.Items[1].Variables)
+	})
+
+	t.Run("Refuse playlist item variables that break the published maxima", func(t *testing.T) {
+		// The maxima are enforced by admission (apps/playlist/pkg/app/app.go), which the
+		// aggregated apiserver consults for every write path, so this sub-test is what proves a
+		// refusal reaches the client as 422 Invalid with a usable field path rather than as a
+		// 403 with the causes flattened away -- and that the legacy endpoints, which proxy
+		// through the same chain, refuse the same payloads.
+		client := helper.GetResourceClient(apis.ResourceClientArgs{
+			User: helper.Org1.Editor,
+			GVR:  gvr,
+		})
+
+		payload := func(t *testing.T, name string, variables map[string][]string) *unstructured.Unstructured {
+			t.Helper()
+			encoded, err := json.Marshal(variables)
+			require.NoError(t, err)
+			return helper.LoadYAMLOrJSON(fmt.Sprintf(`{
+				"apiVersion": "playlist.grafana.app/v1",
+				"kind": "Playlist",
+				"metadata": { "name": %q },
+				"spec": {
+				  "title": "Variable maxima",
+				  "interval": "5m",
+				  "items": [ { "type": "dashboard_by_uid", "value": "xCmMwXdVz", "variables": %s } ]
+				}
+			  }`, name, encoded))
+		}
+
+		causeFields := func(t *testing.T, err error) []string {
+			t.Helper()
+			var statusErr *apierrors.StatusError
+			require.True(t, stderrors.As(err, &statusErr), "expected a status error, got %T: %v", err, err)
+			require.Equal(t, int32(http.StatusUnprocessableEntity), statusErr.ErrStatus.Code)
+			require.NotNil(t, statusErr.ErrStatus.Details)
+			fields := make([]string, 0, len(statusErr.ErrStatus.Details.Causes))
+			for _, cause := range statusErr.ErrStatus.Details.Causes {
+				fields = append(fields, cause.Field)
+			}
+			return fields
+		}
+
+		manyVariables := func(count int) map[string][]string {
+			variables := make(map[string][]string, count)
+			for i := range count {
+				variables[fmt.Sprintf("host%03d", i)] = []string{"a"}
+			}
+			return variables
+		}
+		manyValues := func(count int) []string {
+			values := make([]string, 0, count)
+			for i := range count {
+				values = append(values, fmt.Sprintf("host%03d", i))
+			}
+			return values
+		}
+
+		// The maxima published in the item schema. Written out rather than imported so the
+		// numbers a client reads in the OpenAPI document are the numbers asserted here.
+		const (
+			maxVariables = 32
+			maxValues    = 64
+			maxNameLen   = 128
+			maxValueLen  = 1024
+		)
+
+		for _, tc := range []struct {
+			name       string
+			variables  map[string][]string
+			wantFields []string
+		}{
+			{
+				name:       "a 2 MB value",
+				variables:  map[string][]string{"host": {strings.Repeat("X", 2*1000*1000)}},
+				wantFields: []string{"spec.items[0].variables[host][0]"},
+			},
+			{
+				name:       "one variable past the item maximum",
+				variables:  manyVariables(maxVariables + 1),
+				wantFields: []string{"spec.items[0].variables"},
+			},
+			{
+				name:       "5000 variables",
+				variables:  manyVariables(5000),
+				wantFields: []string{"spec.items[0].variables"},
+			},
+			{
+				name:       "one value past the per-variable maximum",
+				variables:  map[string][]string{"host": manyValues(maxValues + 1)},
+				wantFields: []string{"spec.items[0].variables[host]"},
+			},
+			{
+				name:       "a name one code point too long",
+				variables:  map[string][]string{strings.Repeat("n", maxNameLen+1): {"a"}},
+				wantFields: []string{"spec.items[0].variables[" + strings.Repeat("n", maxNameLen) + "...]"},
+			},
+			{
+				name:       "a value one code point too long",
+				variables:  map[string][]string{"host": {strings.Repeat("v", maxValueLen+1)}},
+				wantFields: []string{"spec.items[0].variables[host][0]"},
+			},
+			{
+				// U+200B passes Go's whitespace trimming, so before the shared rule it was
+				// stored and then played as an invisible `var-%E2%80%8B` parameter.
+				name:       "a zero width space name",
+				variables:  map[string][]string{"\u200b": {"a"}},
+				wantFields: []string{"spec.items[0].variables[\u200b]"},
+			},
+			{
+				// U+FEFF was stored by the API and skipped by playback: the two layers
+				// disagreed about whether the variable existed.
+				name:       "a byte order mark name",
+				variables:  map[string][]string{"\ufeff": {"a"}},
+				wantFields: []string{"spec.items[0].variables[\ufeff]"},
+			},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				name := "playlist-refused-" + strings.ReplaceAll(tc.name, " ", "-")
+				_, err := client.Resource.Create(context.Background(), payload(t, name, tc.variables), metav1.CreateOptions{})
+				require.Error(t, err)
+				require.True(t, apierrors.IsInvalid(err), "expected Invalid, got %v", err)
+				require.Equal(t, tc.wantFields, causeFields(t, err))
+
+				// Nothing was persisted, so the refusal is a refusal and not a warning.
+				_, err = client.Resource.Get(context.Background(), name, metav1.GetOptions{})
+				require.True(t, apierrors.IsNotFound(err), "expected the object to be absent, got %v", err)
+			})
+		}
+
+		t.Run("a payload at every maximum is accepted", func(t *testing.T) {
+			// The maxima are the editor's own, so a map the editor commits has to be stored:
+			// the widest map, the longest value list, the longest name and the longest value.
+			atLimit := manyVariables(maxVariables - 3)
+			atLimit["values-at-maximum"] = manyValues(maxValues)
+			atLimit[strings.Repeat("n", maxNameLen)] = []string{"a"}
+			atLimit["value-at-maximum"] = []string{strings.Repeat("v", maxValueLen)}
+			require.Len(t, atLimit, maxVariables)
+
+			const name = "playlist-at-variable-maxima"
+			created, err := client.Resource.Create(context.Background(), payload(t, name, atLimit), metav1.CreateOptions{})
+			t.Cleanup(func() {
+				_ = client.Resource.Delete(context.Background(), name, metav1.DeleteOptions{})
+			})
+			require.NoError(t, err)
+			require.Equal(t, name, created.GetName())
+
+			legacyGet := apis.DoRequest(helper, apis.RequestParams{
+				User:   client.Args.User,
+				Method: http.MethodGet,
+				Path:   "/api/playlists/" + name,
+			}, &playlist.PlaylistDTO{})
+			require.Equal(t, 200, legacyGet.Response.StatusCode)
+			require.NotNil(t, legacyGet.Result)
+			require.Len(t, legacyGet.Result.Items, 1)
+			require.Equal(t, atLimit, legacyGet.Result.Items[0].Variables)
+		})
+
+		t.Run("the deprecated legacy endpoints refuse the same payload", func(t *testing.T) {
+			// /api/playlists proxies to the same apiserver, and pkg/api/playlist.go writes the
+			// status code it gets back, so the 422 has to survive the legacy envelope too.
+			oversized := `{ "host": ["` + strings.Repeat("X", 2*1000*1000) + `"] }`
+			legacyCreate := apis.DoRequest(helper, apis.RequestParams{
+				User:   client.Args.User,
+				Method: http.MethodPost,
+				Path:   "/api/playlists",
+				Body: []byte(`{
+					"name": "Legacy oversized",
+					"interval": "5m",
+					"items": [ { "type": "dashboard_by_uid", "value": "xCmMwXdVz", "variables": ` + oversized + ` } ],
+					"uid": ""
+				  }`),
+			}, &playlist.Playlist{})
+			require.Equal(t, http.StatusUnprocessableEntity, legacyCreate.Response.StatusCode)
+
+			// The update path is admitted separately from the create path, so it is checked
+			// separately: a playlist that is legal today must not become oversized by a PUT.
+			legacyValid := apis.DoRequest(helper, apis.RequestParams{
+				User:   client.Args.User,
+				Method: http.MethodPost,
+				Path:   "/api/playlists",
+				Body: []byte(`{
+					"name": "Legacy bounded",
+					"interval": "5m",
+					"items": [ { "type": "dashboard_by_uid", "value": "xCmMwXdVz", "variables": { "host": ["a"] } } ],
+					"uid": ""
+				  }`),
+			}, &playlist.Playlist{})
+			t.Cleanup(func() {
+				if legacyValid.Result == nil || legacyValid.Result.UID == "" {
+					return
+				}
+				err := client.Resource.Delete(context.Background(), legacyValid.Result.UID, metav1.DeleteOptions{})
+				if err != nil && !apierrors.IsNotFound(err) {
+					t.Errorf("failed to clean up playlist %s: %v", legacyValid.Result.UID, err)
+				}
+			})
+			require.Equal(t, 200, legacyValid.Response.StatusCode)
+			require.NotNil(t, legacyValid.Result)
+			uid := legacyValid.Result.UID
+			require.NotEmpty(t, uid)
+
+			legacyUpdate := apis.DoRequest(helper, apis.RequestParams{
+				User:   client.Args.User,
+				Method: http.MethodPut,
+				Path:   "/api/playlists/" + uid,
+				Body: []byte(`{
+					"name": "Legacy bounded",
+					"interval": "5m",
+					"items": [ { "type": "dashboard_by_uid", "value": "xCmMwXdVz", "variables": ` + oversized + ` } ],
+					"uid": "` + uid + `"
+				  }`),
+			}, &playlist.PlaylistDTO{})
+			require.Equal(t, http.StatusUnprocessableEntity, legacyUpdate.Response.StatusCode)
+
+			// The stored object still holds what the accepted write put there.
+			stored := apis.DoRequest(helper, apis.RequestParams{
+				User:   client.Args.User,
+				Method: http.MethodGet,
+				Path:   "/api/playlists/" + uid,
+			}, &playlist.PlaylistDTO{})
+			require.Equal(t, 200, stored.Response.StatusCode)
+			require.NotNil(t, stored.Result)
+			require.Len(t, stored.Result.Items, 1)
+			require.Equal(t, map[string][]string{"host": {"a"}}, stored.Result.Items[0].Variables)
+		})
+
+		t.Run("v0alpha1 refuses the same payload", func(t *testing.T) {
+			// Both served versions share the item definition, so both are admitted by the same
+			// rules; a client that never moved off v0alpha1 cannot use it to bypass them.
+			clientV0alpha1 := helper.GetResourceClient(apis.ResourceClientArgs{
+				User: helper.Org1.Editor,
+				GVR: schema.GroupVersionResource{
+					Group:    gvr.Group,
+					Version:  "v0alpha1",
+					Resource: gvr.Resource,
+				},
+			})
+			_, err := clientV0alpha1.Resource.Create(context.Background(),
+				helper.LoadYAMLOrJSON(`{
+					"apiVersion": "playlist.grafana.app/v0alpha1",
+					"kind": "Playlist",
+					"metadata": { "name": "playlist-v0alpha1-refused" },
+					"spec": {
+					  "title": "Variable maxima",
+					  "interval": "5m",
+					  "items": [ { "type": "dashboard_by_uid", "value": "xCmMwXdVz", "variables": { "host": ["`+strings.Repeat("X", 2*1000*1000)+`"] } } ]
+					}
+				  }`),
+				metav1.CreateOptions{},
+			)
+			require.Error(t, err)
+			require.True(t, apierrors.IsInvalid(err), "expected Invalid, got %v", err)
+			require.Equal(t, []string{"spec.items[0].variables[host][0]"}, causeFields(t, err))
+		})
 	})
 
 	t.Run("Do CRUD via k8s (and check that legacy api still works)", func(t *testing.T) {

@@ -156,6 +156,28 @@ func newPlaylistK8sHandler(hs *HTTPServer) *playlistK8sHandler {
 	}
 }
 
+const (
+	// playlistSearchPageSize is the number of playlists requested per list call. The
+	// resource API chunks a list response once it exceeds its own size budget (2 MiB in
+	// unified storage) regardless of this value, so it is only an upper bound: a page may
+	// come back shorter, and the continue token is what actually drives the walk.
+	playlistSearchPageSize = 500
+
+	// playlistSearchMaxPages bounds the continue-token walk. This deprecated endpoint
+	// answers with one unpaginated JSON array, so every page walked is held in memory
+	// until the body is written; a server that kept handing back tokens would otherwise
+	// make the handler loop and allocate without limit. Hitting the cap is reported
+	// through playlistSearchTruncatedWarning instead of being hidden.
+	playlistSearchMaxPages = 20
+
+	// playlistSearchTruncatedWarning is the response header written when the walk stops
+	// with a continue token still outstanding, so a truncated list is never mistaken for
+	// a complete one. 299 is the RFC 9111 "miscellaneous persistent warning" code, used
+	// here the same way pkg/services/ngalert/api marks its deprecated responses. The
+	// value is a constant: nothing user-controlled may reach a response header.
+	playlistSearchTruncatedWarning = `299 - "Incomplete playlist list: too many playlists to return through this deprecated endpoint. Use the playlist.grafana.app API and follow the continue token for the complete list."`
+)
+
 // swagger:route GET /playlists playlists searchPlaylists
 //
 // Get playlists.
@@ -172,24 +194,61 @@ func (pk8s *playlistK8sHandler) searchPlaylists(c *contextmodel.ReqContext) {
 	if !ok {
 		return // error is already sent
 	}
-	out, err := client.List(c.Req.Context(), v1.ListOptions{})
-	if err != nil {
-		pk8s.writeError(c, err)
-		return
-	}
 
 	query := strings.ToUpper(c.Query("query"))
 	playlists := []playlist.Playlist{}
-	for _, item := range out.Items {
-		p := playlist.UnstructuredToLegacyPlaylist(item)
-		if p == nil {
-			continue
+
+	// The resource API returns a chunked list once the response outgrows its size
+	// budget, and a single oversized playlist is enough to trigger that in a namespace
+	// of ordinary ones. Following the continue token here is what keeps this endpoint
+	// answering with the whole namespace instead of just the first chunk; the body it
+	// writes is unchanged either way, so callers of the deprecated API keep the exact
+	// contract they have today.
+	sent := ""
+	pages := 0
+	for pages < playlistSearchMaxPages {
+		out, err := client.List(c.Req.Context(), v1.ListOptions{
+			Limit:    playlistSearchPageSize,
+			Continue: sent,
+		})
+		if err != nil {
+			pk8s.writeError(c, err)
+			return
 		}
-		if query != "" && !strings.Contains(strings.ToUpper(p.Name), query) {
-			continue // query filter
+		pages++
+
+		for _, item := range out.Items {
+			p := playlist.UnstructuredToLegacyPlaylist(item)
+			if p == nil {
+				continue
+			}
+			if query != "" && !strings.Contains(strings.ToUpper(p.Name), query) {
+				continue // query filter
+			}
+			playlists = append(playlists, *p)
 		}
-		playlists = append(playlists, *p)
+
+		next := out.GetContinue()
+		if next == "" {
+			// The namespace is exhausted: everything matching is in playlists.
+			sent = ""
+			break
+		}
+		if next == sent {
+			// A server that answers with the token it was just given would make this
+			// loop run forever. Stop and report the list as incomplete.
+			break
+		}
+		sent = next
 	}
+
+	if sent != "" {
+		// The header has to be set before c.JSON, which writes the status line.
+		c.Resp.Header().Set("Warning", playlistSearchTruncatedWarning)
+		c.Logger.Warn("playlist list is incomplete: continue token still outstanding",
+			"returned", len(playlists), "pages", pages, "pageSize", playlistSearchPageSize, "maxPages", playlistSearchMaxPages)
+	}
+
 	c.JSON(http.StatusOK, playlists)
 }
 
@@ -417,6 +476,11 @@ func (pk8s *playlistK8sHandler) playlistUID(c *contextmodel.ReqContext) (string,
 // on a path segment: a name is required, may not be "." or "..", and may not contain
 // "/" or "%" (content.IsPathSegmentName, which the client itself uses, deliberately
 // does not check for the empty string).
+//
+// The "." and ".." rule is reached through the request body, not the path: the router
+// resolves a path of "." or ".." before matching, so GET /api/playlists/. is served by
+// the list route and :uid never carries either value. Nothing normalises a body, so
+// createPlaylist's cmd.UID does arrive as "." or ".." and is what this rule rejects.
 func validatePlaylistUID(uid string) error {
 	if uid == "" {
 		return stderrors.New("playlist uid is required")

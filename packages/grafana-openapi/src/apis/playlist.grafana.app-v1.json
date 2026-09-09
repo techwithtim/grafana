@@ -1093,7 +1093,7 @@
             "type": "string"
           },
           "variables": {
-            "description": "Optional template variable values applied when this item is played (dashboard_by_uid only).\nEach key is a variable name; its value is a list of one or more values for that variable.\nA multi-value variable is expressed by several list elements under the same key.",
+            "description": "Optional template variable values applied when this item is played (dashboard_by_uid only).\nEach key is a variable name; its value is a list of one or more values for that variable.\nA multi-value variable is expressed by several list elements under the same key.\nA write is rejected when an item carries more than 32 variables, a variable carries more\nthan 64 values, a name is longer than 128 Unicode code points, a value is longer than 1024\nUnicode code points, or a name or value is empty. A name of whitespace, invisible or\ncontrol characters alone counts as empty.",
             "type": "object",
             "additionalProperties": {
               "type": "array",
