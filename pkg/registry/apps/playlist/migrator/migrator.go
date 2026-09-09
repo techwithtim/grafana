@@ -62,7 +62,7 @@ func (m *playlistMigrator) MigratePlaylists(ctx context.Context, orgId int64, op
 		uid       string
 		name      string
 		interval  string
-		items     []playlistv1.PlaylistItem
+		items     []playlistv1.PlaylistPlaylistItem
 		createdAt int64
 		updatedAt int64
 	}
@@ -91,7 +91,7 @@ func (m *playlistMigrator) MigratePlaylists(ctx context.Context, orgId int64, op
 				uid:       uid,
 				name:      name,
 				interval:  interval,
-				items:     []playlistv1.PlaylistItem{},
+				items:     []playlistv1.PlaylistPlaylistItem{},
 				createdAt: createdAt,
 				updatedAt: updatedAt,
 			}
@@ -103,7 +103,7 @@ func (m *playlistMigrator) MigratePlaylists(ctx context.Context, orgId int64, op
 
 		// Add item if it exists (LEFT JOIN can return NULL for playlists without items)
 		if itemType.Valid && itemValue.Valid {
-			pl.items = append(pl.items, playlistv1.PlaylistItem{
+			pl.items = append(pl.items, playlistv1.PlaylistPlaylistItem{
 				Type:  playlistv1.PlaylistPlaylistItemType(itemType.String),
 				Value: itemValue.String,
 			})

@@ -1013,9 +1013,6 @@
           }
         ]
       },
-      "PlaylistItem": {
-        "$ref": "#/components/schemas/PlaylistPlaylistItem"
-      },
       "PlaylistList": {
         "type": "object",
         "required": ["metadata", "items"],
@@ -1118,7 +1115,7 @@
           "items": {
             "type": "array",
             "items": {
-              "$ref": "#/components/schemas/PlaylistItem"
+              "$ref": "#/components/schemas/PlaylistPlaylistItem"
             }
           },
           "title": {

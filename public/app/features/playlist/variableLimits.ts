@@ -72,6 +72,23 @@ export const MAX_ENCODED_VARIABLES_LENGTH = 8192;
  */
 export const MAX_VARIABLE_VALUES_TEXT_LENGTH = 8192;
 
+/**
+ * UTF-16 code units the name input of the editor accepts, in the same unit and for the same reason
+ * as the values bound above.
+ *
+ * It is deliberately far above `MAX_VARIABLE_NAME_LENGTH` rather than equal to it. A `maxLength`
+ * equal to the limit does not tell the user anything: the browser drops the characters past it in
+ * silence, and what is left is a name of exactly the limit — acceptable input, committed as though
+ * it were what was typed, and never the name the user meant. Leaving the control wider than the
+ * limit is what lets the code-point check refuse the name and say why, with the typed text still
+ * in the field to correct.
+ *
+ * Sized as a bound on one control and nothing else: it is past twice the name limit, so even a
+ * name written entirely in astral characters — two code units each — is refused rather than
+ * clipped to exactly the limit, with room left for a pasted name to arrive whole and be reported.
+ */
+export const MAX_VARIABLE_NAME_TEXT_LENGTH = 1024;
+
 /** The prefix every playlist variable parameter carries, so a pair is measured as it is written. */
 const VAR_PARAM_PREFIX = 'var-';
 

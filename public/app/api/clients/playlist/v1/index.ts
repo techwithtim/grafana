@@ -1,10 +1,60 @@
+import { normalizeError } from '@grafana/api-clients';
 import { generatedAPI, type Playlist, type PlaylistSpec } from '@grafana/api-clients/rtkq/playlist/v1';
-import { getBackendSrv } from '@grafana/runtime';
+import { isObject } from '@grafana/data';
+import { t } from '@grafana/i18n';
+import { getBackendSrv, isFetchError } from '@grafana/runtime';
 
-import { createSuccessNotification } from '../../../../core/copy/appNotification';
+import { createErrorNotification, createSuccessNotification } from '../../../../core/copy/appNotification';
 import { notifyApp } from '../../../../core/reducers/appNotification';
 import { contextSrv } from '../../../../core/services/context_srv';
 import { handleError } from '../../../utils';
+
+/**
+ * Finds the underlying request failure in the two shapes a playlist error arrives in.
+ *
+ * A query hook exposes the value the base query returned, which is Grafana's `FetchError`. A
+ * mutation's `queryFulfilled` instead rejects with a `{ error, isUnhandledError, meta }` wrapper
+ * built by RTK Query, so the same failure has to be unwrapped one level before it can be
+ * recognised.
+ */
+function toFetchError(error: unknown) {
+  if (isFetchError(error)) {
+    return error;
+  }
+  if (isObject(error) && 'error' in error && isFetchError(error.error)) {
+    return error.error;
+  }
+  return undefined;
+}
+
+/**
+ * Turns a failed playlist request into a message written for the person reading it.
+ *
+ * A playlist request that fails reaches the UI as a Grafana `FetchError` whose `data` is the
+ * apiserver's `Status` object. For a conflict or a missing playlist that object's `message` names
+ * the internal resource — `playlists.playlist.grafana.app "<uid>"` — which tells a user nothing and
+ * describes an identifier they never chose. Those outcomes are therefore mapped to text that says
+ * what happened and what to do about it. Anything else falls back to the backend's own message,
+ * which is already phrased for a human, and never to the serialized error object: that carries the
+ * request URL, method and headers.
+ */
+export function getPlaylistErrorMessage(error: unknown): string {
+  const fetchError = toFetchError(error);
+
+  switch (fetchError?.status) {
+    case 403:
+      return t('playlist-edit.error-forbidden', 'You do not have permission to view or change this playlist.');
+    case 404:
+      return t('playlist-edit.error-not-found', 'This playlist no longer exists. It may have been deleted.');
+    case 409:
+      return t(
+        'playlist-edit.error-conflict',
+        'This playlist was changed somewhere else. Reload the page and apply your changes to the latest version.'
+      );
+    default:
+      return normalizeError(error);
+  }
+}
 
 export const playlistAPIv1 = generatedAPI.enhanceEndpoints({
   endpoints: {
@@ -45,7 +95,10 @@ export const playlistAPIv1 = generatedAPI.enhanceEndpoints({
           await queryFulfilled;
           dispatch(notifyApp(createSuccessNotification('Playlist updated')));
         } catch (e) {
-          handleError(e, dispatch, 'Unable to update playlist');
+          // Saving over a playlist someone else has already changed is the one failure a user hits
+          // in normal use, and the apiserver reports it by naming its own resource. Map it (and the
+          // other recognised reasons) rather than passing the raw message through `handleError`.
+          dispatch(notifyApp(createErrorNotification('Unable to update playlist', getPlaylistErrorMessage(e))));
         }
       },
     },

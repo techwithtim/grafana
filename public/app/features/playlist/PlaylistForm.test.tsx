@@ -1,7 +1,9 @@
-import { render, screen, waitFor, within } from '@testing-library/react';
+import { act, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent, { type UserEvent } from '@testing-library/user-event';
+import { useEffect } from 'react';
+import { render as renderWithRouter } from 'test/test-utils';
 
-import { setBackendSrv } from '@grafana/runtime';
+import { locationService, setBackendSrv } from '@grafana/runtime';
 import { getCustomSearchHandler } from '@grafana/test-utils/handlers';
 import server, { setupMockServer } from '@grafana/test-utils/server';
 import { type DashboardPickerDTO } from 'app/core/components/Select/DashboardPicker';
@@ -15,24 +17,42 @@ import * as playlistUtils from './utils';
 setBackendSrv(backendSrv);
 setupMockServer();
 
+// The real `TagFilter` compares its `tags` prop by reference and re-queries the dashboard tag
+// facets whenever that identity changes, so the stand-in records every reference it is handed.
+const mockTagFilterTagProps: string[][] = [];
+
 jest.mock('app/core/components/TagFilter/TagFilter', () => ({
-  TagFilter: () => {
+  TagFilter: ({ tags }: { tags: string[] }) => {
+    mockTagFilterTagProps.push(tags);
     return <>mocked-tag-filter</>;
   },
 }));
 
+// `jest.mock` factories are hoisted above the imports, so anything they reach for has to be
+// declared with a `mock`-prefixed name (babel-plugin-jest-hoist allows only those).
+const mockDashboardPickerMounts = { count: 0 };
+
 // The real picker is an async Select backed by dashboard search. A button standing in for it keeps
 // "add this dashboard" a single click, and `type="button"` matters: a submit button inside the
-// form's real <form> would save the playlist instead of adding an item.
+// form's real <form> would save the playlist instead of adding an item. The mount counter stands in
+// for the real picker's mount cost: it subscribes to dashboard and tag search when it mounts.
 jest.mock('app/core/components/Select/DashboardPicker', () => ({
-  DashboardPicker: ({ onChange }: { onChange: (dashboard: DashboardPickerDTO) => void }) => (
-    <button
-      type="button"
-      onClick={() => onChange({ uid: 'uid_1', name: 'Host dashboard', folderUid: 'folder_1', folderTitle: 'Folder 1' })}
-    >
-      mocked-dashboard-picker
-    </button>
-  ),
+  DashboardPicker: ({ onChange }: { onChange: (dashboard: DashboardPickerDTO) => void }) => {
+    useEffect(() => {
+      mockDashboardPickerMounts.count++;
+    }, []);
+
+    return (
+      <button
+        type="button"
+        onClick={() =>
+          onChange({ uid: 'uid_1', name: 'Host dashboard', folderUid: 'folder_1', folderTitle: 'Folder 1' })
+        }
+      >
+        mocked-dashboard-picker
+      </button>
+    );
+  },
 }));
 
 const mockPlaylist: Playlist = {
@@ -107,11 +127,115 @@ function getTestContext(playlist: Playlist = mockPlaylist) {
   return { onSubmitMock, playlist, rerender, unmount, user };
 }
 
-function rows() {
-  return screen.getAllByRole('row');
+/**
+ * Renders the form with an `onSubmit` the test supplies. `getTestContext` covers everything that
+ * only needs to observe what was submitted; this is for the cases that also need to control when
+ * the save settles, or to navigate from inside it the way the pages do.
+ */
+function renderWithSubmit(playlist: Playlist, onSubmit: jest.Mock) {
+  server.use(getCustomSearchHandler([]));
+  return setup(<PlaylistForm onSubmit={onSubmit} playlist={playlist} />);
 }
 
-/** The picker re-mounts on every add (`key={items.length}`), so it is queried again each time. */
+/**
+ * Renders the form inside the app's providers, which the unsaved-changes cases need: the location
+ * service they navigate through is created fresh per render (so one test's location cannot leak into
+ * the next), and the redirect the discard button performs goes through the router.
+ */
+function renderInApp(playlist: Playlist, onSubmit: jest.Mock = jest.fn()) {
+  server.use(getCustomSearchHandler([]));
+  return { onSubmitMock: onSubmit, ...renderWithRouter(<PlaylistForm onSubmit={onSubmit} playlist={playlist} />) };
+}
+
+/**
+ * An `onSubmit` whose promise the test settles by hand. The pages await their create/replace call
+ * before navigating, so the in-flight window is the whole request; controlling it here makes the
+ * assertions about that window exact rather than dependent on the wall clock.
+ */
+function controlledSubmit() {
+  let resolveSubmit = () => {};
+  const onSubmitMock = jest.fn(
+    () =>
+      new Promise<void>((resolve) => {
+        resolveSubmit = resolve;
+      })
+  );
+
+  return { onSubmitMock, settleSubmit: () => resolveSubmit() };
+}
+
+/**
+ * An in-app navigation attempt, as the app's own redirects and menu links make it. Wrapped in `act`
+ * because the guard answers it by opening a modal, which is a React state update originating from
+ * outside React.
+ */
+async function attemptNavigation(path: string) {
+  await act(async () => {
+    locationService.push(path);
+  });
+}
+
+function currentPath() {
+  return locationService.getLocation().pathname;
+}
+
+function unsavedChangesModal() {
+  return screen.queryByRole('dialog', { name: 'Leave page?' });
+}
+
+/**
+ * Dispatches the event the browser fires before a reload or a tab close, and reports whether it was
+ * cancelled — which is what makes the browser show its own "leave site?" dialog.
+ */
+function reloadIsBlocked(): boolean {
+  const event = new Event('beforeunload', { cancelable: true });
+  window.dispatchEvent(event);
+  return event.defaultPrevented;
+}
+
+/**
+ * Stubs the dashboard search so enrichment attaches a named dashboard to every item. The name is
+ * rendered in the row, so a test can wait for it and know the enrichment has merged into the item
+ * list before it asserts anything about unsaved changes.
+ */
+function stubDashboardEnrichment() {
+  return jest.spyOn(playlistUtils, 'loadDashboards').mockImplementation(async (items) =>
+    items.map((item) => ({
+      ...item,
+      dashboards: [
+        {
+          kind: 'dashboard',
+          name: `Dashboard ${item.value}`,
+          uid: item.value,
+          url: `/d/${item.value}/dashboard-${item.value}`,
+          panel_type: '',
+          tags: [],
+          location: 'general',
+          ds_uid: [],
+          score: 0,
+          explain: {},
+        },
+      ],
+    }))
+  );
+}
+
+/**
+ * The item list, and the rows of it.
+ *
+ * The rows are a `list` of `listitem` elements: a row owns the item's name, its controls and,
+ * while it is expanded, its variables editor — content a `row` may not own, in a place a `row`
+ * may not be, which is why neither role is here any more.
+ */
+function itemList() {
+  return screen.getByRole('list', { name: 'Playlist items' });
+}
+
+function rows() {
+  return within(itemList()).getAllByRole('listitem');
+}
+
+/** Stands in for the "Add by title" picker; one click adds `uid_1` to the item list. */
 function dashboardPickerButton() {
   return screen.getByRole('button', { name: 'mocked-dashboard-picker' });
 }
@@ -128,37 +252,28 @@ function disclosureStates() {
   return disclosureButtons().map((button) => button.getAttribute('aria-expanded'));
 }
 
-/**
- * The draggable wrapper of the row at `index`. The variables panel renders as a sibling of the
- * `role="row"` element rather than inside it, so the wrapper is the smallest element containing
- * both, and it is what confines a query to one row's editor when two rows hold the same dashboard.
- */
-function rowWrapper(index: number): HTMLElement {
-  const wrapper = rows()[index].parentElement;
-  if (!wrapper) {
-    throw new Error(`Row ${index} is not inside a draggable wrapper element`);
-  }
-  return wrapper;
-}
-
 function rowDisclosure(index: number) {
   return within(rows()[index]).getByRole('button', { name: 'Template variables' });
 }
 
 /**
  * The expanded variables panel of the row at `index`, reached by following that row's own
- * disclosure. Two rows listing the same dashboard label their panels identically, so the returned
- * region is provably the intended row's only because the disclosure that reports it controls
- * (`aria-controls`) lives in that row and the region carrying that id sits in that row's wrapper.
+ * disclosure.
+ *
+ * The returned region is provably the intended row's twice over: the disclosure reporting it
+ * controls (`aria-controls`) lives in that row, the region carrying that id is inside that row,
+ * and the region names the row's position, so a panel rendered under the wrong row of a
+ * duplicated dashboard fails here rather than passing as a correct one.
  */
 function variableEditorFor(index: number): HTMLElement {
   const disclosure = rowDisclosure(index);
   const controlledId = disclosure.getAttribute('aria-controls');
-  const region = within(rowWrapper(index)).getByRole('region');
+  const region = within(rows()[index]).getByRole('region');
 
   expect(disclosure).toHaveAttribute('aria-expanded', 'true');
   expect(region.id).not.toBe('');
   expect(region.id).toBe(controlledId);
+  expect(region).toHaveAccessibleName(new RegExp(`, item ${index + 1}$`));
 
   return region;
 }
@@ -196,6 +311,8 @@ function firstSubmittedPlaylist(onSubmitMock: jest.Mock): Playlist {
 
 describe('PlaylistForm', () => {
   beforeEach(() => {
+    mockDashboardPickerMounts.count = 0;
+    mockTagFilterTagProps.length = 0;
     jest.spyOn(console, 'error').mockImplementation(() => {});
   });
 
@@ -221,7 +338,25 @@ describe('PlaylistForm', () => {
     it('then items row count should be correct', () => {
       getTestContext();
 
-      expect(screen.getAllByRole('row')).toHaveLength(3);
+      expect(rows()).toHaveLength(3);
+    });
+
+    /**
+     * The rows are one item of a list each, and nothing about them is tabular.
+     *
+     * They used to be `role="row"` elements owning a `role="cell"`, which is invalid twice: a row
+     * has to be owned by a table, grid, treegrid or rowgroup, and there is none here, and a row
+     * may own nothing but cells, while these rows own a disclosure, a delete button, a drag handle
+     * and — while a row is expanded — a whole variables editor.
+     */
+    it('then the item rows are list items of a named list and carry no table roles', () => {
+      getTestContext();
+
+      expect(rows()).toHaveLength(3);
+      expect(screen.queryAllByRole('row')).toHaveLength(0);
+      expect(screen.queryAllByRole('cell')).toHaveLength(0);
+      expect(screen.queryAllByRole('table')).toHaveLength(0);
+      expect(screen.queryAllByRole('grid')).toHaveLength(0);
     });
 
     it('then the first item row should be correct', () => {
@@ -244,6 +379,40 @@ describe('PlaylistForm', () => {
       });
       expectCorrectRow({ index: 0, type: 'dashboard_by_uid', value: 'uid_1' });
       expectCorrectRow({ index: 1, type: 'dashboard_by_uid', value: 'uid_2' });
+    });
+  });
+
+  describe('when the item list changes structurally', () => {
+    it('then the dashboard picker is not re-mounted', async () => {
+      const { user } = getTestContext();
+
+      expect(rows()).toHaveLength(3);
+      expect(mockDashboardPickerMounts.count).toBe(1);
+
+      await user.click(dashboardPickerButton());
+      await waitFor(() => {
+        expect(rows()).toHaveLength(4);
+      });
+
+      await user.click(within(rows()[3]).getByRole('button', { name: /delete playlist item/i }));
+      await waitFor(() => {
+        expect(rows()).toHaveLength(3);
+      });
+
+      // Re-mounting the picker is what dropped keyboard focus to `document.body` after a selection
+      // and re-issued its dashboard and tag search requests, whose async default-options load runs
+      // on mount only. Adding and deleting an item are local edits, so the picker survives both.
+      expect(mockDashboardPickerMounts.count).toBe(1);
+
+      // The tag filter holds no tags here, but it reloads the dashboard tag facets whenever its
+      // `tags` prop changes identity — it compares by reference. The add and the delete above
+      // re-rendered this form several times, and every one of those renders has to hand the filter
+      // the same array, or a purely local edit of the item list issues search requests again.
+      expect(mockTagFilterTagProps.length).toBeGreaterThan(1);
+      expect(new Set(mockTagFilterTagProps).size).toBe(1);
+      expectCorrectRow({ index: 0, type: 'dashboard_by_uid', value: 'uid_1' });
+      expectCorrectRow({ index: 1, type: 'dashboard_by_uid', value: 'uid_2' });
+      expectCorrectRow({ index: 2, type: 'dashboard_by_tag', value: 'tag_A' });
     });
   });
 
@@ -356,8 +525,10 @@ describe('PlaylistForm', () => {
 
       expect(screen.getByText('1 variable')).toBeInTheDocument();
       const editor = await openVariableEditor(reloaded.user, 0);
-      expect(await within(editor).findByRole('textbox', { name: 'Variable name for host' })).toHaveValue('host');
-      expect(within(editor).getByRole('textbox', { name: 'Values for host' })).toHaveValue('a, b');
+      expect(await within(editor).findByRole('textbox', { name: 'Variable name for host, item 1' })).toHaveValue(
+        'host'
+      );
+      expect(within(editor).getByRole('textbox', { name: 'Values for host, item 1' })).toHaveValue('a, b');
     });
 
     it('submits distinct variables for two rows holding the same dashboard', async () => {
@@ -368,16 +539,16 @@ describe('PlaylistForm', () => {
       await user.click(dashboardPickerButton());
       await addVariable(user, 1, 'host', 'c');
 
-      // Both editors stay open on purpose. The two rows carry the same dashboard, so their rows and
-      // their panels are labelled identically and only the disclosure-to-panel association tells
-      // them apart; with one of the two closed, a panel rendered under the wrong row would look the
-      // same as a correct one. Each region is re-resolved through its own row's `aria-controls`
-      // here, so these assertions fail if that association is dropped or crossed over.
+      // Both editors stay open on purpose. The two rows carry the same dashboard, so only the
+      // disclosure-to-panel association and the position each panel names tell them apart; with
+      // one of the two closed, a panel rendered under the wrong row would look the same as a
+      // correct one. Each region is re-resolved through its own row's `aria-controls` here, so
+      // these assertions fail if that association is dropped or crossed over.
       const firstEditor = variableEditorFor(0);
       const secondEditor = variableEditorFor(1);
       expect(firstEditor.id).not.toBe(secondEditor.id);
-      expect(within(firstEditor).getByRole('textbox', { name: 'Values for host' })).toHaveValue('a, b');
-      expect(within(secondEditor).getByRole('textbox', { name: 'Values for host' })).toHaveValue('c');
+      expect(within(firstEditor).getByRole('textbox', { name: 'Values for host, item 1' })).toHaveValue('a, b');
+      expect(within(secondEditor).getByRole('textbox', { name: 'Values for host, item 2' })).toHaveValue('c');
 
       await user.click(saveButton());
 
@@ -399,6 +570,48 @@ describe('PlaylistForm', () => {
           status: {},
         });
       });
+    });
+
+    /**
+     * The arrangement the feature exists for, read the way a user reads it: one dashboard listed
+     * twice, both editors closed, and the two rows still telling the reader which entry plays
+     * which host — in their text and in the name assistive technology reports for them.
+     */
+    it('tells two closed rows of one dashboard apart by the variables each one plays', async () => {
+      const { user } = getTestContext(mockEmptyPlaylist);
+
+      await user.click(dashboardPickerButton());
+      await addVariable(user, 0, 'host', 'Host1');
+      await user.click(dashboardPickerButton());
+      await addVariable(user, 1, 'host', 'Host2');
+
+      await user.click(rowDisclosure(0));
+      await user.click(rowDisclosure(1));
+      expect(disclosureStates()).toEqual(['false', 'false']);
+
+      expectCorrectRow({ index: 0, type: 'dashboard_by_uid', value: 'uid_1', variables: 'host=Host1' });
+      expectCorrectRow({ index: 1, type: 'dashboard_by_uid', value: 'uid_1', variables: 'host=Host2' });
+      expect(rows()[0]).toHaveTextContent('· host=Host1');
+      expect(rows()[1]).toHaveTextContent('· host=Host2');
+      // The counts match, which is the case the summary exists for: it is the values, not the
+      // count, that separate the rows.
+      expect(screen.getAllByText('1 variable')).toHaveLength(2);
+    });
+
+    it('names each open editor and its controls after the row they belong to', async () => {
+      const { user } = getTestContext(mockEmptyPlaylist);
+
+      await user.click(dashboardPickerButton());
+      await addVariable(user, 0, 'host', 'Host1');
+      await user.click(dashboardPickerButton());
+      await addVariable(user, 1, 'host', 'Host2');
+
+      const firstEditor = variableEditorFor(0);
+      const secondEditor = variableEditorFor(1);
+      expect(firstEditor).toHaveAccessibleName('Template variables for uid_1, item 1');
+      expect(secondEditor).toHaveAccessibleName('Template variables for uid_1, item 2');
+      expect(within(firstEditor).getByRole('textbox', { name: 'Values for host, item 1' })).toHaveValue('Host1');
+      expect(within(secondEditor).getByRole('textbox', { name: 'Values for host, item 2' })).toHaveValue('Host2');
     });
 
     it('submits an item with no variables key once its last variable is removed', async () => {
@@ -436,7 +649,7 @@ describe('PlaylistForm', () => {
       ]);
     });
 
-    it('rejects a variable without a name and submits the items unchanged', async () => {
+    it('refuses to save a variable without a name, keeps the message, and saves once it is given one', async () => {
       const { onSubmitMock, user } = getTestContext(playlistWithVariables());
 
       const editor = await openVariableEditor(user, 0);
@@ -446,6 +659,16 @@ describe('PlaylistForm', () => {
       expect(await within(editor).findByText('Variable name is required')).toBeInTheDocument();
 
       await user.click(saveButton());
+
+      // Saving now would drop the text the user can see on screen and report that as a success, so
+      // the save stops and the editor stays open with its message.
+      expect(onSubmitMock).not.toHaveBeenCalled();
+      expect(within(editor).getByText('Variable name is required')).toBeInTheDocument();
+      expect(disclosureStates()).toEqual(['true', 'false']);
+
+      await user.type(newVariableName(editor), 'extra');
+      await user.click(saveButton());
+
       await waitFor(() => {
         expect(onSubmitMock).toHaveBeenCalledWith({
           apiVersion: 'playlist.grafana.app/v1',
@@ -454,7 +677,7 @@ describe('PlaylistForm', () => {
             title: 'A test playlist',
             interval: '10m',
             items: [
-              { type: 'dashboard_by_uid', value: 'uid_1', variables: { host: ['Host1'] } },
+              { type: 'dashboard_by_uid', value: 'uid_1', variables: { host: ['Host1'], extra: ['Host9'] } },
               { type: 'dashboard_by_uid', value: 'uid_2', variables: { host: ['Host2'] } },
               { type: 'dashboard_by_tag', value: 'tag_A' },
             ],
@@ -465,13 +688,103 @@ describe('PlaylistForm', () => {
           status: {},
         });
       });
+      expect(onSubmitMock).toHaveBeenCalledTimes(1);
+    });
+
+    it('saves a variable that was typed but never added', async () => {
+      const { onSubmitMock, user } = getTestContext(mockEmptyPlaylist);
+
+      await user.click(dashboardPickerButton());
+      const editor = await openVariableEditor(user, 0);
+      await user.type(newVariableName(editor), 'draft2');
+      await user.type(newVariableValues(editor), 'd2');
+
+      // No click on Add variable: the text is still in the add row when Save is pressed, and a
+      // playlist saved without it would report success while dropping what the user typed.
+      await user.click(saveButton());
+
+      await waitFor(() => {
+        expect(onSubmitMock).toHaveBeenCalledWith({
+          apiVersion: 'playlist.grafana.app/v1',
+          kind: 'Playlist',
+          spec: {
+            title: 'A test playlist',
+            interval: '10m',
+            items: [{ type: 'dashboard_by_uid', value: 'uid_1', variables: { draft2: ['d2'] } }],
+          },
+          metadata: {
+            name: 'foo',
+          },
+          status: {},
+        });
+      });
+      expect(onSubmitMock).toHaveBeenCalledTimes(1);
+    });
+
+    it('keeps a variable that was typed but never added when the row is collapsed and reopened', async () => {
+      const { user } = getTestContext(mockEmptyPlaylist);
+
+      await user.click(dashboardPickerButton());
+      const editor = await openVariableEditor(user, 0);
+      await user.type(newVariableName(editor), 'draft1');
+      await user.type(newVariableValues(editor), 'd1');
+
+      // Collapsing unmounts the panel and everything typed into it, so the variable has to have
+      // been added by the time the disclosure closes.
+      await user.click(rowDisclosure(0));
+
+      expect(await screen.findByText('1 variable')).toBeInTheDocument();
+      expect(disclosureStates()).toEqual(['false']);
+
+      const reopened = await openVariableEditor(user, 0);
+      expect(within(reopened).getByRole('textbox', { name: 'Variable name for draft1, item 1' })).toHaveValue('draft1');
+      expect(within(reopened).getByRole('textbox', { name: 'Values for draft1, item 1' })).toHaveValue('d1');
+    });
+
+    it('refuses to save an invalid edit of a committed variable, then saves the corrected value', async () => {
+      const { onSubmitMock, user } = getTestContext(playlistWithVariables());
+
+      const editor = await openVariableEditor(user, 0);
+      await user.clear(within(editor).getByRole('textbox', { name: 'Values for host, item 1' }));
+
+      // The click on Save is itself what leaves the field, so the rejection and the submit arrive
+      // in one interaction: saving through it would store the value the user had just replaced.
+      await user.click(saveButton());
+
+      expect(onSubmitMock).not.toHaveBeenCalled();
+      expect(await within(editor).findByText('Variable value is required')).toBeInTheDocument();
+      expect(disclosureStates()).toEqual(['true', 'false']);
+
+      await user.type(within(editor).getByRole('textbox', { name: 'Values for host, item 1' }), 'Host9');
+      await user.click(saveButton());
+
+      await waitFor(() => {
+        expect(onSubmitMock).toHaveBeenCalledWith({
+          apiVersion: 'playlist.grafana.app/v1',
+          kind: 'Playlist',
+          spec: {
+            title: 'A test playlist',
+            interval: '10m',
+            items: [
+              { type: 'dashboard_by_uid', value: 'uid_1', variables: { host: ['Host9'] } },
+              { type: 'dashboard_by_uid', value: 'uid_2', variables: { host: ['Host2'] } },
+              { type: 'dashboard_by_tag', value: 'tag_A' },
+            ],
+          },
+          metadata: {
+            name: 'foo',
+          },
+          status: {},
+        });
+      });
+      expect(onSubmitMock).toHaveBeenCalledTimes(1);
     });
 
     it('collapses every editor and leaves each remaining item its own variables when a row is deleted', async () => {
       const { onSubmitMock, user } = getTestContext(playlistWithVariables());
 
       const editor = await openVariableEditor(user, 0);
-      expect(await within(editor).findByRole('textbox', { name: 'Values for host' })).toHaveValue('Host1');
+      expect(await within(editor).findByRole('textbox', { name: 'Values for host, item 1' })).toHaveValue('Host1');
       expect(disclosureStates()).toEqual(['true', 'false']);
 
       await user.click(within(rows()[1]).getByRole('button', { name: /delete playlist item/i }));
@@ -602,17 +915,180 @@ describe('PlaylistForm', () => {
       ]);
     });
   });
+
+  describe('while a save is in flight', () => {
+    it('disables Save, reports aria-busy, and restores the button when the save comes back failed', async () => {
+      const { onSubmitMock, settleSubmit } = controlledSubmit();
+      const { user } = renderWithSubmit(mockPlaylist, onSubmitMock);
+
+      expect(saveButton()).toBeEnabled();
+      expect(saveButton()).toHaveAttribute('aria-busy', 'false');
+
+      await user.click(saveButton());
+
+      await waitFor(() => {
+        expect(saveButton()).toBeDisabled();
+      });
+      expect(saveButton()).toHaveAttribute('aria-busy', 'true');
+      expect(onSubmitMock).toHaveBeenCalledTimes(1);
+
+      // The pages report a failed save with an error notification and keep the user on the form, so
+      // the promise `doSubmit` awaits settles with the form still mounted.
+      settleSubmit();
+
+      await waitFor(() => {
+        expect(saveButton()).toBeEnabled();
+      });
+      expect(saveButton()).toHaveAttribute('aria-busy', 'false');
+
+      // The retry is one click: nothing else has to be re-entered or re-focused first.
+      await user.click(saveButton());
+      expect(onSubmitMock).toHaveBeenCalledTimes(2);
+    });
+
+    it('submits once for a double-click on Save', async () => {
+      const { onSubmitMock, settleSubmit } = controlledSubmit();
+      const { user } = renderWithSubmit(mockPlaylist, onSubmitMock);
+
+      await user.dblClick(saveButton());
+
+      await waitFor(() => {
+        expect(saveButton()).toBeDisabled();
+      });
+      expect(onSubmitMock).toHaveBeenCalledTimes(1);
+
+      settleSubmit();
+      await waitFor(() => {
+        expect(saveButton()).toBeEnabled();
+      });
+      expect(onSubmitMock).toHaveBeenCalledTimes(1);
+    });
+
+    it('submits once for three clicks on Save landing inside the same request', async () => {
+      const { onSubmitMock, settleSubmit } = controlledSubmit();
+      const { user } = renderWithSubmit(mockPlaylist, onSubmitMock);
+
+      await user.click(saveButton());
+      await user.click(saveButton());
+      await user.click(saveButton());
+
+      expect(onSubmitMock).toHaveBeenCalledTimes(1);
+
+      settleSubmit();
+      await waitFor(() => {
+        expect(saveButton()).toBeEnabled();
+      });
+      expect(onSubmitMock).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('when leaving the editor', () => {
+    it('lets a playlist that has not been edited go, including after its dashboards have loaded', async () => {
+      stubDashboardEnrichment();
+      renderInApp(playlistWithVariables());
+
+      // The loaded dashboards are added to the same item objects the guard compares, so the
+      // comparison is only proven correct once that enrichment has landed.
+      expect(await screen.findByText('Dashboard uid_1')).toBeInTheDocument();
+      // Both dashboard items of this playlist carry one variable, and both summaries survive the
+      // enrichment; the guard compares the same maps.
+      expect(screen.getAllByText('1 variable')).toHaveLength(2);
+      expect(reloadIsBlocked()).toBe(false);
+
+      await attemptNavigation('/dashboards');
+
+      expect(currentPath()).toBe('/dashboards');
+      expect(unsavedChangesModal()).not.toBeInTheDocument();
+    });
+
+    it('blocks the navigation and returns to the form when the name has been edited', async () => {
+      const { user } = renderInApp(mockPlaylist);
+
+      await user.type(screen.getByRole('textbox', { name: /name/i }), ' edited');
+
+      await attemptNavigation('/dashboards');
+
+      expect(await screen.findByRole('dialog', { name: 'Leave page?' })).toBeInTheDocument();
+      expect(currentPath()).toBe('/');
+
+      await user.click(screen.getByRole('button', { name: 'Continue editing' }));
+
+      await waitFor(() => {
+        expect(unsavedChangesModal()).not.toBeInTheDocument();
+      });
+      expect(currentPath()).toBe('/');
+      expect(screen.getByRole('textbox', { name: /name/i })).toHaveValue('A test playlist edited');
+    });
+
+    it('lets the navigation through once the unsaved changes are discarded', async () => {
+      const { user } = renderInApp(mockPlaylist);
+
+      await user.type(screen.getByRole('textbox', { name: /name/i }), ' edited');
+
+      await attemptNavigation('/dashboards');
+      expect(await screen.findByRole('dialog', { name: 'Leave page?' })).toBeInTheDocument();
+
+      await user.click(screen.getByRole('button', { name: 'Discard unsaved changes' }));
+
+      await waitFor(() => {
+        expect(currentPath()).toBe('/dashboards');
+      });
+      expect(unsavedChangesModal()).not.toBeInTheDocument();
+    });
+
+    it('blocks the navigation when a dashboard row has been added but nothing typed', async () => {
+      const { user } = renderInApp(mockPlaylist);
+
+      await user.click(dashboardPickerButton());
+      await waitFor(() => {
+        expect(rows()).toHaveLength(4);
+      });
+
+      await attemptNavigation('/dashboards');
+
+      expect(await screen.findByRole('dialog', { name: 'Leave page?' })).toBeInTheDocument();
+      expect(currentPath()).toBe('/');
+    });
+
+    it('blocks a reload only while there is unsaved input', async () => {
+      const { user } = renderInApp(mockPlaylist);
+
+      expect(reloadIsBlocked()).toBe(false);
+
+      await user.type(screen.getByRole('textbox', { name: /name/i }), ' edited');
+
+      expect(reloadIsBlocked()).toBe(true);
+    });
+
+    it('does not prompt when a successful save navigates away', async () => {
+      // The pages await their create/replace call and only then push the list route, from inside the
+      // `onSubmit` the form awaits — the one navigation the guard must never intercept.
+      const onSubmitMock = jest.fn(async () => {
+        locationService.push('/playlists');
+      });
+      const { user } = renderInApp(mockPlaylist, onSubmitMock);
+
+      await user.type(screen.getByRole('textbox', { name: /name/i }), ' edited');
+      await user.click(saveButton());
+
+      await waitFor(() => {
+        expect(currentPath()).toBe('/playlists');
+      });
+      expect(unsavedChangesModal()).not.toBeInTheDocument();
+      expect(onSubmitMock).toHaveBeenCalledTimes(1);
+    });
+  });
 });
 
 interface ExpectCorrectRowArgs {
   index: number;
   type: 'dashboard_by_tag' | 'dashboard_by_uid';
   value: string;
+  /** The variable summary the row's name ends with, for an item that carries variables. */
+  variables?: string;
 }
 
-function expectCorrectRow({ index, type, value }: ExpectCorrectRowArgs) {
-  const row = within(rows()[index]);
-  const cell = `Playlist item, ${type}, ${value}`;
-  const regex = new RegExp(cell, 'i');
-  expect(row.getByRole('cell', { name: regex })).toBeInTheDocument();
+function expectCorrectRow({ index, type, value, variables }: ExpectCorrectRowArgs) {
+  const name = `Playlist item, ${type}, ${value}${variables === undefined ? '' : `, ${variables}`}`;
+  expect(rows()[index]).toHaveAccessibleName(name);
 }

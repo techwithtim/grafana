@@ -3,7 +3,9 @@ package playlist
 import (
 	"context"
 	"fmt"
+	"io"
 
+	"k8s.io/apiserver/pkg/admission"
 	"k8s.io/apiserver/pkg/authorization/authorizer"
 	restclient "k8s.io/client-go/rest"
 
@@ -112,4 +114,92 @@ func (p *AppInstaller) GetAuthorizer() authorizer.Authorizer {
 			return authorizer.DecisionAllow, "", nil
 		},
 	)
+}
+
+// AdmissionPlugin wraps the App SDK's admission plugin so that a playlist write which
+// violates the item contract published in the generated OpenAPI document -- `required:
+// [type, value]`, the three-value `type` enum and `variables` as a map of non-empty string
+// lists -- is rejected with HTTP 422 Invalid instead of being persisted.
+//
+// Why the validation is invoked here as well as in apps/playlist/pkg/app/app.go, which is
+// not obvious: Grafana calls AdmissionPlugin once and puts the result into an
+// admission.NewChainHandler, whose Validate returns each handler's error verbatim. The SDK's
+// own plugin, however, passes every error the app's validator returns through
+// admission.NewForbidden, and the apiserver re-wraps anything that is not already Forbidden
+// -- so an error raised inside the app can only ever reach the client as HTTP 403 with its
+// field causes flattened into a message string. Running the same validation ahead of the
+// delegate here is what preserves the Invalid status and its per-field Details.Causes. The
+// call in app.go still covers wrappers that are not this apiserver (an operator or webhook
+// deployment), so neither call is redundant and neither should be deleted as duplication.
+//
+// The admission chain is shared with every other app installer, so this handler is consulted
+// for other groups' resources too. playlistapp.ValidatePlaylistObject returns nil for any
+// object that is not a Playlist, which is what makes those calls a cheap no-op; no second
+// group check is added here, because it could drift from the type switch that actually
+// decides.
+func (p *AppInstaller) AdmissionPlugin() admission.Factory {
+	delegateFactory := p.AppInstaller.AdmissionPlugin()
+	if delegateFactory == nil {
+		// The App SDK returns a nil factory only for a manifest that declares neither
+		// validation nor mutation; the playlist manifest declares both, so there is a
+		// delegate to wrap in practice.
+		return nil
+	}
+
+	return func(config io.Reader) (admission.Interface, error) {
+		delegate, err := delegateFactory(config)
+		if err != nil {
+			return nil, fmt.Errorf("creating the app sdk admission plugin for playlists: %w", err)
+		}
+		return &playlistAdmission{delegate: delegate}, nil
+	}
+}
+
+// playlistAdmission enforces the structural playlist item contract and then hands the
+// request to the App SDK's admission handler.
+type playlistAdmission struct {
+	// delegate is the App SDK handler. It is never nil in practice; the nil checks below
+	// keep a future SDK change from turning a missing handler into a panic that would take
+	// every resource write in the aggregated apiserver down with it.
+	delegate admission.Interface
+}
+
+// All three interfaces are implemented, and each one delegates, because the admission chain
+// type-asserts for MutationInterface and ValidationInterface separately and silently skips a
+// handler that does not implement the one it is looking for. A wrapper that dropped Admit
+// would therefore disable the app's mutation hook without any error.
+var (
+	_ admission.Interface           = (*playlistAdmission)(nil)
+	_ admission.MutationInterface   = (*playlistAdmission)(nil)
+	_ admission.ValidationInterface = (*playlistAdmission)(nil)
+)
+
+func (p *playlistAdmission) Handles(operation admission.Operation) bool {
+	if p.delegate == nil {
+		// Without a delegate the wrapper must still be consulted for the operations its own
+		// validation covers, which are exactly the ones the playlist manifest declares.
+		return operation == admission.Create || operation == admission.Update
+	}
+	return p.delegate.Handles(operation)
+}
+
+func (p *playlistAdmission) Admit(ctx context.Context, a admission.Attributes, o admission.ObjectInterfaces) error {
+	mutator, ok := p.delegate.(admission.MutationInterface)
+	if !ok {
+		return nil
+	}
+	return mutator.Admit(ctx, a, o)
+}
+
+func (p *playlistAdmission) Validate(ctx context.Context, a admission.Attributes, o admission.ObjectInterfaces) error {
+	obj := a.GetObject()
+	if errs := playlistapp.ValidatePlaylistObject(obj); len(errs) > 0 {
+		return playlistapp.NewPlaylistInvalidError(obj, errs)
+	}
+
+	validator, ok := p.delegate.(admission.ValidationInterface)
+	if !ok {
+		return nil
+	}
+	return validator.Validate(ctx, a, o)
 }

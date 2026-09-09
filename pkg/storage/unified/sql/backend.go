@@ -15,11 +15,8 @@ import (
 	"time"
 
 	"github.com/fullstorydev/grpchan/inprocgrpc"
-	"github.com/go-sql-driver/mysql"
 	"github.com/google/uuid"
 	"github.com/grafana/dskit/services"
-	"github.com/jackc/pgx/v5/pgconn"
-	"github.com/lib/pq"
 	"github.com/prometheus/client_golang/prometheus"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -42,7 +39,6 @@ import (
 	"github.com/grafana/grafana/pkg/storage/unified/sql/rvmanager"
 	"github.com/grafana/grafana/pkg/storage/unified/sql/sqltemplate"
 	"github.com/grafana/grafana/pkg/util/debouncer"
-	"github.com/grafana/grafana/pkg/util/sqlite"
 )
 
 var tracer = otel.Tracer("github.com/grafana/grafana/pkg/storage/unified/sql")
@@ -979,30 +975,13 @@ func (b *backend) create(ctx context.Context, event resource.WriteEvent) (int64,
 }
 
 // IsRowAlreadyExistsError checks if the error is the result of the row inserted already existing.
+//
+// The per-driver classification lives in dbutil, which is where a failing
+// statement is turned into an error, so that the same condition is recognised
+// both here — where it becomes 409 AlreadyExists — and by dbutil's failure
+// logging, which must not report an expected duplicate as a server fault.
 func IsRowAlreadyExistsError(err error) bool {
-	if sqlite.IsUniqueConstraintViolation(err) {
-		return true
-	}
-
-	var pg *pgconn.PgError
-	if errors.As(err, &pg) {
-		// https://www.postgresql.org/docs/current/errcodes-appendix.html
-		return pg.Code == "23505" // unique_violation
-	}
-
-	var pqerr *pq.Error
-	if errors.As(err, &pqerr) {
-		// https://www.postgresql.org/docs/current/errcodes-appendix.html
-		return pqerr.Code == "23505" // unique_violation
-	}
-
-	var mysqlerr *mysql.MySQLError
-	if errors.As(err, &mysqlerr) {
-		// https://dev.mysql.com/doc/mysql-errors/8.0/en/server-error-reference.html
-		return mysqlerr.Number == 1062 // ER_DUP_ENTRY
-	}
-
-	return false
+	return dbutil.IsUniqueViolation(err)
 }
 
 func (b *backend) update(ctx context.Context, event resource.WriteEvent) (int64, error) {

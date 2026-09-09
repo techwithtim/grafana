@@ -10,17 +10,34 @@ import (
 	"strings"
 	"text/template"
 
+	"github.com/go-sql-driver/mysql"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/lib/pq"
 	"go.opentelemetry.io/otel/attribute"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	"github.com/grafana/grafana-app-sdk/logging"
 
 	"github.com/grafana/grafana/pkg/storage/unified/sql/db"
 	"github.com/grafana/grafana/pkg/storage/unified/sql/db/otel"
 	"github.com/grafana/grafana/pkg/storage/unified/sql/sqltemplate"
+	"github.com/grafana/grafana/pkg/util/sqlite"
 )
 
 const (
 	otelAttrBaseKey         = "dbutil_"
 	otelAttrTemplateNameKey = otelAttrBaseKey + "template"
 	otelAttrDialectKey      = otelAttrBaseKey + "dialect"
+)
+
+const (
+	// loggerName identifies this package in the server log, matching the name
+	// used by the transaction boundary logging in the db package.
+	loggerName = "unified-storage-sql"
+
+	// sqlFailureLogMsg is a stable message so that a failed database operation
+	// can be alerted on without parsing the driver error.
+	sqlFailureLogMsg = "database operation failed"
 )
 
 func withOtelAttrs(ctx context.Context, tmplName, dialectName string) context.Context {
@@ -55,6 +72,27 @@ func (e SQLError) Error() string {
 	return fmt.Sprintf("%s: %s with %d input arguments and %d output "+
 		"destination arguments: %v; query: %s", e.TemplateName, e.CallType,
 		len(e.arguments), len(e.ScanDest), e.Err, e.Query)
+}
+
+// Status implements k8s.io/apimachinery/pkg/api/errors.APIStatus so that the
+// unified storage error mapping (resource.AsErrorResult) builds the client
+// response from this generic envelope instead of falling back to Error(),
+// whose text names the query template file, the executed statement and the
+// tables and columns it touches. Everything Error() reports is operator-facing
+// detail: it stays in the server log (see logSQLFailure) and never reaches an
+// API client, on either the resource surface or the legacy REST surface.
+//
+// The receiver is a value because SQLError is returned by value, and the
+// mapping resolves the status with errors.As, which therefore also finds it
+// through the wrapping the SQL backend applies on the way out (for example
+// fmt.Errorf("transactional operation: %w", err)).
+//
+// The envelope is chosen from the wrapped driver error: database contention
+// keeps a retryable shape (see db.StatusForError), because withholding the
+// driver text would otherwise leave a caller unable to tell a lost race for the
+// database from a server that is actually broken.
+func (e SQLError) Status() metav1.Status {
+	return db.StatusForError(e.Err)
 }
 
 // Debug provides greater detail about the SQL error. It is defined on the same
@@ -93,6 +131,81 @@ func Debug(err error) error {
 	return err
 }
 
+// IsUniqueViolation reports whether err is the database rejecting a row because
+// it already exists, for every driver unified storage supports.
+//
+// Unified storage uses that rejection as control flow rather than as a failure:
+// the SQL backend turns it into resource.ErrResourceAlreadyExists, which the API
+// surfaces as 409 AlreadyExists (see IsRowAlreadyExistsError in the sql package,
+// which delegates here). It lives in this package because the failure logging
+// below has to recognise the same condition, and the sql package imports this
+// one, so this is the lowest point both can share.
+func IsUniqueViolation(err error) bool {
+	if sqlite.IsUniqueConstraintViolation(err) {
+		return true
+	}
+
+	var pg *pgconn.PgError
+	if errors.As(err, &pg) {
+		// https://www.postgresql.org/docs/current/errcodes-appendix.html
+		return pg.Code == "23505" // unique_violation
+	}
+
+	var pqerr *pq.Error
+	if errors.As(err, &pqerr) {
+		// https://www.postgresql.org/docs/current/errcodes-appendix.html
+		return pqerr.Code == "23505" // unique_violation
+	}
+
+	var mysqlerr *mysql.MySQLError
+	if errors.As(err, &mysqlerr) {
+		// https://dev.mysql.com/doc/mysql-errors/8.0/en/server-error-reference.html
+		return mysqlerr.Number == 1062 // ER_DUP_ENTRY
+	}
+
+	return false
+}
+
+// logSQLFailure records the operator-facing detail of a failed database
+// operation: the query template, the kind of call, the driver error and the
+// executed statement, plus the argument and scan destination counts. This is
+// the only place that detail is emitted now that it is withheld from the
+// client, so it is logged where the failure happens rather than where the
+// response is built.
+//
+// Three classes of wrapped error are not storage faults and are logged below
+// error level so they cannot drown real failures: sql.ErrNoRows, which is the
+// ordinary "object not found" outcome; context cancellation or deadline expiry,
+// which are client disconnects; and a unique-constraint violation, which is how
+// the backend detects that an object already exists and answers 409 — logging
+// that at error level would report every duplicate name, and every write that
+// loses a create race, as a server fault.
+//
+// Statement arguments are never logged. They are the potentially regulated
+// information that SQLError keeps unexported, and only Debug() — a local
+// debugging aid — renders them.
+func logSQLFailure(ctx context.Context, e SQLError) {
+	logger := logging.FromContext(ctx).With(
+		"logger", loggerName,
+		"template", e.TemplateName,
+		"callType", e.CallType,
+		"inputArguments", len(e.arguments),
+		"outputDestinations", len(e.ScanDest),
+		"query", e.Query,
+		"error", fmt.Sprintf("%v", e.Err),
+	)
+
+	switch {
+	case errors.Is(e.Err, sql.ErrNoRows),
+		errors.Is(e.Err, context.Canceled),
+		errors.Is(e.Err, context.DeadlineExceeded),
+		IsUniqueViolation(e.Err):
+		logger.Debug(sqlFailureLogMsg)
+	default:
+		logger.Error(sqlFailureLogMsg)
+	}
+}
+
 // Exec uses `req` as input for a non-data returning query generated with
 // `tmpl`, and executed in `x`.
 func Exec(ctx context.Context, x db.ContextExecer, tmpl *template.Template, req sqltemplate.SQLTemplate) (db.Result, error) {
@@ -111,7 +224,7 @@ func Exec(ctx context.Context, x db.ContextExecer, tmpl *template.Template, req 
 	ctx = withOtelAttrs(ctx, tmpl.Name(), req.DialectName())
 	res, err := x.ExecContext(ctx, query, args...)
 	if err != nil {
-		return nil, SQLError{
+		sqlErr := SQLError{
 			Err:          err,
 			CallType:     "Exec",
 			TemplateName: tmpl.Name(),
@@ -119,6 +232,9 @@ func Exec(ctx context.Context, x db.ContextExecer, tmpl *template.Template, req 
 			Query:        query,
 			RawQuery:     rawQuery,
 		}
+		logSQLFailure(ctx, sqlErr)
+
+		return nil, sqlErr
 	}
 
 	return res, nil
@@ -142,7 +258,7 @@ func QueryRows(ctx context.Context, x db.ContextExecer, tmpl *template.Template,
 	ctx = withOtelAttrs(ctx, tmpl.Name(), req.DialectName())
 	rows, err := x.QueryContext(ctx, query, args...)
 	if err != nil {
-		return nil, SQLError{
+		sqlErr := SQLError{
 			Err:          err,
 			CallType:     "Query",
 			TemplateName: tmpl.Name(),
@@ -151,6 +267,9 @@ func QueryRows(ctx context.Context, x db.ContextExecer, tmpl *template.Template,
 			Query:        query,
 			RawQuery:     rawQuery,
 		}
+		logSQLFailure(ctx, sqlErr)
+
+		return nil, sqlErr
 	}
 	return rows, err
 }

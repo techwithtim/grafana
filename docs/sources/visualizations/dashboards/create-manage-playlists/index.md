@@ -53,6 +53,8 @@ You can start a playlist in four different view modes. View modes determine how 
    - **Variables**
    - **Dashboard links**
 
+   Grafana applies the template variable values of each playlist item to the dashboard URL and displays them in the dashboard's variable controls. If you clear **Variables**, or you start the playlist in **Kiosk** mode, Grafana still applies the values, but the dashboard doesn't display them, so consecutive items that play the same dashboard look identical.
+
 1. Click **Start \<playlist name\>**.
 
 The playlist displays each dashboard for the time specified in the **Interval** field, set when creating or editing a playlist. After a playlist starts, you can start or stop it it using the [controls](#playlist-controls) at the top of your screen.
@@ -74,9 +76,13 @@ The playlist displays each dashboard for the time specified in the **Interval** 
 
 You can control a playlist in **Normal** mode after it's started, using the buttons at the top of your screen. Press the `Esc` key to stop the playlist.
 
-- **Next (double-right arrow)** - Advances to the next dashboard.
-- **Back (double-left arrow)** - Returns to the previous dashboard.
+- **Next (double-right arrow)** - Advances to the next dashboard. On the last dashboard, it returns to the first dashboard.
+- **Back (double-left arrow)** - Returns to the previous dashboard. On the first dashboard, it returns to the last dashboard.
 - **Stop playlist** - Ends the playlist, and exits to the current dashboard.
+
+Grafana doesn't display the playlist controls in **Kiosk** mode. Press the `Esc` key to exit kiosk mode and display them, including **Stop playlist**.
+
+If you use your browser's back or forward button while a playlist plays, Grafana ends the playlist and displays a **Playlist stopped** notification.
 
 ## Create a playlist
 

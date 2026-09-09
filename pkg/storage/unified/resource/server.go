@@ -955,11 +955,15 @@ func (s *server) newEvent(ctx context.Context, user claims.AuthInfo, key *resour
 		return nil, NewBadRequestError(
 			fmt.Sprintf("key/name do not match (key: %s, name: %s)", key.Name, obj.GetName()))
 	}
+	// Name violations on a write are field violations, not malformed requests:
+	// they answer 422 Invalid with metadata.name in details.causes, the same
+	// envelope verifyRequestKey produces for the request key and the API server
+	// produces for the name violations it catches itself.
 	if errs := validation.IsValidGrafanaName(obj.GetName()); errs != nil {
-		return nil, NewBadRequestError(errs[0])
+		return nil, NewInvalidNameError(key, errs[0])
 	}
 	if errs := validation.IsReservedName(obj.GetName()); errs != nil {
-		return nil, NewBadRequestError(errs[0])
+		return nil, NewInvalidNameError(key, errs[0])
 	}
 
 	// For folder moves, we need to check permissions on both folders
@@ -1065,7 +1069,7 @@ func (s *server) Create(ctx context.Context, req *resourcepb.CreateRequest) (*re
 	defer s.inflight.Done()
 
 	if r := verifyRequestKey(req.Key); r != nil {
-		return nil, status.Error(codes.InvalidArgument, r.Message)
+		return nil, ErrorResultAsGRPCError(r)
 	}
 
 	rsp := &resourcepb.CreateResponse{}
@@ -1194,7 +1198,7 @@ func (s *server) Update(ctx context.Context, req *resourcepb.UpdateRequest) (*re
 	defer s.inflight.Done()
 
 	if r := verifyRequestKey(req.Key); r != nil {
-		return nil, status.Error(codes.InvalidArgument, r.Message)
+		return nil, ErrorResultAsGRPCError(r)
 	}
 
 	rsp := &resourcepb.UpdateResponse{}
@@ -1291,7 +1295,7 @@ func (s *server) Delete(ctx context.Context, req *resourcepb.DeleteRequest) (*re
 	defer s.inflight.Done()
 
 	if r := verifyRequestKey(req.Key); r != nil {
-		return nil, status.Error(codes.InvalidArgument, r.Message)
+		return nil, ErrorResultAsGRPCError(r)
 	}
 
 	rsp := &resourcepb.DeleteResponse{}
@@ -1415,7 +1419,7 @@ func (s *server) Read(ctx context.Context, req *resourcepb.ReadRequest) (*resour
 	// NotFound, matching K8s Get semantics. Strict name validation belongs on
 	// writes (Create/Update/Delete).
 	if r := verifyRequestKeyCollection(req.Key); r != nil {
-		return nil, status.Error(codes.InvalidArgument, r.Message)
+		return nil, ErrorResultAsGRPCError(r)
 	}
 
 	var (
@@ -1511,7 +1515,7 @@ func (s *server) RecordEvent(ctx context.Context, req *resourcepb.RecordEventReq
 		return nil, status.Error(codes.Unauthenticated, "no user found in context")
 	}
 	if r := verifyRequestKey(req.Key); r != nil {
-		return nil, status.Error(codes.InvalidArgument, r.Message)
+		return nil, ErrorResultAsGRPCError(r)
 	}
 
 	if err := s.statsIngester.RecordEvent(ctx, req.Key, req.Events); err != nil {
@@ -1536,7 +1540,7 @@ func (s *server) GetResourceDailyStats(req *resourcepb.GetResourceDailyStatsRequ
 		return status.Error(codes.Unauthenticated, "no user found in context")
 	}
 	if r := verifyRequestKey(req.Key); r != nil {
-		return status.Error(codes.InvalidArgument, r.Message)
+		return ErrorResultAsGRPCError(r)
 	}
 	if err := s.checkStatsReadAccess(ctx, user, req.Key); err != nil {
 		return err
@@ -1561,7 +1565,7 @@ func (s *server) List(ctx context.Context, req *resourcepb.ListRequest) (*resour
 		return nil, status.Error(codes.InvalidArgument, "missing list options")
 	}
 	if r := verifyRequestKeyCollection(req.Options.Key); r != nil {
-		return nil, status.Error(codes.InvalidArgument, r.Message)
+		return nil, ErrorResultAsGRPCError(r)
 	}
 	span.SetAttributes(attribute.String("group", req.Options.Key.Group), attribute.String("resource", req.Options.Key.Resource))
 
@@ -1640,7 +1644,15 @@ func (s *server) List(ctx context.Context, req *resourcepb.ListRequest) (*resour
 	}
 
 	if req.NextPageToken != "" {
-		if token, err := GetContinueToken(req.NextPageToken); err == nil && tokenFromOtherListPath(token, false) {
+		token, err := GetContinueToken(req.NextPageToken)
+		if err != nil {
+			// The token is client-supplied, so one that does not decode is a bad
+			// request. Rejecting it here rather than letting it reach the backend
+			// makes every backend — SQL, KV and search-backed — answer the same
+			// 400, instead of each one's decode failure surfacing as a 500.
+			return &resourcepb.ListResponse{Error: AsErrorResult(err)}, nil
+		}
+		if tokenFromOtherListPath(token, false) {
 			return &resourcepb.ListResponse{
 				Error: NewBadRequestError("continue token was issued for a search-backed list"),
 			}, nil
@@ -1976,7 +1988,7 @@ func (s *server) Watch(req *resourcepb.WatchRequest, srv resourcepb.ResourceStor
 		return status.Error(codes.InvalidArgument, "missing watch options")
 	}
 	if r := verifyRequestKeyCollection(req.Options.Key); r != nil {
-		return status.Error(codes.InvalidArgument, r.Message)
+		return ErrorResultAsGRPCError(r)
 	}
 
 	key := req.Options.Key

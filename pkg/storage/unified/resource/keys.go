@@ -15,8 +15,13 @@ func verifyRequestKey(key *resourcepb.ResourceKey) *resourcepb.ErrorResult {
 	if err := verifyRequestKeyNamespaceGroupResource(key); err != nil {
 		return NewBadRequestError(err.Message)
 	}
+	// A malformed namespace/group/resource is a bad request — the client
+	// addressed something that cannot exist. A name that fails validation is a
+	// field violation on the object being addressed, so it gets the 422 Invalid
+	// envelope that every other metadata.name violation produces, with the field
+	// named in details.causes.
 	if err := validation.IsValidGrafanaName(key.Name); err != nil {
-		return NewBadRequestError(err[0])
+		return NewInvalidNameError(key, err[0])
 	}
 	return nil
 }

@@ -1,5 +1,6 @@
-import { act, render, screen } from '@testing-library/react';
-import { of } from 'rxjs';
+import { act, render, screen, waitFor, within } from '@testing-library/react';
+import userEvent, { type UserEvent } from '@testing-library/user-event';
+import { from, of } from 'rxjs';
 import { TestProvider } from 'test/helpers/TestProvider';
 
 import { locationService } from '@grafana/runtime';
@@ -197,6 +198,157 @@ describe('PlaylistPage', () => {
           expect(screen.queryByRole('button', { name: /Delete playlist/i })).not.toBeInTheDocument();
         });
       });
+    });
+  });
+
+  describe('focus after the delete confirmation dialog closes', () => {
+    interface SeededPlaylist {
+      name: string;
+      title: string;
+    }
+
+    /**
+     * Answers the list GET with the seeded playlists, the DELETE with an empty body, and every
+     * request made after a deletion with the playlists that survive it — which is what the
+     * refetch triggered by the invalidated `Playlist` tag picks up.
+     *
+     * With `deferRefetch`, that post-deletion response is held back until the returned
+     * `releaseRefetch` is called, so a test can interact with the page while the deleted card is
+     * still on screen.
+     */
+    function mockPlaylistBackend(seeded: SeededPlaylist[], { deferRefetch = false } = {}) {
+      const deleted = new Set<string>();
+      let releaseRefetch: (() => void) | undefined;
+      const refetchGate = new Promise<void>((resolve) => {
+        releaseRefetch = resolve;
+      });
+
+      const listResponse = () =>
+        createFetchResponse({
+          items: seeded
+            .filter(({ name }) => !deleted.has(name))
+            .map(({ name, title }) => ({
+              spec: { title, interval: '10m', items: [] },
+              metadata: { name, uid: `uid-${name}` },
+            })),
+        });
+
+      jest.spyOn(backendSrv, 'fetch').mockImplementation((options) => {
+        if (options.method === 'DELETE') {
+          deleted.add(options.url.split('/').pop() ?? '');
+          return of(createFetchResponse({}));
+        }
+        if (deferRefetch && deleted.size > 0) {
+          return from(refetchGate.then(() => listResponse()));
+        }
+        return of(listResponse());
+      });
+
+      return { releaseRefetch: () => releaseRefetch?.() };
+    }
+
+    /** Focuses the first card's "Delete playlist" button and opens the confirmation dialog. */
+    async function openDeleteDialog(user: UserEvent) {
+      const [deleteButton] = await screen.findAllByRole('button', { name: /delete playlist/i });
+      deleteButton.focus();
+      await user.click(deleteButton);
+      return { deleteButton, dialog: await screen.findByRole('dialog') };
+    }
+
+    beforeEach(() => {
+      // Legacy (playlistsRBAC off) write access, so the cards render "Delete playlist" and the
+      // page renders its "New playlist" action.
+      (contextSrv as jest.Mocked<typeof contextSrv>).isEditor = true;
+    });
+
+    it('moves focus to the "New playlist" link when the confirmed deletion unmounts the card', async () => {
+      mockPlaylistBackend([
+        { name: 'playlist-a', title: 'Playlist A' },
+        { name: 'playlist-b', title: 'Playlist B' },
+      ]);
+      const user = userEvent.setup();
+      setup();
+
+      const { dialog } = await openDeleteDialog(user);
+      await user.click(within(dialog).getByRole('button', { name: 'Delete' }));
+
+      await waitFor(() => expect(screen.queryByText('Playlist A')).not.toBeInTheDocument());
+      expect(screen.getByText('Playlist B')).toBeInTheDocument();
+      expect(screen.getByRole('link', { name: /new playlist/i })).toHaveFocus();
+      expect(document.body).not.toHaveFocus();
+    });
+
+    it('moves focus to the empty-state "Create playlist" link when the last playlist is deleted', async () => {
+      mockPlaylistBackend([{ name: 'playlist-a', title: 'Playlist A' }]);
+      const user = userEvent.setup();
+      setup();
+
+      const { dialog } = await openDeleteDialog(user);
+      await user.click(within(dialog).getByRole('button', { name: 'Delete' }));
+
+      expect(await screen.findByText('There are no playlists created yet')).toBeInTheDocument();
+      expect(screen.getByRole('link', { name: /create playlist/i })).toHaveFocus();
+      expect(document.body).not.toHaveFocus();
+    });
+
+    it('returns focus to the "Delete playlist" button when the dialog is cancelled', async () => {
+      mockPlaylistBackend([
+        { name: 'playlist-a', title: 'Playlist A' },
+        { name: 'playlist-b', title: 'Playlist B' },
+      ]);
+      const user = userEvent.setup();
+      setup();
+
+      const { deleteButton, dialog } = await openDeleteDialog(user);
+      await user.click(within(dialog).getByRole('button', { name: 'Cancel' }));
+
+      await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+      expect(screen.getByText('Playlist A')).toBeInTheDocument();
+      expect(deleteButton).toHaveFocus();
+    });
+
+    it('returns focus to the "Delete playlist" button when the dialog is dismissed with Escape', async () => {
+      mockPlaylistBackend([
+        { name: 'playlist-a', title: 'Playlist A' },
+        { name: 'playlist-b', title: 'Playlist B' },
+      ]);
+      const user = userEvent.setup();
+      setup();
+
+      const { deleteButton } = await openDeleteDialog(user);
+      await user.keyboard('{Escape}');
+
+      await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+      expect(deleteButton).toHaveFocus();
+    });
+
+    it('leaves focus alone when the user moved it elsewhere before the deleted card unmounted', async () => {
+      const { releaseRefetch } = mockPlaylistBackend(
+        [
+          { name: 'playlist-a', title: 'Playlist A' },
+          { name: 'playlist-b', title: 'Playlist B' },
+        ],
+        { deferRefetch: true }
+      );
+      const user = userEvent.setup();
+      setup();
+
+      const { dialog } = await openDeleteDialog(user);
+      await user.click(within(dialog).getByRole('button', { name: 'Delete' }));
+      await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+
+      // The deletion is through but its refetch has not landed, so the card — and the user's own
+      // choice of where to put focus — are both still there.
+      const searchInput = screen.getByPlaceholderText('Search by name or type');
+      await user.click(searchInput);
+      expect(searchInput).toHaveFocus();
+
+      await act(async () => {
+        releaseRefetch();
+      });
+
+      await waitFor(() => expect(screen.queryByText('Playlist A')).not.toBeInTheDocument());
+      expect(searchInput).toHaveFocus();
     });
   });
 

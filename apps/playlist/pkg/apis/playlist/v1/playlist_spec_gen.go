@@ -2,14 +2,6 @@
 
 package v1
 
-// +k8s:openapi-gen=true
-type PlaylistItem = PlaylistPlaylistItem
-
-// NewPlaylistItem creates a new PlaylistItem object.
-func NewPlaylistItem() *PlaylistItem {
-	return NewPlaylistPlaylistItem()
-}
-
 // Shared item definition for all versions
 // +k8s:openapi-gen=true
 type PlaylistPlaylistItem struct {
@@ -41,15 +33,15 @@ func (PlaylistPlaylistItem) OpenAPIModelName() string {
 
 // +k8s:openapi-gen=true
 type PlaylistSpec struct {
-	Title    string         `json:"title"`
-	Interval string         `json:"interval"`
-	Items    []PlaylistItem `json:"items"`
+	Title    string                 `json:"title"`
+	Interval string                 `json:"interval"`
+	Items    []PlaylistPlaylistItem `json:"items"`
 }
 
 // NewPlaylistSpec creates a new PlaylistSpec object.
 func NewPlaylistSpec() *PlaylistSpec {
 	return &PlaylistSpec{
-		Items: []PlaylistItem{},
+		Items: []PlaylistPlaylistItem{},
 	}
 }
 

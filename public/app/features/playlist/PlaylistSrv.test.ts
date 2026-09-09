@@ -2,6 +2,7 @@ import { type Store } from 'redux';
 import configureMockStore from 'redux-mock-store';
 
 import { locationService, logWarning } from '@grafana/runtime';
+import { appEvents } from 'app/core/app_events';
 import { setStore } from 'app/store/store';
 
 import { type Playlist, type PlaylistSpec } from '../../api/clients/playlist/v1';
@@ -232,9 +233,58 @@ describe('PlaylistSrv', () => {
   });
 
   it('Should stop playlist when navigating away', async () => {
+    const publishSpy = jest.spyOn(appEvents, 'publish');
+
     await srv.start(mockPlaylist);
 
     locationService.push('/datasources');
+
+    expect(srv.state.isPlaying).toBe(false);
+    // A playlist that ends because the viewer went somewhere else says so, rather than leaving the
+    // playback controls to vanish without explanation.
+    expect(publishSpy).toHaveBeenCalledWith({
+      type: 'alert-info',
+      payload: ['Playlist stopped', 'Navigating away from a playlist dashboard ends the playlist.'],
+    });
+  });
+
+  it('does not announce a stop that the viewer asked for', async () => {
+    await srv.start(mockPlaylist);
+    const publishSpy = jest.spyOn(appEvents, 'publish');
+
+    srv.stop();
+
+    expect(srv.state.isPlaying).toBe(false);
+    expect(publishSpy).not.toHaveBeenCalled();
+  });
+
+  it('stops playback and explains why when the browser goes back to the entry of another item', async () => {
+    const publishSpy = jest.spyOn(appEvents, 'publish');
+
+    // Both items play the same dashboard, which is the case a pathname comparison cannot see: the
+    // entry the browser goes back to has the pathname the playlist considers its own.
+    await srv.start(
+      playlistWithItems([
+        { type: 'dashboard_by_uid', value: 'aaa', variables: { host: ['one'] } },
+        { type: 'dashboard_by_uid', value: 'aaa', variables: { host: ['two'] } },
+      ])
+    );
+    srv.next();
+    expect(getLastHistoryEntry().search).toBe('?var-host=two');
+
+    locationService.getHistory().goBack();
+
+    expect(srv.state.isPlaying).toBe(false);
+    expect(publishSpy).toHaveBeenCalledWith({
+      type: 'alert-info',
+      payload: ['Playlist stopped', 'Navigating away from a playlist dashboard ends the playlist.'],
+    });
+  });
+
+  it('stops playback when the browser goes back out of the playlist entirely', async () => {
+    await srv.start(mockPlaylist);
+
+    locationService.getHistory().goBack();
 
     expect(srv.state.isPlaying).toBe(false);
   });
@@ -408,27 +458,164 @@ describe('PlaylistSrv', () => {
     expect(srv.state.isPlaying).toBe(true);
   });
 
-  it('adds no history entry for a playlist with no items', async () => {
+  it('reports a playlist it started', async () => {
+    const result = await srv.start(mockPlaylist);
+
+    expect(result).toEqual({ started: true });
+    expect(srv.state.isPlaying).toBe(true);
+  });
+
+  it('reports the reason, stays stopped and adds no history entry for a playlist with no items', async () => {
     const entryCountBefore = getHistoryEntries().length;
     const entryBefore = getLastHistoryEntry();
 
-    await srv.start(playlistWithItems([]));
+    const result = await srv.start(playlistWithItems([]));
 
+    expect(result).toEqual({ started: false, failureReason: 'no-items' });
+    // Reporting a playlist as playing when it has nothing to play is what left the start page blank:
+    // the page could not explain itself and the toolbar showed controls for a playlist going nowhere.
+    expect(srv.state.isPlaying).toBe(false);
     expect(getHistoryEntries()).toHaveLength(entryCountBefore);
     expect(getLastHistoryEntry()).toBe(entryBefore);
   });
 
-  it('adds no history entry when no item resolves to a dashboard', async () => {
+  it('reports the reason, stays stopped and adds no history entry when no item resolves to a dashboard', async () => {
     // The default stub resolves one dashboard per item, while a search that matches nothing resolves
     // the item with an empty dashboard list, which is what leaves the playlist with no entries.
     jest.mocked(loadDashboards).mockResolvedValueOnce([{ type: 'dashboard_by_uid', value: 'aaa', dashboards: [] }]);
     const entryCountBefore = getHistoryEntries().length;
     const entryBefore = getLastHistoryEntry();
 
-    await srv.start(playlistWithItems([{ type: 'dashboard_by_uid', value: 'aaa' }]));
+    const result = await srv.start(playlistWithItems([{ type: 'dashboard_by_uid', value: 'aaa' }]));
 
+    expect(result).toEqual({ started: false, failureReason: 'no-dashboards' });
+    expect(srv.state.isPlaying).toBe(false);
     expect(getHistoryEntries()).toHaveLength(entryCountBefore);
     expect(getLastHistoryEntry()).toBe(entryBefore);
+  });
+
+  it('navigates nowhere when a control is used after a start that found no dashboards', async () => {
+    jest.mocked(loadDashboards).mockResolvedValueOnce([{ type: 'dashboard_by_uid', value: 'aaa', dashboards: [] }]);
+    await srv.start(playlistWithItems([{ type: 'dashboard_by_uid', value: 'aaa' }]));
+    const entryCountBefore = getHistoryEntries().length;
+
+    srv.next();
+    srv.prev();
+
+    expect(getHistoryEntries()).toHaveLength(entryCountBefore);
+    // The one call is start() reading the current href; a reload would be a second, setting one.
+    expect(hrefMock).toHaveBeenCalledTimes(1);
+    expect(srv.state.isPlaying).toBe(false);
+  });
+
+  it('leaves no previous playlist to replay when a later start finds no dashboards', async () => {
+    await srv.start(mockPlaylist);
+    expect(srv.state.isPlaying).toBe(true);
+
+    jest.mocked(loadDashboards).mockResolvedValueOnce([{ type: 'dashboard_by_uid', value: 'zzz', dashboards: [] }]);
+    await srv.start(playlistWithItems([{ type: 'dashboard_by_uid', value: 'zzz' }]));
+    const entryCountBefore = getHistoryEntries().length;
+
+    srv.next();
+
+    expect(getHistoryEntries()).toHaveLength(entryCountBefore);
+    expect(srv.state.isPlaying).toBe(false);
+  });
+
+  it('goes back to the last item when prev is used on the first item', async () => {
+    await srv.start(
+      playlistWithItems([
+        { type: 'dashboard_by_uid', value: 'aaa' },
+        { type: 'dashboard_by_uid', value: 'bbb' },
+        { type: 'dashboard_by_uid', value: 'ccc' },
+      ])
+    );
+
+    expect(getLastHistoryEntry().pathname).toBe('/url/to/aaa');
+
+    srv.prev();
+
+    expect(getLastHistoryEntry().pathname).toBe('/url/to/ccc');
+    expect(getValidPlaylistUrl(srv)).toBe('/url/to/ccc');
+    expect(srv.state.isPlaying).toBe(true);
+  });
+
+  it('goes back exactly one item when prev is used past the first item', async () => {
+    await srv.start(
+      playlistWithItems([
+        { type: 'dashboard_by_uid', value: 'aaa' },
+        { type: 'dashboard_by_uid', value: 'bbb' },
+        { type: 'dashboard_by_uid', value: 'ccc' },
+      ])
+    );
+
+    srv.next();
+    expect(getLastHistoryEntry().pathname).toBe('/url/to/bbb');
+
+    srv.prev();
+
+    expect(getLastHistoryEntry().pathname).toBe('/url/to/aaa');
+    expect(srv.state.isPlaying).toBe(true);
+  });
+
+  it('completes no loop, and so never reloads, when prev wraps to the last item', async () => {
+    await srv.start(mockPlaylist);
+
+    srv.prev();
+    srv.prev();
+    srv.prev();
+
+    // Only start()'s read of the current href; the reload sets it, so a wrap that counted a loop
+    // would show up here as a second call.
+    expect(hrefMock).toHaveBeenCalledTimes(1);
+    expect(srv.state.isPlaying).toBe(true);
+  });
+
+  it('keeps playing the only item of a one-item playlist through both directional controls', async () => {
+    await srv.start(playlistWithItems([{ type: 'dashboard_by_uid', value: 'aaa', variables: { host: ['a'] } }]));
+    const entryCountAfterStart = getHistoryEntries().length;
+
+    srv.next();
+    srv.prev();
+
+    const entries = getHistoryEntries();
+    expect(entries).toHaveLength(entryCountAfterStart + 2);
+    expect(entries[entries.length - 1].pathname).toBe('/url/to/aaa');
+    expect(entries[entries.length - 1].search).toBe('?var-host=a');
+    expect(srv.state.isPlaying).toBe(true);
+  });
+
+  it('drops kiosk from the reload URL once the viewer has left kiosk mode', async () => {
+    hrefMock.mockReturnValue('http://localhost/playlists/play/foo?kiosk=true');
+    locationService.push('/playlists/play/foo?kiosk=true');
+
+    await srv.start(mockPlaylist);
+    expect(getLastHistoryEntry().search).toBe('?kiosk=true');
+
+    // What pressing Escape does: kiosk leaves the URL, and playback carries on without it.
+    locationService.partial({ kiosk: null });
+    expect(srv.state.isPlaying).toBe(true);
+
+    for (let i = 0; i < 6; i++) {
+      srv.next();
+    }
+
+    expect(hrefMock).toHaveBeenLastCalledWith('http://localhost/playlists/play/foo');
+  });
+
+  it('keeps the playback options of the live URL in the reload URL', async () => {
+    hrefMock.mockReturnValue('http://localhost/playlists/play/foo?kiosk=true&_dash.hideVariables=true');
+    locationService.push('/playlists/play/foo?kiosk=true&_dash.hideVariables=true');
+
+    await srv.start(mockPlaylist);
+
+    for (let i = 0; i < 6; i++) {
+      srv.next();
+    }
+
+    expect(hrefMock).toHaveBeenLastCalledWith(
+      'http://localhost/playlists/play/foo?kiosk=true&_dash.hideVariables=true'
+    );
   });
 
   it('applies a variable name, a value count and a value length that sit exactly on their limits', async () => {

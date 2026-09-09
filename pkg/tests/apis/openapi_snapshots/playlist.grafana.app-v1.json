@@ -1070,9 +1070,6 @@
           }
         ]
       },
-      "com.github.grafana.grafana.apps.playlist.pkg.apis.playlist.v1.PlaylistItem": {
-        "$ref": "#/components/schemas/com.github.grafana.grafana.apps.playlist.pkg.apis.playlist.v1.PlaylistPlaylistItem"
-      },
       "com.github.grafana.grafana.apps.playlist.pkg.apis.playlist.v1.PlaylistList": {
         "type": "object",
         "required": [
@@ -1196,7 +1193,7 @@
           "items": {
             "type": "array",
             "items": {
-              "$ref": "#/components/schemas/com.github.grafana.grafana.apps.playlist.pkg.apis.playlist.v1.PlaylistItem"
+              "$ref": "#/components/schemas/com.github.grafana.grafana.apps.playlist.pkg.apis.playlist.v1.PlaylistPlaylistItem"
             }
           },
           "title": {

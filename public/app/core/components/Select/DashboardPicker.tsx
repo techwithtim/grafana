@@ -15,10 +15,26 @@ interface Props extends Omit<AsyncSelectProps<DashboardPickerDTO>, 'value' | 'on
   value?: DashboardPickerDTO['uid'];
   onChange?: (value?: DashboardPickerDTO) => void;
   showUnknown?: boolean;
+  /**
+   * Returns the picker to its placeholder after a selection instead of displaying the chosen
+   * dashboard. For "add an item" controls, which hand the selection to their owner and hold no
+   * value of their own. Left unset, the picker keeps showing what was picked.
+   */
+  clearOnSelect?: boolean;
 }
 
 export type DashboardPickerDTO = Pick<DashboardQueryResult, 'uid' | 'name'> &
   Pick<DashboardDTO['meta'], 'folderUid' | 'folderTitle'>;
+
+/**
+ * `controlShouldRenderValue` is a react-select prop that grafana-ui's `AsyncSelect` props do not
+ * enumerate but do forward verbatim, so it is declared here to pass it type-safely. It is what
+ * `clearOnSelect` needs: clearing our own state is not enough, because grafana-ui reduces a falsy
+ * `value` to `undefined` and react-select then falls back to the selection it holds internally.
+ */
+type ReactSelectValueDisplayProps = {
+  controlShouldRenderValue?: boolean;
+};
 
 const formatLabel = (folderTitle = 'Dashboards', dashboardTitle: string) => `${folderTitle}/${dashboardTitle}`;
 
@@ -44,7 +60,7 @@ const getDashboards = debounce(findDashboards, 250, { leading: true });
 
 // TODO: this component should provide a way to apply different filters to the search APIs
 export const DashboardPicker = forwardRef<HTMLElement, Props>(
-  ({ value, onChange, placeholder, noOptionsMessage, showUnknown, ...props }, ref) => {
+  ({ value, onChange, placeholder, noOptionsMessage, showUnknown, clearOnSelect, id, inputId, ...props }, ref) => {
     const [current, setCurrent] = useState<SelectableValue<DashboardPickerDTO>>();
     const abortRef = useRef<AbortController | null>(null);
 
@@ -117,14 +133,14 @@ export const DashboardPicker = forwardRef<HTMLElement, Props>(
     const onPicked = useCallback(
       (sel: SelectableValue<DashboardPickerDTO>) => {
         abortRef.current?.abort();
-        setCurrent(sel);
+        setCurrent(clearOnSelect ? undefined : sel);
         onChange?.(sel?.value);
       },
-      [onChange, setCurrent]
+      [clearOnSelect, onChange, setCurrent]
     );
 
     return (
-      <AsyncSelect
+      <AsyncSelect<DashboardPickerDTO, ReactSelectValueDisplayProps>
         loadOptions={getDashboards}
         onChange={onPicked}
         placeholder={placeholder ?? t('dashboard-picker.placeholder', 'Select dashboard')}
@@ -132,6 +148,14 @@ export const DashboardPicker = forwardRef<HTMLElement, Props>(
         value={current}
         defaultOptions={true}
         {...props}
+        // An `id` given to a Select is forwarded to react-select's container div, which is not
+        // labelable, while grafana-ui `Field` points its `label[for]` at that same string — so the
+        // combobox ended up unnamed and the id sat on two nodes. Both forms are routed to the input
+        // instead, and `id` is never forwarded on, which leaves `label[for]` resolving to the
+        // combobox.
+        inputId={inputId ?? id}
+        // `true` is react-select's own default, so this is inert unless `clearOnSelect` is set.
+        controlShouldRenderValue={!clearOnSelect}
         selectRef={ref}
       />
     );

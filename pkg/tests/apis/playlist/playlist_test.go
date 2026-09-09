@@ -696,10 +696,71 @@ func doPlaylistTests(t *testing.T, helper *apis.K8sTestHelper) *apis.K8sTestHelp
 		v0alpha1TagItem, ok := v0alpha1Items[1].(map[string]any)
 		require.True(t, ok)
 		require.NotContains(t, v0alpha1TagItem, "variables")
+
+		// The write direction of the shared item definition. The read above only proves that
+		// v0alpha1 can render what v1 stored; a client that never moved off v0alpha1 also
+		// writes through it, so the variables it sends must reach storage and be readable
+		// through v1 and through the legacy API unchanged.
+		v0alpha1Name := "playlist-written-through-v0alpha1"
+		v0alpha1Created, err := clientV0alpha1.Resource.Create(context.Background(),
+			helper.LoadYAMLOrJSON(`{
+				"apiVersion": "playlist.grafana.app/v0alpha1",
+				"kind": "Playlist",
+				"metadata": { "name": "`+v0alpha1Name+`" },
+				"spec": {
+				  "title": "Created from k8s v0alpha1 with variables",
+				  "interval": "7m",
+				  "items": [
+					{ "type": "dashboard_by_uid", "value": "xCmMwXdVz", "variables": { "host": ["h1", "h2"], "cluster": ["c1"] } },
+					{ "type": "dashboard_by_tag", "value": "graph-ng" }
+				  ]
+				}
+			  }`),
+			metav1.CreateOptions{},
+		)
+		t.Cleanup(func() {
+			_ = client.Resource.Delete(context.Background(), v0alpha1Name, metav1.DeleteOptions{})
+		})
+		require.NoError(t, err)
+		require.Equal(t, v0alpha1Name, v0alpha1Created.GetName())
+
+		expectedWrittenItem := map[string]any{
+			"type":  "dashboard_by_uid",
+			"value": "xCmMwXdVz",
+			"variables": map[string]any{
+				"host":    []any{"h1", "h2"},
+				"cluster": []any{"c1"},
+			},
+		}
+
+		createdItems, _, err := unstructured.NestedSlice(v0alpha1Created.Object, "spec", "items")
+		require.NoError(t, err)
+		require.Len(t, createdItems, 2)
+		require.Equal(t, expectedWrittenItem, createdItems[0])
+
+		foundV1, err := client.Resource.Get(context.Background(), v0alpha1Name, metav1.GetOptions{})
+		require.NoError(t, err)
+		v1Items, _, err := unstructured.NestedSlice(foundV1.Object, "spec", "items")
+		require.NoError(t, err)
+		require.Len(t, v1Items, 2)
+		require.Equal(t, expectedWrittenItem, v1Items[0])
+		v1TagItem, ok := v1Items[1].(map[string]any)
+		require.True(t, ok)
+		require.NotContains(t, v1TagItem, "variables")
+
+		legacyGet = apis.DoRequest(helper, apis.RequestParams{
+			User:   client.Args.User,
+			Method: http.MethodGet,
+			Path:   "/api/playlists/" + v0alpha1Name,
+		}, &playlist.PlaylistDTO{})
+		require.Equal(t, 200, legacyGet.Response.StatusCode)
+		require.NotNil(t, legacyGet.Result)
+		require.Len(t, legacyGet.Result.Items, 2)
+		require.Equal(t, map[string][]string{"host": {"h1", "h2"}, "cluster": {"c1"}}, legacyGet.Result.Items[0].Variables)
+		require.Nil(t, legacyGet.Result.Items[1].Variables)
 	})
 
 	t.Run("Do CRUD via k8s (and check that legacy api still works)", func(t *testing.T) {
-		t.Skip()
 		client := helper.GetResourceClient(apis.ResourceClientArgs{
 			User: helper.Org1.Editor,
 			GVR:  gvr,
@@ -743,8 +804,17 @@ func doPlaylistTests(t *testing.T, helper *apis.K8sTestHelper) *apis.K8sTestHelp
 			getFromBothAPIs(t, helper, client, uid, nil)
 		}
 
+		// Unified storage enforces optimistic concurrency, so a replacement must state the
+		// version of the object it replaces. A file fixture cannot carry a server-generated
+		// version, and the resource client sends the object as given, so the version of the
+		// object created above is stamped onto it here -- the same read-then-stamp the legacy
+		// PUT handler performs before it calls update. Reusing that version also keeps the
+		// resource-version assertions below meaningful: the update only succeeds while
+		// nothing else has touched the object since it was created.
+		replacement := helper.LoadYAMLOrJSONFile("testdata/playlist-test-replace.yaml")
+		replacement.SetResourceVersion(first.GetResourceVersion())
 		updated, err := client.Resource.Update(context.Background(),
-			helper.LoadYAMLOrJSONFile("testdata/playlist-test-replace.yaml"),
+			replacement,
 			metav1.UpdateOptions{},
 		)
 		require.NoError(t, err)

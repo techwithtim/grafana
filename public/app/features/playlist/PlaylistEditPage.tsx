@@ -2,9 +2,9 @@ import { useState } from 'react';
 import { useParams } from 'react-router-dom-v5-compat';
 
 import { type NavModelItem } from '@grafana/data';
-import { Trans, t } from '@grafana/i18n';
+import { t } from '@grafana/i18n';
 import { locationService } from '@grafana/runtime';
-import { Stack } from '@grafana/ui';
+import { Alert, Stack } from '@grafana/ui';
 import { Page } from 'app/core/components/Page/Page';
 import { ManagedBadge } from 'app/features/provisioning/components/ManagedBadge';
 import { SaveProvisionedResourceDrawer } from 'app/features/provisioning/components/Shared/SaveProvisionedResourceDrawer';
@@ -18,7 +18,12 @@ import {
 } from 'app/features/provisioning/utils/managedResource';
 import { resourceKindInfos } from 'app/features/provisioning/utils/resourceKinds';
 
-import { type Playlist, useGetPlaylistQuery, useReplacePlaylistMutation } from '../../api/clients/playlist/v1';
+import {
+  getPlaylistErrorMessage,
+  type Playlist,
+  useGetPlaylistQuery,
+  useReplacePlaylistMutation,
+} from '../../api/clients/playlist/v1';
 
 import { PlaylistForm } from './PlaylistForm';
 
@@ -42,10 +47,25 @@ export const PlaylistEditPage = () => {
       return;
     }
 
-    replacePlaylist({
-      name: playlist.metadata?.name ?? '',
-      playlist,
-    });
+    try {
+      // Awaited and unwrapped: the trigger was previously fired and abandoned, so the page
+      // navigated before the request had even completed. An RTK Query trigger also resolves with
+      // `{ error }` rather than rejecting, so `unwrap()` is what turns a rejected save — a 409 from
+      // a concurrent edit being the one a user actually meets — into a caught error here.
+      await replacePlaylist({
+        name: playlist.metadata?.name ?? '',
+        playlist,
+      }).unwrap();
+    } catch {
+      // `replacePlaylist`'s `onQueryStarted` has already raised the notification with a
+      // user-facing message, so returning is the whole failure path: the form stays mounted with
+      // the user's edits and Save is re-enabled by `PlaylistForm.doSubmit`'s `finally`. Not
+      // re-thrown, because `doSubmit` awaits this inside react-hook-form's submit handler.
+      return;
+    }
+
+    // Reached only once the replace is stored, so the invalidated list query is refetched with the
+    // saved state before `/playlists` mounts.
     locationService.push('/playlists');
   };
 
@@ -75,10 +95,12 @@ export const PlaylistEditPage = () => {
     <Page navId="dashboards/playlists" pageNav={pageNav} renderTitle={renderTitle}>
       <Page.Contents isLoading={isLoading}>
         {isError && (
-          <div>
-            <Trans i18nKey="playlist-edit.error-prefix">Error loading playlist:</Trans>
-            {JSON.stringify(error)}
-          </div>
+          // The error is described, never serialized: RTK Query stores the Grafana `FetchError`,
+          // whose `config` carries the request URL, method and headers (org id and device id
+          // among them), and rendering that put all of it on screen and into any screenshot.
+          <Alert severity="error" title={t('playlist-edit.error-load-title', 'Error loading playlist')}>
+            {getPlaylistErrorMessage(error)}
+          </Alert>
         )}
         {data && (
           // Only repository-managed playlists show the (read-only) repository field — the repository

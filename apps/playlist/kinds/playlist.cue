@@ -35,12 +35,16 @@ playlistv1: {
 			"UPDATE",
 		]
 	}
+	// items references #PlaylistItem directly on purpose. An intermediate alias
+	// (#Item: #PlaylistItem) publishes a $ref-only OpenAPI model with no type of its
+	// own, which structured-merge-diff cannot resolve: server-side apply then fails
+	// and managedFields cannot be tracked for any playlist that has items.
+
 	schema: {
-		#Item: #PlaylistItem
 		spec: {
 			title:    string
 			interval: string
-			items: [...#Item]
+			items: [...#PlaylistItem]
 		}
 	}
 }

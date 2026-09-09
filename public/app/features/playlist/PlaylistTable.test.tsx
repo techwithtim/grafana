@@ -1,7 +1,13 @@
-import { DragDropContext, type DraggableProvided, type DropResult, type DroppableProvided } from '@hello-pangea/dnd';
-import { act, render, screen, waitFor } from '@testing-library/react';
+import {
+  DragDropContext,
+  type BeforeCapture,
+  type DraggableProvided,
+  type DropResult,
+  type DroppableProvided,
+} from '@hello-pangea/dnd';
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent, { type UserEvent } from '@testing-library/user-event';
-import { type ReactNode } from 'react';
+import { useState, type ReactNode } from 'react';
 
 import { PlaylistTable } from './PlaylistTable';
 import { PlaylistTableRows } from './PlaylistTableRows';
@@ -104,6 +110,15 @@ function playlistItems(): PlaylistItemUI[] {
   ];
 }
 
+/** Three rows that are told apart by their accessible names, which duplicate UIDs are not. */
+function distinctItems(): PlaylistItemUI[] {
+  return [
+    { type: 'dashboard_by_uid', value: 'uid_1', dashboards: [loadedDashboard('uid_1', 'First dashboard')] },
+    { type: 'dashboard_by_uid', value: 'uid_2', dashboards: [loadedDashboard('uid_2', 'Second dashboard')] },
+    { type: 'dashboard_by_tag', value: 'graph-ng', dashboards: [loadedDashboard('uid_3', 'Tagged dashboard')] },
+  ];
+}
+
 function setup(jsx: JSX.Element) {
   return {
     user: userEvent.setup(),
@@ -115,7 +130,7 @@ function setup(jsx: JSX.Element) {
  * The spies stand in for the playlist form, which owns the item list: the rows therefore stay
  * exactly as they are after a move or a deletion, which is what makes the collapse observable.
  */
-function renderTable() {
+function renderTable(items: PlaylistItemUI[] = playlistItems()) {
   const deleteItem = jest.fn();
   const moveItem = jest.fn();
   const onVariablesChange = jest.fn();
@@ -125,14 +140,90 @@ function renderTable() {
     moveItem,
     onVariablesChange,
     ...setup(
-      <PlaylistTable
-        items={playlistItems()}
-        deleteItem={deleteItem}
-        moveItem={moveItem}
-        onVariablesChange={onVariablesChange}
-      />
+      <PlaylistTable items={items} deleteItem={deleteItem} moveItem={moveItem} onVariablesChange={onVariablesChange} />
     ),
   };
+}
+
+interface StatefulTableProps {
+  initialItems: PlaylistItemUI[];
+  deleteItem: (index: number) => void;
+  moveItem: (src: number, dst: number) => void;
+}
+
+/**
+ * A table whose item list is real state, standing in for the playlist form. A deletion therefore
+ * removes the row for real, which is the only arrangement in which the control focus is moved to
+ * afterwards is a *surviving* one, and in which a move re-renders the rows in their new order.
+ */
+function StatefulTable({ initialItems, deleteItem, moveItem }: StatefulTableProps) {
+  const [items, setItems] = useState(initialItems);
+
+  return (
+    <PlaylistTable
+      items={items}
+      deleteItem={(index) => {
+        deleteItem(index);
+        setItems((previous) => previous.filter((_, i) => i !== index));
+      }}
+      moveItem={(src, dst) => {
+        moveItem(src, dst);
+        setItems((previous) => {
+          const next = Array.from(previous);
+          const [moved] = next.splice(src, 1);
+          next.splice(dst, 0, moved);
+          return next;
+        });
+      }}
+      onVariablesChange={(index, variables) =>
+        setItems((previous) =>
+          previous.map((item, i) => {
+            if (i !== index) {
+              return item;
+            }
+            const { variables: replaced, ...rest } = item;
+            return variables && Object.keys(variables).length > 0 ? { ...rest, variables } : rest;
+          })
+        )
+      }
+    />
+  );
+}
+
+function renderStatefulTable(items: PlaylistItemUI[] = playlistItems()) {
+  const deleteItem = jest.fn();
+  const moveItem = jest.fn();
+
+  return {
+    deleteItem,
+    moveItem,
+    ...setup(<StatefulTable initialItems={items} deleteItem={deleteItem} moveItem={moveItem} />),
+  };
+}
+
+/**
+ * The item list, which is a `list` of `listitem` rows.
+ *
+ * Queried by role and name rather than by test id because the structure is the assertion: a row
+ * may own its controls and, while it is expanded, its variables editor, which is what a `listitem`
+ * in a `list` permits and what a `row` in no table permits at all.
+ */
+function itemList() {
+  return screen.getByRole('list', { name: 'Playlist items' });
+}
+
+function rows() {
+  return within(itemList()).getAllByRole('listitem');
+}
+
+/**
+ * The accessible name of each row, in row order.
+ *
+ * The name is carried by the `listitem` itself — the row owns it, and there is no cell to hold it
+ * — so it is read off the same elements `rows()` returns rather than off any descendant.
+ */
+function rowNames() {
+  return rows().map((row) => row.getAttribute('aria-label'));
 }
 
 function disclosureButtons() {
@@ -155,8 +246,33 @@ function variablesPanels() {
   return screen.queryAllByRole('region');
 }
 
+/**
+ * The panels of the two rows holding `uid_1`, matched by name.
+ *
+ * The name of a panel carries its row's position as well as the dashboard, so the two rows of one
+ * dashboard are matched by a pattern here and asserted to be distinct where that is the point.
+ */
 function uidVariablesPanels() {
-  return screen.getAllByRole('region', { name: 'Template variables for uid_1' });
+  return screen.getAllByRole('region', { name: /^Template variables for uid_1, item [1-4]$/ });
+}
+
+function variablesPanelNames() {
+  return variablesPanels().map((panel) => panel.getAttribute('aria-label'));
+}
+
+/**
+ * The open editor of the row whose disclosure is at `index`, found through the id that disclosure
+ * reports it controls. Two rows holding the same dashboard label their panels identically, so the
+ * `aria-controls` link is the only thing that ties a panel to the row it belongs to.
+ */
+function editorFor(index: number): HTMLElement {
+  const disclosure = disclosureButtons()[index];
+  const controlledId = disclosure.getAttribute('aria-controls');
+  const panel = variablesPanels().find((candidate) => candidate.id === controlledId);
+  if (!panel) {
+    throw new Error(`The disclosure at position ${index} controls no rendered panel`);
+  }
+  return panel;
 }
 
 /**
@@ -197,6 +313,44 @@ async function endDrag(result: DropResult) {
   });
 }
 
+/**
+ * Fires the responder the library calls at the moment an item is lifted, before it measures the
+ * element it is about to drag. The real library flushes this responder synchronously for exactly
+ * that reason, so whatever it changes is in the DOM by the time it returns.
+ */
+async function beginDrag(before: BeforeCapture) {
+  const { calls } = jest.mocked(DragDropContext).mock;
+  const onBeforeCapture = calls[calls.length - 1]?.[0].onBeforeCapture;
+  if (!onBeforeCapture) {
+    throw new Error('DragDropContext was rendered without an onBeforeCapture handler');
+  }
+
+  await act(async () => {
+    onBeforeCapture(before);
+  });
+}
+
+function rowWrappers() {
+  return Array.from(document.querySelectorAll('[data-playlist-item-index]'));
+}
+
+/** The draggable id the library would record for each row, in row order. */
+function draggableIds() {
+  return rowWrappers().map((wrapper) => wrapper.getAttribute('data-rfd-draggable-id'));
+}
+
+function activeElementName() {
+  const active = document.activeElement;
+  if (!active || active === document.body) {
+    return 'document.body';
+  }
+  return active.getAttribute('aria-label') ?? active.textContent ?? active.tagName;
+}
+
+function confirmDialog() {
+  return screen.queryByRole('dialog', { name: 'Delete playlist item' });
+}
+
 describe('PlaylistTable', () => {
   beforeEach(() => {
     // The stubbed `DragDropContext` records every render, so the recorded props must not leak from
@@ -208,17 +362,119 @@ describe('PlaylistTable', () => {
   it('offers a variable editor on the two dashboard_by_uid rows and on neither the tag nor the id row', async () => {
     const { user } = renderTable();
 
-    expect(screen.getAllByRole('row')).toHaveLength(4);
-    expect(screen.getByRole('cell', { name: 'Playlist item, dashboard_by_tag, graph-ng' })).toBeInTheDocument();
-    expect(screen.getByRole('cell', { name: 'Playlist item, dashboard_by_id, 3' })).toBeInTheDocument();
+    expect(rows()).toHaveLength(4);
+    expect(screen.getByRole('listitem', { name: 'Playlist item, dashboard_by_tag, graph-ng' })).toBeInTheDocument();
+    expect(screen.getByRole('listitem', { name: 'Playlist item, dashboard_by_id, 3' })).toBeInTheDocument();
     expect(disclosureButtons()).toHaveLength(2);
     expect(variablesPanels()).toHaveLength(0);
 
     await expandBothUidRows(user);
 
     expect(uidVariablesPanels()).toHaveLength(2);
-    expect(screen.queryByRole('region', { name: 'Template variables for graph-ng' })).not.toBeInTheDocument();
-    expect(screen.queryByRole('region', { name: 'Template variables for 3' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('region', { name: /^Template variables for graph-ng/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole('region', { name: /^Template variables for 3/ })).not.toBeInTheDocument();
+  });
+
+  /**
+   * The rows are a list, and every row is one item of it.
+   *
+   * `role="row"` is what this markup used to carry, and it was invalid in two ways at once: a row
+   * has to be owned by a table, grid, treegrid or rowgroup, and none of those is here or belongs
+   * here, and a row may own nothing but cells, while these rows own a disclosure, a delete button,
+   * a drag handle and — while a row is expanded — a whole variables editor.
+   */
+  it('renders the items as a named list of list items and as no kind of table', () => {
+    renderTable();
+
+    expect(itemList()).toBeInTheDocument();
+    expect(rows()).toHaveLength(4);
+    expect(screen.queryAllByRole('row')).toHaveLength(0);
+    expect(screen.queryAllByRole('cell')).toHaveLength(0);
+    expect(screen.queryAllByRole('table')).toHaveLength(0);
+    expect(screen.queryAllByRole('grid')).toHaveLength(0);
+  });
+
+  it('carries no list role while the playlist is empty, where the empty-state text is all there is', () => {
+    renderTable([]);
+
+    expect(screen.queryByRole('list')).not.toBeInTheDocument();
+    expect(screen.queryAllByRole('listitem')).toHaveLength(0);
+    expect(screen.getByText('Playlist is empty. Add dashboards below.')).toBeInTheDocument();
+  });
+
+  /**
+   * The arrangement this feature exists for: one dashboard listed several times, each entry
+   * pinned to a different host. Nothing but the variables tells those entries apart, so the row's
+   * text, the row's accessible name, the panel's name and the names of the controls inside the
+   * panel all have to say which entry they belong to.
+   */
+  it('distinguishes two entries of one dashboard by their variables and their position', async () => {
+    const { user } = renderTable([
+      {
+        type: 'dashboard_by_uid',
+        value: 'uid_1',
+        variables: { host: ['Host1'] },
+        dashboards: [loadedDashboard('uid_1', 'Host dashboard')],
+      },
+      {
+        type: 'dashboard_by_uid',
+        value: 'uid_1',
+        variables: { host: ['Host2'] },
+        dashboards: [loadedDashboard('uid_1', 'Host dashboard')],
+      },
+    ]);
+
+    expect(rowNames()).toEqual([
+      'Playlist item, dashboard_by_uid, uid_1, host=Host1',
+      'Playlist item, dashboard_by_uid, uid_1, host=Host2',
+    ]);
+    expect(rows()[0]).toHaveTextContent('· host=Host1');
+    expect(rows()[1]).toHaveTextContent('· host=Host2');
+    expect(rows()[0]).not.toHaveTextContent('Host2');
+    expect(rows()[1]).not.toHaveTextContent('Host1');
+
+    await expandBothUidRows(user);
+
+    expect(variablesPanelNames()).toEqual([
+      'Template variables for uid_1, item 1',
+      'Template variables for uid_1, item 2',
+    ]);
+    expect(
+      screen
+        .getAllByRole('textbox', { name: /^Variable name for host, item [12]$/ })
+        .map((input) => input.getAttribute('aria-label'))
+    ).toEqual(['Variable name for host, item 1', 'Variable name for host, item 2']);
+    expect(
+      screen
+        .getAllByRole('textbox', { name: /^Values for host, item [12]$/ })
+        .map((input) => input.getAttribute('aria-label'))
+    ).toEqual(['Values for host, item 1', 'Values for host, item 2']);
+  });
+
+  it('summarizes the first variables of a row and elides the rest', () => {
+    renderTable([
+      {
+        type: 'dashboard_by_uid',
+        value: 'uid_1',
+        variables: { host: ['web-01', 'web-02'], region: ['eu'], zone: ['z1'] },
+        dashboards: [loadedDashboard('uid_1', 'Host dashboard')],
+      },
+      { type: 'dashboard_by_uid', value: 'uid_2', dashboards: [loadedDashboard('uid_2', 'Plain dashboard')] },
+      { type: 'dashboard_by_tag', value: 'graph-ng', dashboards: [loadedDashboard('uid_3', 'Tagged dashboard')] },
+    ]);
+
+    expect(rowNames()).toEqual([
+      'Playlist item, dashboard_by_uid, uid_1, host=web-01, web-02; region=eu…',
+      'Playlist item, dashboard_by_uid, uid_2',
+      'Playlist item, dashboard_by_tag, graph-ng',
+    ]);
+    expect(screen.getByText('3 variables')).toBeInTheDocument();
+    expect(rows()[0]).toHaveTextContent('· host=web-01, web-02; region=eu…');
+    // A row with no variables and a tag row, which cannot carry any, keep the text and the name
+    // they have always had: no count, no summary, nothing appended.
+    expect(rows()[1]).toHaveTextContent('Plain dashboard');
+    expect(rows()[1]).not.toHaveTextContent('variable');
+    expect(rows()[2]).not.toHaveTextContent('variable');
   });
 
   it('closes an open variable editor when its own disclosure is clicked a second time', async () => {
@@ -226,15 +482,15 @@ describe('PlaylistTable', () => {
 
     await user.click(disclosureButtons()[0]);
 
-    expect(await screen.findByRole('textbox', { name: 'Variable name for host' })).toBeInTheDocument();
+    expect(await screen.findByRole('textbox', { name: 'Variable name for host, item 1' })).toBeInTheDocument();
     expect(disclosureStates()).toEqual(['true', 'false']);
     expect(variablesPanels()).toHaveLength(1);
 
     await user.click(disclosureButtons()[0]);
 
     expect(disclosureStates()).toEqual(['false', 'false']);
-    expect(screen.queryByRole('region', { name: 'Template variables for uid_1' })).not.toBeInTheDocument();
-    expect(screen.queryByRole('textbox', { name: 'Variable name for host' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('region', { name: 'Template variables for uid_1, item 1' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('textbox', { name: 'Variable name for host, item 1' })).not.toBeInTheDocument();
   });
 
   it('points every open disclosure at the id of its own variables panel', async () => {
@@ -311,6 +567,235 @@ describe('PlaylistTable', () => {
 
     expect(moveItem).not.toHaveBeenCalled();
   });
+
+  // The library restores focus after a drop to the drag handle whose draggable id it recorded when
+  // the item was lifted, so an id derived from the position hands the moved item's focus — and,
+  // through the React key, its DOM node — to whichever row took its place.
+  it('gives every row a draggable id that follows its own item across a reorder', async () => {
+    const { moveItem } = renderStatefulTable(distinctItems());
+
+    const idsBefore = draggableIds();
+    const namesBefore = rowNames();
+    expect(new Set(idsBefore).size).toBe(3);
+    expect(idsBefore).not.toEqual(['0', '1', '2']);
+
+    await endDrag(dropResult(0, 2));
+
+    expect(moveItem).toHaveBeenCalledWith(0, 2);
+    expect(rowNames()).toEqual([namesBefore[1], namesBefore[2], namesBefore[0]]);
+    expect(draggableIds()).toEqual([idsBefore[1], idsBefore[2], idsBefore[0]]);
+  });
+
+  // Editing a row's variables replaces the item object. Two rows holding the same dashboard are
+  // indistinguishable by content, so the identity has to survive that replacement as well as a
+  // move, or the row would remount and take its open editor and the focus inside it with it.
+  it('keeps each row of a duplicated dashboard on its own draggable id when its variables change', async () => {
+    const { user } = renderStatefulTable();
+    const idsBefore = draggableIds();
+
+    await user.click(disclosureButtons()[1]);
+    const editor = editorFor(1);
+    await user.type(within(editor).getByRole('textbox', { name: 'Variable name' }), 'shard');
+    await user.type(within(editor).getByRole('textbox', { name: 'Values (comma-separated)' }), 'a, b');
+    await user.click(within(editor).getByRole('button', { name: 'Add variable' }));
+
+    // The committed row is named for the item's position as well as the variable, so this also
+    // says the row that took the text is the second entry of the dashboard and not the first.
+    expect(await within(editor).findByRole('textbox', { name: 'Variable name for shard, item 2' })).toBeInTheDocument();
+    expect(draggableIds()).toEqual(idsBefore);
+    expect(disclosureStates()).toEqual(['false', 'true']);
+  });
+
+  // The panel of an expanded row is a sibling of the row inside the draggable wrapper, so it is
+  // measured and lifted with the row unless it is gone before the library takes its dimensions.
+  it('collapses every open editor before the library measures the row being lifted', async () => {
+    const { user } = renderTable();
+    await expandBothUidRows(user);
+
+    await beginDrag({ draggableId: draggableIds()[0] ?? '', mode: 'FLUID' });
+
+    expect(disclosureStates()).toEqual(['false', 'false']);
+    expect(variablesPanels()).toHaveLength(0);
+  });
+
+  it('returns focus to the disclosure of the row being edited when another row is deleted', async () => {
+    const { user, deleteItem } = renderStatefulTable();
+    await user.click(disclosureButtons()[0]);
+    const values = await screen.findByRole('textbox', { name: 'Values for host, item 1' });
+    values.focus();
+    expect(values).toHaveFocus();
+
+    // Clicking would move focus onto the delete button first. Firing the event leaves focus inside
+    // the panel that the deletion unmounts, which is the case that used to strand it on the page.
+    fireEvent.click(deleteButtons()[1]);
+
+    await waitFor(() => {
+      expect(document.activeElement).toBe(disclosureButtons()[0]);
+    });
+    expect(deleteItem).toHaveBeenCalledWith(1);
+    expect(disclosureStates()).toEqual(['false']);
+    expect(variablesPanels()).toHaveLength(0);
+  });
+
+  it('moves focus off the delete button of the row it removed', async () => {
+    const { user, deleteItem } = renderStatefulTable();
+
+    await user.click(deleteButtons()[0]);
+
+    await waitFor(() => {
+      expect(activeElementName()).toBe('Template variables');
+    });
+    expect(deleteItem).toHaveBeenCalledWith(0);
+    // Focus lands on the surviving row that took the deleted row's place, and on its disclosure
+    // rather than its delete button, so a second Enter cannot remove another item.
+    expect(deleteButtons()[0]).not.toHaveFocus();
+    // The row that took the deleted row's place is the *other* entry of the same dashboard, which
+    // its variable summary is what says: the deleted `host=Host1` entry is the one that is gone.
+    expect(rowNames()).toEqual([
+      'Playlist item, dashboard_by_uid, uid_1, cluster=eu-west',
+      'Playlist item, dashboard_by_tag, graph-ng',
+      'Playlist item, dashboard_by_id, 3',
+    ]);
+  });
+
+  it('falls back to the drag handle when the row taking the deleted row place has no disclosure', async () => {
+    const { user } = renderStatefulTable();
+
+    await user.click(deleteButtons()[2]);
+
+    await waitFor(() => {
+      expect(document.activeElement).toHaveAttribute('data-playlist-item-drag-handle');
+    });
+    expect(rowWrappers()).toHaveLength(3);
+    expect(document.activeElement?.closest('[data-playlist-item-index]')).toBe(rowWrappers()[2]);
+  });
+
+  it('moves focus to the list itself when the last remaining row is deleted', async () => {
+    const { user } = renderStatefulTable([playlistItems()[0]]);
+
+    await user.click(deleteButtons()[0]);
+
+    const list = document.querySelector('[data-rfd-droppable-id="playlist-list"]');
+    await waitFor(() => {
+      expect(document.activeElement).toBe(list);
+    });
+    expect(screen.queryAllByRole('row')).toHaveLength(0);
+    expect(screen.getByText('Playlist is empty. Add dashboards below.')).toBeInTheDocument();
+  });
+
+  describe('when a row carries template variables that have not been saved', () => {
+    async function addVariableToFirstRow(user: UserEvent) {
+      await user.click(disclosureButtons()[0]);
+      const editor = editorFor(0);
+      await user.type(within(editor).getByRole('textbox', { name: 'Variable name' }), 'shard');
+      await user.type(within(editor).getByRole('textbox', { name: 'Values (comma-separated)' }), 'a, b');
+      await user.click(within(editor).getByRole('button', { name: 'Add variable' }));
+      expect(
+        await within(editor).findByRole('textbox', { name: 'Variable name for shard, item 1' })
+      ).toBeInTheDocument();
+    }
+
+    it('asks for confirmation before deleting it, naming how many values are at stake', async () => {
+      const { user, deleteItem } = renderStatefulTable();
+      await addVariableToFirstRow(user);
+
+      await user.click(deleteButtons()[0]);
+
+      const dialog = screen.getByRole('dialog', { name: 'Delete playlist item' });
+      expect(deleteItem).not.toHaveBeenCalled();
+      expect(
+        within(dialog).getByText(
+          'This item has 2 template variables that have not been saved yet. Deleting the item discards them.'
+        )
+      ).toBeInTheDocument();
+    });
+
+    it('removes it once the deletion is confirmed, without leaving focus on the page body', async () => {
+      const { user, deleteItem } = renderStatefulTable();
+      await addVariableToFirstRow(user);
+      await user.click(deleteButtons()[0]);
+
+      await user.click(screen.getByRole('button', { name: 'Delete item' }));
+
+      expect(deleteItem).toHaveBeenCalledWith(0);
+      expect(confirmDialog()).not.toBeInTheDocument();
+      expect(rows()).toHaveLength(3);
+      await waitFor(() => {
+        expect(activeElementName()).toBe('Template variables');
+      });
+    });
+
+    it('keeps the row and its variables when the confirmation is dismissed', async () => {
+      const { user, deleteItem } = renderStatefulTable();
+      await addVariableToFirstRow(user);
+      await user.click(deleteButtons()[0]);
+
+      await user.click(screen.getByRole('button', { name: 'Cancel' }));
+
+      expect(deleteItem).not.toHaveBeenCalled();
+      expect(confirmDialog()).not.toBeInTheDocument();
+      expect(rows()).toHaveLength(4);
+      // The dismissal changes nothing, so the editor the variable was typed into is still open.
+      expect(disclosureStates()).toEqual(['true', 'false']);
+      expect(within(editorFor(0)).getByRole('textbox', { name: 'Values for shard, item 1' })).toHaveValue('a, b');
+    });
+  });
+
+  // Variables loaded with the playlist are still stored on the server until the form is saved, and
+  // the form's own Cancel puts the row back, so removing such a row stays a single click.
+  it('deletes a row whose stored variables have not been edited without asking', async () => {
+    const { user, deleteItem } = renderStatefulTable();
+
+    await user.click(deleteButtons()[0]);
+
+    expect(confirmDialog()).not.toBeInTheDocument();
+    expect(deleteItem).toHaveBeenCalledWith(0);
+    expect(rows()).toHaveLength(3);
+  });
+
+  /**
+   * The disclosure carries its accessible name as `aria-label` rather than as `tooltip`, so no
+   * overlay is rendered at all. A tooltip-bearing `IconButton` renders exactly one portal
+   * `div[role="tooltip"]` on hover in jsdom, and floating-ui's `useFocus` keeps it open for as long
+   * as the clicked button holds focus, so counting those elements is what makes this a regression
+   * test rather than a tautology. In the browser that lingering overlay is pointer-capturing and
+   * covers the next row's controls, which is why the first click is asserted to toggle the row.
+   */
+  it('renders no tooltip overlay for the disclosure and expands the row on the first click', async () => {
+    const { user } = renderTable();
+
+    await user.hover(disclosureButtons()[0]);
+
+    expect(screen.queryByRole('tooltip')).not.toBeInTheDocument();
+    expect(document.querySelectorAll('[role="tooltip"]')).toHaveLength(0);
+
+    await user.click(disclosureButtons()[0]);
+
+    expect(disclosureStates()).toEqual(['true', 'false']);
+    expect(screen.queryByRole('tooltip')).not.toBeInTheDocument();
+    expect(document.querySelectorAll('[role="tooltip"]')).toHaveLength(0);
+    expect(disclosureButtons()[0]).toHaveAccessibleName('Template variables');
+  });
+
+  /**
+   * The summary shares the row's flex cell with a dashboard title that wraps to three lines on a
+   * narrow viewport, and a shrinking flex item with the inherited `white-space: normal` broke the
+   * phrase itself across two lines ("1" / "variable"). Wrapping is a layout outcome jsdom does not
+   * compute, so the assertion is on the computed style emotion resolves from the class rule, which
+   * is what actually decides it.
+   */
+  it('keeps the variable-count summary on one line and lets the dashboard title absorb the wrapping', () => {
+    renderTable();
+
+    const summaries = screen.getAllByText('1 variable');
+    expect(summaries).toHaveLength(2);
+
+    for (const summary of summaries) {
+      const { whiteSpace, flexShrink } = window.getComputedStyle(summary);
+      expect(whiteSpace).toBe('nowrap');
+      expect(flexShrink).toBe('0');
+    }
+  });
 });
 
 describe('PlaylistTableRows', () => {
@@ -321,19 +806,26 @@ describe('PlaylistTableRows', () => {
   // The stubbed `Draggable` above is what lets them render outside a real `DragDropContext`.
   it('renders a variables panel on the dashboard_by_uid rows only, even with every row index expanded', () => {
     render(
-      <PlaylistTableRows
-        items={playlistItems()}
-        onDelete={jest.fn()}
-        expanded={new Set([0, 1, 2, 3])}
-        onToggleExpanded={jest.fn()}
-        onVariablesChange={jest.fn()}
-      />
+      // The rows are list items, so rendering them without `PlaylistTable` still needs the list
+      // they belong to: a `listitem` outside a `list` is exactly the containment defect this
+      // markup was restructured to remove, and a fixture is not the place to reintroduce it.
+      <div role="list" aria-label="Playlist items">
+        <PlaylistTableRows
+          items={playlistItems()}
+          itemKeys={['a', 'b', 'c', 'd']}
+          onDelete={jest.fn()}
+          expanded={new Set([0, 1, 2, 3])}
+          onToggleExpanded={jest.fn()}
+          onVariablesChange={jest.fn()}
+        />
+      </div>
     );
 
+    expect(rows()).toHaveLength(4);
     expect(disclosureStates()).toEqual(['true', 'true']);
     expect(uidVariablesPanels()).toHaveLength(2);
     expect(variablesPanels()).toHaveLength(2);
-    expect(screen.queryByRole('region', { name: 'Template variables for graph-ng' })).not.toBeInTheDocument();
-    expect(screen.queryByRole('region', { name: 'Template variables for 3' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('region', { name: /^Template variables for graph-ng/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole('region', { name: /^Template variables for 3/ })).not.toBeInTheDocument();
   });
 });

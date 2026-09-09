@@ -13447,21 +13447,42 @@
         }
       }
     },
+    "playlist-srv": {
+      "stopped-navigation-body": "Navigating away from a playlist dashboard ends the playlist.",
+      "stopped-navigation-title": "Playlist stopped"
+    },
+    "playlist-start-page": {
+      "back-to-playlists": "Back to playlists",
+      "edit-playlist": "Edit playlist",
+      "empty-body": "The playlist has no dashboards to play. Edit the playlist to add dashboards to it.",
+      "empty-title": "This playlist is empty",
+      "load-failed-body": "Grafana could not load this playlist. It may have been deleted, or you may not have permission to view it.",
+      "load-failed-title": "This playlist could not be loaded",
+      "no-dashboards-body": "None of the dashboards in this playlist could be found. They may have been deleted, or you may not have permission to view them. Edit the playlist to choose dashboards that exist.",
+      "no-dashboards-title": "No dashboards could be found for this playlist",
+      "start-failed-body": "Something went wrong while starting the playlist. Try again, or edit the playlist to check the dashboards it plays.",
+      "start-failed-title": "This playlist could not be started",
+      "starting": "Starting playlist...",
+      "title": "Start playlist"
+    },
     "playlist-table-rows": {
       "aria-label-playlist-item": "Playlist item, {{itemType}}, {{itemValue}}",
+      "aria-label-playlist-item-variables": "Playlist item, {{itemType}}, {{itemValue}}, {{variablesSummary}}",
       "multiple-dashboards-found": "Multiple items found: {{items}}",
       "no-dashboards-found": "No dashboards found",
       "not-found": "Not found: {{items}}",
       "variables-count_one": "{{count}} variable",
       "variables-count_other": "{{count}} variables",
-      "variables-panel": "Template variables for {{itemValue}}"
+      "variables-panel": "Template variables for {{itemValue}}, item {{itemPosition}}"
     },
     "start-modal": {
       "button-start": "Start {{title}}",
       "description-customize-dashboard-elements-visibility": "Customize dashboard elements visibility",
       "description-hide-logo": "Hide the branding footer from the dashboard",
+      "description-kiosk-controls": "Kiosk mode hides the playlist controls. Press the Esc key to exit kiosk mode and show them, including Stop playlist.",
       "description-panel-heights-adjusted-screen": "Panel heights will be adjusted to fit screen size",
       "description-playlist-nav": "Show previous and next buttons to manually navigate between dashboards",
+      "description-variables": "A playlist applies template variable values per dashboard and displays them in these controls, so clearing this option hides which values are in use",
       "label-autofit": "Autofit",
       "label-dashboard-links": "Dashboard links",
       "label-display-dashboard-controls": "Display dashboard controls",
@@ -13480,12 +13501,19 @@
     }
   },
   "playlist-edit": {
-    "error-prefix": "Error loading playlist:",
+    "error-conflict": "This playlist was changed somewhere else. Reload the page and apply your changes to the latest version.",
+    "error-forbidden": "You do not have permission to view or change this playlist.",
+    "error-load-title": "Error loading playlist",
+    "error-not-found": "This playlist no longer exists. It may have been deleted.",
     "form": {
       "add-tag-label": "Add by tag",
       "add-tag-placeholder": "Select a tag",
       "add-title-label": "Add by title",
       "cancel": "Cancel",
+      "delete-item-body_one": "This item has {{count}} template variable that has not been saved yet. Deleting the item discards it.",
+      "delete-item-body_other": "This item has {{count}} template variables that have not been saved yet. Deleting the item discards them.",
+      "delete-item-confirm": "Delete item",
+      "delete-item-title": "Delete playlist item",
       "heading": "Add dashboards",
       "interval-label": "Interval",
       "interval-placeholder": "5m",
@@ -13498,9 +13526,11 @@
       "table-drag": "Reorder playlist item",
       "table-empty": "Playlist is empty. Add dashboards below.",
       "table-heading": "Dashboards",
+      "table-list-label": "Playlist items",
       "variables-add": "Add variable",
       "variables-add-heading": "Add a variable",
       "variables-name-aria-label": "Variable name for {{variableName}}",
+      "variables-name-aria-label-item": "Variable name for {{variableName}}, item {{itemPosition}}",
       "variables-name-duplicate": "A variable with this name already exists",
       "variables-name-placeholder": "Variable name",
       "variables-name-required": "Variable name is required",
@@ -13509,6 +13539,7 @@
       "variables-new-values-label": "Values (comma-separated)",
       "variables-over-budget-body": "The variables stored on this playlist item are beyond the limits the editor supports. Remove the playlist item and add it again to set its variables.",
       "variables-over-budget-title": "These template variables cannot be edited",
+      "variables-pending-hint": "This variable is not added yet. Select Add variable to include it.",
       "variables-remove": "Remove variable {{variableName}}",
       "variables-toggle": "Template variables",
       "variables-too-many": "A playlist item cannot have more than {{max}} variables",
@@ -13516,6 +13547,7 @@
       "variables-value-required": "Variable value is required",
       "variables-value-too-long": "A variable value cannot be longer than {{maxLength}} characters",
       "variables-values-aria-label": "Values for {{variableName}}",
+      "variables-values-aria-label-item": "Values for {{variableName}}, item {{itemPosition}}",
       "variables-values-placeholder": "Values, comma-separated"
     },
     "sub-title": "A playlist rotates through a pre-selected list of dashboards. A playlist can be a great way to build situational awareness, or just show off your metrics to your team or visitors.",

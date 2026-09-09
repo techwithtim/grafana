@@ -1,4 +1,4 @@
-import { useCallback, useState } from 'react';
+import { useCallback, useRef, useState } from 'react';
 import { useAsync } from 'react-use';
 
 import { type DashboardPickerDTO } from 'app/core/components/Select/DashboardPicker';
@@ -116,4 +116,69 @@ export function usePlaylistItems(playlistItems?: PlaylistItemUI[]) {
   }, []);
 
   return { items, addByUID, addByTag, deleteItem, moveItem, updateItemVariables };
+}
+
+/**
+ * Gives every item a key that follows the item itself rather than the position it happens to hold.
+ *
+ * The drag and drop library restores focus after a drop to the drag handle whose draggable id it
+ * recorded when the item was lifted, and React reuses the DOM node at a position whose key has not
+ * changed. A key derived from the index therefore leaves both the focus and the node on whichever
+ * item took the moved item's place, so a keyboard user carries on operating the wrong row.
+ *
+ * A key has to survive a reorder and also the object replacement that a variables edit or the
+ * asynchronous dashboard enrichment performs, without being stored on the item itself: an item is
+ * submitted to the API by spreading its own properties, so an added property would be persisted.
+ * Each item therefore claims a previous key by object identity first, which is exact for a move or
+ * a deletion, and then by type and value, preferring the nearest position. The second pass is what
+ * carries a key across a replaced object, including when the same dashboard appears more than once,
+ * because the untouched twin has already claimed its own key in the first pass.
+ */
+export function usePlaylistItemKeys(items: PlaylistItemUI[]): string[] {
+  const tracked = useRef<{ items: PlaylistItemUI[]; keys: string[] }>({ items: [], keys: [] });
+  const nextKey = useRef(0);
+
+  const { items: previousItems, keys: previousKeys } = tracked.current;
+  const claimed = previousItems.map(() => false);
+  const keys: Array<string | undefined> = items.map(() => undefined);
+
+  const claim = (from: number, to: number) => {
+    claimed[from] = true;
+    keys[to] = previousKeys[from];
+  };
+
+  items.forEach((item, index) => {
+    const previousIndex = previousItems.findIndex((previousItem, i) => !claimed[i] && previousItem === item);
+    if (previousIndex >= 0) {
+      claim(previousIndex, index);
+    }
+  });
+
+  items.forEach((item, index) => {
+    if (keys[index] !== undefined) {
+      return;
+    }
+
+    let nearest = -1;
+    previousItems.forEach((previousItem, i) => {
+      if (claimed[i] || previousItem.type !== item.type || previousItem.value !== item.value) {
+        return;
+      }
+      if (nearest < 0 || Math.abs(i - index) < Math.abs(nearest - index)) {
+        nearest = i;
+      }
+    });
+
+    if (nearest >= 0) {
+      claim(nearest, index);
+    }
+  });
+
+  const resolved = keys.map((key) => key ?? `playlist-item-${nextKey.current++}`);
+  // Recording the result during the render keeps the next render's comparison against the list it
+  // actually rendered. Re-running this render with the same array claims every key by identity
+  // again, so a repeated or discarded render cannot renumber the rows.
+  tracked.current = { items, keys: resolved };
+
+  return resolved;
 }

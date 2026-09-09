@@ -3,7 +3,7 @@ import { useState } from 'react';
 import { type SelectableValue, type UrlQueryMap, urlUtil } from '@grafana/data';
 import { Trans, t } from '@grafana/i18n';
 import { config, locationService, reportInteraction } from '@grafana/runtime';
-import { Box, Button, Checkbox, Field, FieldSet, Modal, RadioButtonGroup, Stack } from '@grafana/ui';
+import { Box, Button, Checkbox, Field, FieldSet, Modal, RadioButtonGroup, Stack, Text } from '@grafana/ui';
 
 import { type Playlist } from '../../api/clients/playlist/v1';
 
@@ -76,6 +76,16 @@ export const StartModal = ({ playlist, onDismiss }: Props) => {
               }}
             />
           </Field>
+          {/* Tied to the kiosk selection because kiosk is the only mode that hides the playback controls,
+              so the consequence is stated at the moment the user chooses it rather than after playback starts. */}
+          {mode && (
+            <Text variant="bodySmall" color="secondary" element="p" role="status">
+              <Trans i18nKey="playlist.start-modal.description-kiosk-controls">
+                Kiosk mode hides the playlist controls. Press the Esc key to exit kiosk mode and show them, including
+                Stop playlist.
+              </Trans>
+            </Text>
+          )}
           <Field noMargin>
             <Checkbox
               label={t('playlist.start-modal.label-autofit', 'Autofit')}
@@ -134,6 +144,10 @@ export const StartModal = ({ playlist, onDismiss }: Props) => {
                 />
                 <Checkbox
                   label={t('playlist.start-modal.label-variables', 'Variables')}
+                  description={t(
+                    'playlist.start-modal.description-variables',
+                    'A playlist applies template variable values per dashboard and displays them in these controls, so clearing this option hides which values are in use'
+                  )}
                   name="displayVariableControls"
                   value={displayVariables}
                   onChange={(e) => setDisplayVariables(e.currentTarget.checked)}

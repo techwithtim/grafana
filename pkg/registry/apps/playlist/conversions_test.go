@@ -1,11 +1,23 @@
 package playlist
 
 import (
+	"context"
+	"errors"
+	"io"
+	"net/http"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apiserver/pkg/admission"
+
+	appsdkapiserver "github.com/grafana/grafana-app-sdk/k8s/apiserver"
+	playlistv1 "github.com/grafana/grafana/apps/playlist/pkg/apis/playlist/v1"
 )
 
 func TestLegacyUpdateCommandToUnstructured(t *testing.T) {
@@ -222,4 +234,282 @@ func TestUnstructuredToLegacyPlaylistDTO(t *testing.T) {
 		assert.Equal(t, "dashboard_by_tag", dto.Items[3].Type)
 		assert.Equal(t, "graph-ng", dto.Items[3].Value)
 	})
+}
+
+func TestLegacyUpdateCommandToUnstructuredForwardsInvalidItemsVerbatim(t *testing.T) {
+	// The deprecated /api/playlists write path proxies through this conversion to the same
+	// resource API the Kubernetes-style endpoints use, so the item contract is enforced in
+	// exactly one place: the admission plugin in register.go. This pins the bridge's half of
+	// that arrangement -- it neither repairs nor drops an item the validator will reject, so
+	// the rejection cannot be defeated by writing through the legacy surface, and there is no
+	// second, drifting gate to maintain here.
+	obj := LegacyUpdateCommandToUnstructured(UpdatePlaylistCommand{
+		UID:      "playlist-uid",
+		Name:     "Test",
+		Interval: "20s",
+		Items: []PlaylistItem{
+			{Type: "", Value: "xCmMwXdVz"},
+			{Type: "dashboard_by_uid", Value: ""},
+			{Type: "dashboard_by_unicorn", Value: "x"},
+			{Type: "dashboard_by_uid", Value: "xCmMwXdVz", Variables: map[string][]string{"host": {""}}},
+			{Type: "dashboard_by_uid", Value: "xCmMwXdVz", Variables: map[string][]string{"": {"a"}}},
+		},
+	})
+
+	spec, ok := obj.Object["spec"].(map[string]any)
+	require.True(t, ok, "spec should be a map[string]any")
+	items, ok := spec["items"].([]any)
+	require.True(t, ok, "spec.items should be an []any, got %T", spec["items"])
+	require.Len(t, items, 5, "every command item must produce exactly one entry, in order")
+
+	assert.Equal(t, map[string]any{"type": "", "value": "xCmMwXdVz"}, items[0],
+		"a missing item type must reach the resource API as the empty string, not be defaulted")
+	assert.Equal(t, map[string]any{"type": "dashboard_by_uid", "value": ""}, items[1],
+		"a missing item value must reach the resource API as the empty string, not be defaulted")
+	assert.Equal(t, map[string]any{"type": "dashboard_by_unicorn", "value": "x"}, items[2],
+		"an out-of-enum item type must be forwarded verbatim, not coerced to a known type")
+	assert.Equal(t, map[string]any{
+		"type":      "dashboard_by_uid",
+		"value":     "xCmMwXdVz",
+		"variables": map[string]any{"host": []any{""}},
+	}, items[3], "an empty variable value must be forwarded, not filtered out of the list")
+	assert.Equal(t, map[string]any{
+		"type":      "dashboard_by_uid",
+		"value":     "xCmMwXdVz",
+		"variables": map[string]any{"": []any{"a"}},
+	}, items[4], "an empty variable name must be forwarded, not dropped from the map")
+}
+
+// recordingAdmission stands in for the App SDK's admission handler so the wrapper's
+// delegation can be observed.
+type recordingAdmission struct {
+	handles       bool
+	admitErr      error
+	validateErr   error
+	admitCalls    int
+	validateCalls int
+}
+
+var (
+	_ admission.Interface           = (*recordingAdmission)(nil)
+	_ admission.MutationInterface   = (*recordingAdmission)(nil)
+	_ admission.ValidationInterface = (*recordingAdmission)(nil)
+)
+
+func (r *recordingAdmission) Handles(admission.Operation) bool { return r.handles }
+
+func (r *recordingAdmission) Admit(context.Context, admission.Attributes, admission.ObjectInterfaces) error {
+	r.admitCalls++
+	return r.admitErr
+}
+
+func (r *recordingAdmission) Validate(context.Context, admission.Attributes, admission.ObjectInterfaces) error {
+	r.validateCalls++
+	return r.validateErr
+}
+
+// stubAppInstaller supplies only the one method AdmissionPlugin() overrides. The embedded
+// interface is nil, which is safe because no other method is reached by these tests.
+type stubAppInstaller struct {
+	appsdkapiserver.AppInstaller
+	factory admission.Factory
+}
+
+func (s *stubAppInstaller) AdmissionPlugin() admission.Factory { return s.factory }
+
+func playlistAdmissionAttributes(obj runtime.Object, operation admission.Operation) admission.Attributes {
+	name := ""
+	if accessor, err := meta.Accessor(obj); err == nil {
+		name = accessor.GetName()
+	}
+	return admission.NewAttributesRecord(
+		obj,
+		nil,
+		playlistv1.PlaylistKind().GroupVersionKind(),
+		"default",
+		name,
+		schema.GroupVersionResource{Group: playlistv1.APIGroup, Version: "v1", Resource: "playlists"},
+		"",
+		operation,
+		nil,
+		false,
+		nil,
+	)
+}
+
+func TestAppInstallerAdmissionPlugin(t *testing.T) {
+	t.Run("a nil delegate factory stays nil", func(t *testing.T) {
+		installer := &AppInstaller{AppInstaller: &stubAppInstaller{factory: nil}}
+		assert.Nil(t, installer.AdmissionPlugin(),
+			"a manifest that declares no admission must not gain a handler from the wrapper")
+	})
+
+	t.Run("a delegate construction error is surfaced", func(t *testing.T) {
+		sentinel := errors.New("boom")
+		installer := &AppInstaller{AppInstaller: &stubAppInstaller{
+			factory: func(io.Reader) (admission.Interface, error) { return nil, sentinel },
+		}}
+		factory := installer.AdmissionPlugin()
+		require.NotNil(t, factory)
+		plugin, err := factory(nil)
+		assert.Nil(t, plugin)
+		assert.ErrorIs(t, err, sentinel)
+	})
+
+	t.Run("the wrapper implements every admission interface the chain looks for", func(t *testing.T) {
+		delegate := &recordingAdmission{handles: true}
+		installer := &AppInstaller{AppInstaller: &stubAppInstaller{
+			factory: func(io.Reader) (admission.Interface, error) { return delegate, nil },
+		}}
+		plugin, err := installer.AdmissionPlugin()(nil)
+		require.NoError(t, err)
+
+		// The chain type-asserts for these two separately and skips a handler that does not
+		// implement the one it wants, so losing either would silently disable a hook.
+		assert.Implements(t, (*admission.MutationInterface)(nil), plugin)
+		assert.Implements(t, (*admission.ValidationInterface)(nil), plugin)
+
+		assert.True(t, plugin.Handles(admission.Create), "Handles must follow the delegate")
+		delegate.handles = false
+		assert.False(t, plugin.Handles(admission.Create), "Handles must follow the delegate")
+	})
+}
+
+func TestPlaylistAdmissionValidate(t *testing.T) {
+	validPlaylist := func() *playlistv1.Playlist {
+		obj := &playlistv1.Playlist{}
+		obj.SetName("valid-playlist")
+		obj.Spec = playlistv1.PlaylistSpec{
+			Title:    "Test",
+			Interval: "5m",
+			Items: []playlistv1.PlaylistPlaylistItem{
+				{
+					Type:      playlistv1.PlaylistPlaylistItemTypeDashboardByUid,
+					Value:     "xCmMwXdVz",
+					Variables: map[string][]string{"host": {"a", "b"}},
+				},
+			},
+		}
+		return obj
+	}
+
+	t.Run("a valid playlist reaches the delegate", func(t *testing.T) {
+		sentinel := errors.New("delegate decided")
+		delegate := &recordingAdmission{handles: true, validateErr: sentinel}
+		plugin := &playlistAdmission{delegate: delegate}
+
+		err := plugin.Validate(context.Background(),
+			playlistAdmissionAttributes(validPlaylist(), admission.Create), nil)
+
+		assert.ErrorIs(t, err, sentinel, "the delegate's verdict must be returned unchanged")
+		assert.Equal(t, 1, delegate.validateCalls)
+	})
+
+	t.Run("an invalid playlist is rejected as Invalid before the delegate runs", func(t *testing.T) {
+		delegate := &recordingAdmission{handles: true}
+		plugin := &playlistAdmission{delegate: delegate}
+
+		obj := validPlaylist()
+		obj.SetName("invalid-playlist")
+		obj.Spec.Items = []playlistv1.PlaylistPlaylistItem{
+			{Value: "xCmMwXdVz"},
+			{Type: playlistv1.PlaylistPlaylistItemTypeDashboardByUid},
+			{Type: "dashboard_by_unicorn", Value: "x"},
+			{
+				Type:      playlistv1.PlaylistPlaylistItemTypeDashboardByUid,
+				Value:     "xCmMwXdVz",
+				Variables: map[string][]string{"host": nil, "cluster": {""}, "": {"a"}},
+			},
+		}
+
+		err := plugin.Validate(context.Background(),
+			playlistAdmissionAttributes(obj, admission.Create), nil)
+
+		require.Error(t, err)
+		assert.Equal(t, 0, delegate.validateCalls, "a rejected object must not reach the delegate")
+
+		// Invalid is what renders as HTTP 422 with per-field causes. The SDK's own admission
+		// path could only produce 403 with the causes flattened into a message, which is why
+		// this wrapper exists.
+		var status *apierrors.StatusError
+		require.ErrorAs(t, err, &status)
+		require.True(t, apierrors.IsInvalid(err), "got reason %q", status.ErrStatus.Reason)
+		assert.EqualValues(t, http.StatusUnprocessableEntity, status.ErrStatus.Code)
+		require.NotNil(t, status.ErrStatus.Details)
+		assert.Equal(t, "invalid-playlist", status.ErrStatus.Details.Name)
+		assert.Equal(t, "playlist.grafana.app", status.ErrStatus.Details.Group)
+		assert.Equal(t, "Playlist", status.ErrStatus.Details.Kind)
+
+		fields := make([]string, 0, len(status.ErrStatus.Details.Causes))
+		for _, cause := range status.ErrStatus.Details.Causes {
+			fields = append(fields, cause.Field)
+		}
+		assert.ElementsMatch(t, []string{
+			"spec.items[0].type",
+			"spec.items[1].value",
+			"spec.items[2].type",
+			`spec.items[3].variables[]`,
+			`spec.items[3].variables[cluster][0]`,
+			`spec.items[3].variables[host]`,
+		}, fields, "every violation must arrive with its own precise field path")
+	})
+
+	t.Run("another group's resource is passed straight through", func(t *testing.T) {
+		delegate := &recordingAdmission{handles: true}
+		plugin := &playlistAdmission{delegate: delegate}
+
+		other := &unstructured.Unstructured{Object: map[string]any{
+			"apiVersion": "example.grafana.app/v1",
+			"kind":       "Example",
+		}}
+
+		require.NoError(t, plugin.Validate(context.Background(),
+			playlistAdmissionAttributes(other, admission.Create), nil))
+		assert.Equal(t, 1, delegate.validateCalls,
+			"the chain is shared, so a non-playlist object must be a no-op for the wrapper")
+	})
+
+	t.Run("an operation without an object is passed straight through", func(t *testing.T) {
+		delegate := &recordingAdmission{handles: true}
+		plugin := &playlistAdmission{delegate: delegate}
+
+		require.NoError(t, plugin.Validate(context.Background(),
+			playlistAdmissionAttributes(nil, admission.Delete), nil))
+		assert.Equal(t, 1, delegate.validateCalls, "a DELETE carries no object and must not panic")
+	})
+
+	t.Run("without a delegate the wrapper still enforces the contract", func(t *testing.T) {
+		plugin := &playlistAdmission{}
+
+		require.NoError(t, plugin.Validate(context.Background(),
+			playlistAdmissionAttributes(validPlaylist(), admission.Create), nil))
+		require.NoError(t, plugin.Admit(context.Background(),
+			playlistAdmissionAttributes(validPlaylist(), admission.Create), nil))
+		assert.True(t, plugin.Handles(admission.Create))
+		assert.True(t, plugin.Handles(admission.Update))
+		assert.False(t, plugin.Handles(admission.Delete))
+
+		obj := validPlaylist()
+		obj.Spec.Items = []playlistv1.PlaylistPlaylistItem{{Type: "dashboard_by_unicorn", Value: "x"}}
+		assert.True(t, apierrors.IsInvalid(plugin.Validate(context.Background(),
+			playlistAdmissionAttributes(obj, admission.Create), nil)))
+	})
+}
+
+func TestPlaylistAdmissionAdmit(t *testing.T) {
+	// The app's mutation hook runs through the delegate, so the wrapper must forward Admit
+	// unconditionally -- it performs no mutation of its own, and nothing about a write is
+	// silently normalized or repaired.
+	sentinel := errors.New("delegate mutated")
+	delegate := &recordingAdmission{handles: true, admitErr: sentinel}
+	plugin := &playlistAdmission{delegate: delegate}
+
+	obj := &playlistv1.Playlist{}
+	obj.SetName("invalid-playlist")
+	obj.Spec.Items = []playlistv1.PlaylistPlaylistItem{{Type: "dashboard_by_unicorn"}}
+
+	err := plugin.Admit(context.Background(), playlistAdmissionAttributes(obj, admission.Create), nil)
+
+	assert.ErrorIs(t, err, sentinel)
+	assert.Equal(t, 1, delegate.admitCalls, "the app's mutation hook must keep running")
 }
