@@ -14,6 +14,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 
+	claims "github.com/grafana/authlib/types"
 	"github.com/grafana/grafana/pkg/apimachinery/utils"
 	"github.com/grafana/grafana/pkg/storage/unified/resourcepb"
 	"github.com/grafana/grafana/pkg/util/scheduler"
@@ -61,6 +62,59 @@ func NewNotFoundError(key *resourcepb.ResourceKey) *resourcepb.ErrorResult {
 			Name:  key.Name,
 		},
 	}
+}
+
+// NewInvalidNameError reports a metadata.name violation the way every other
+// name violation is reported to an API client: 422 Invalid, naming the offending
+// field in details.causes so the client can point at the request body.
+//
+// It takes a *resourcepb.ResourceKey rather than a utils.GrafanaMetaAccessor —
+// unlike newInvalidFieldError and newRequiredFieldError — because request-key
+// validation runs before the object body is decoded, so the key is the only
+// description of the resource available at that point.
+//
+// The envelope is built through apierrors.NewInvalid so the message, the cause
+// type and the details are byte-for-byte the shape the API server produces for
+// the name violations it catches itself, instead of a second, near-identical
+// shape only unified storage emits.
+func NewInvalidNameError(key *resourcepb.ResourceKey, detail string) *resourcepb.ErrorResult {
+	var group, resource, name string
+	if key != nil {
+		group, resource, name = key.Group, key.Resource, key.Name
+	}
+	// Kind is the resource here, which is what apierrors.NewNotFound does as
+	// well (see NewNotFoundError above): the key names a resource, and the
+	// kind it maps to is not known at this layer.
+	return AsErrorResult(apierrors.NewInvalid(
+		schema.GroupKind{Group: group, Kind: resource},
+		name,
+		field.ErrorList{field.Invalid(field.NewPath("metadata", "name"), name, detail)},
+	))
+}
+
+// ErrorResultAsGRPCError converts an ErrorResult into a gRPC error that carries
+// the result as a status detail, so its reason, HTTP code and details survive
+// the transport. Returning status.Error(code, result.Message) instead discards
+// all three: AsErrorResult on the receiving side then finds nothing structured
+// and falls back to the transport text, which is how an invalid name reached
+// clients as a reason-less 400 whose message read "rpc error: code = ...".
+//
+// The gRPC code is derived from the result's HTTP status. A status with no gRPC
+// mapping keeps InvalidArgument, the code the request-validation call sites have
+// always returned, so the wire contract does not change for them.
+func ErrorResultAsGRPCError(result *resourcepb.ErrorResult) error {
+	if result == nil {
+		return nil
+	}
+	code := grpcCodeFromHTTPStatus(result.Code)
+	if code == grpccodes.Unknown {
+		code = grpccodes.InvalidArgument
+	}
+	st := grpcstatus.New(code, result.Message)
+	if withDetails, err := st.WithDetails(result); err == nil {
+		st = withDetails
+	}
+	return st.Err()
 }
 
 func NewResourceVersionExpiredError(rv int64) error {
@@ -235,17 +289,98 @@ func AsErrorResult(err error) *resourcepb.ErrorResult {
 		return res
 	}
 
-	code := 500
+	// A cross-namespace request is reported by authlib as a bare sentinel, and it
+	// reaches this funnel wrapped by whichever layers it crossed — for the SQL
+	// backend the transaction wrapper prefixes "transactional operation: ".
+	// Untyped it mapped to 500, which told the client the server had broken when
+	// it had in fact refused the request: a cluster-scoped list carries an empty
+	// namespace, which matches no non-wildcard identity, so the first candidate
+	// item fails its access check. 403 Forbidden is the answer
+	// requireUserNamespace already gives for the same condition, and the message
+	// is rebuilt from the sentinel so no wrapping from the layers in between is
+	// disclosed. Identities entitled to read across namespaces hold the wildcard
+	// namespace, which claims.NamespaceMatches accepts, so they never reach here.
+	if errors.Is(err, claims.ErrNamespaceMismatch) {
+		return &resourcepb.ErrorResult{
+			Message: claims.ErrNamespaceMismatch.Error(),
+			Code:    http.StatusForbidden,
+			Reason:  string(metav1.StatusReasonForbidden),
+		}
+	}
 
-	st, ok := grpcstatus.FromError(err)
-	if ok {
-		code = runtime.HTTPStatusFromCode(st.Code())
+	// Residual cases: the error carries no structured result at all, so the
+	// envelope is derived from what the error itself says. It must still be
+	// complete — Kubernetes clients classify failures by reason (every
+	// apierrors.IsXxx helper reads it), so an envelope without one leaves the
+	// caller unable to tell a rejected request from a broken server.
+	code := int32(http.StatusInternalServerError)
+	message := err.Error()
+
+	// A bare gRPC status is what a request rejected before any structured result
+	// was attached arrives as. Its own message is used rather than err.Error(),
+	// which prepends the "rpc error: code = ... desc = ..." transport syntax; the
+	// unwrap keeps that syntax out even when the status was wrapped on the way up.
+	var grpcErr interface{ GRPCStatus() *grpcstatus.Status }
+	if errors.As(err, &grpcErr) {
+		if st := grpcErr.GRPCStatus(); st != nil {
+			code = int32(runtime.HTTPStatusFromCode(st.Code()))
+			message = st.Message()
+		}
 	}
 
 	return &resourcepb.ErrorResult{
-		Message: err.Error(),
-		Code:    int32(code),
+		Message: message,
+		Code:    code,
+		Reason:  string(reasonFromHTTPStatus(code)),
 	}
+}
+
+// reasonFromHTTPStatus names the metav1 reason that belongs with an HTTP status,
+// for errors that reached AsErrorResult carrying a status but no reason of their
+// own. The pairs mirror the ones apimachinery itself uses when it builds a
+// Status from a bare response code (apierrors.NewGenericServerResponse), so an
+// envelope this funnel produces classifies the same way one built by the API
+// server would. Only the message differs: the error's own message is kept,
+// because it is more specific than apimachinery's generic wording.
+//
+// An unmapped status yields StatusReasonUnknown (the empty reason), which is
+// what apimachinery reports for a status it cannot classify.
+func reasonFromHTTPStatus(code int32) metav1.StatusReason {
+	switch code {
+	case http.StatusBadRequest:
+		return metav1.StatusReasonBadRequest
+	case http.StatusUnauthorized:
+		return metav1.StatusReasonUnauthorized
+	case http.StatusForbidden:
+		return metav1.StatusReasonForbidden
+	case http.StatusNotFound:
+		return metav1.StatusReasonNotFound
+	case http.StatusMethodNotAllowed:
+		return metav1.StatusReasonMethodNotAllowed
+	case http.StatusNotAcceptable:
+		return metav1.StatusReasonNotAcceptable
+	case http.StatusRequestTimeout:
+		return metav1.StatusReasonTimeout
+	case http.StatusConflict:
+		return metav1.StatusReasonConflict
+	case http.StatusGone:
+		return metav1.StatusReasonGone
+	case http.StatusRequestEntityTooLarge:
+		return metav1.StatusReasonRequestEntityTooLarge
+	case http.StatusUnsupportedMediaType:
+		return metav1.StatusReasonUnsupportedMediaType
+	case http.StatusUnprocessableEntity:
+		return metav1.StatusReasonInvalid
+	case http.StatusTooManyRequests:
+		return metav1.StatusReasonTooManyRequests
+	case http.StatusNotImplemented, http.StatusBadGateway, http.StatusInternalServerError:
+		return metav1.StatusReasonInternalError
+	case http.StatusServiceUnavailable:
+		return metav1.StatusReasonServiceUnavailable
+	case http.StatusGatewayTimeout:
+		return metav1.StatusReasonTimeout
+	}
+	return metav1.StatusReasonUnknown
 }
 
 func GetError(res *resourcepb.ErrorResult) error {

@@ -44,6 +44,18 @@ describe('PlaylistCard', () => {
     expect(screen.queryByTestId('icon-exchange-alt')).not.toBeInTheDocument();
   });
 
+  it('names a playlist whose stored title is blank by its resource name', () => {
+    // A playlist stored with a blank title — written before the editor refused one, or straight
+    // through the API — used to render a card with no heading at all, so it could not be told
+    // apart from any other unnamed playlist in the list.
+    const playlist = getPlaylist();
+    playlist.spec = { ...playlist.spec!, title: '   ' };
+
+    setup(playlist);
+
+    expect(screen.getByText('Untitled playlist (foo)')).toBeInTheDocument();
+  });
+
   it('renders the provisioned badge for a managed playlist', () => {
     setup(
       getPlaylist({

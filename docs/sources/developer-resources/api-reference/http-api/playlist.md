@@ -72,7 +72,11 @@ Content-Type: application/json
         "items": [
           {
             "type": "dashboard_by_uid",
-            "value": "dashboard-uid-1"
+            "value": "dashboard-uid-1",
+            "variables": {
+              "host": ["Host1"],
+              "datacenter": ["eu-west-1", "us-east-1"]
+            }
           },
           {
             "type": "dashboard_by_tag",
@@ -326,3 +330,16 @@ Playlist items support three types:
 - `dashboard_by_uid`: Include a specific dashboard by its UID
 - `dashboard_by_tag`: Include all dashboards with a specific tag
 - `dashboard_by_id`: (Deprecated) Include a dashboard by internal ID
+
+Items of type `dashboard_by_uid` also support an optional `variables` field. Each key is a template variable name. Each value is a list of one or more strings. Grafana applies them when the playlist reaches that item. List several values under one name for a multi-value variable. Omit the field to leave the item's behavior unchanged. Add the same dashboard UID more than once with a different set of variables to rotate one dashboard through each set.
+
+The API enforces the following maxima on each item's `variables` map:
+
+- At most 32 variables for each item.
+- At most 64 values for each variable.
+- At most 128 Unicode code points for a variable name.
+- At most 1024 Unicode code points for a value.
+
+A variable name must also contain at least one character that isn't whitespace, invisible, or a control character, and each value must be a non-empty string. Grafana rejects a write that breaks any of these rules with HTTP `422 Unprocessable Entity` and a `Failure` status whose `details.causes` name the offending field, such as `spec.items[0].variables[host]`. Grafana applies the same rules to the `playlist.grafana.app/v1` and `playlist.grafana.app/v0alpha1` resource endpoints and to the deprecated `/api/playlists` endpoints, on create and on update. The Grafana playlist editor applies the same maxima before it saves, so a variable set the editor accepts is a variable set the API stores.
+
+Playback adds one limit of its own in the browser: at most 8192 characters of encoded `var-` parameters in one dashboard URL. When an item's variables exceed that limit, playback skips the pairs that don't fit and applies the rest of the item. A playlist stored before Grafana enforced the maxima above can still exceed them. Such an item still plays, but playback applies only the variables that stay within the maxima, and the playlist editor shows a message in place of that item's variable controls, so remove the item and add it again to change its variables.

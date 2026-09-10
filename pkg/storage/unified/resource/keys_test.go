@@ -6,6 +6,9 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/validation/field"
 
 	"github.com/grafana/grafana/pkg/apimachinery/validation"
 	"github.com/grafana/grafana/pkg/storage/unified/resource/kv"
@@ -90,6 +93,10 @@ func TestVerifyRequestKey(t *testing.T) {
 		name         string
 		input        *resourcepb.ResourceKey
 		expectedCode int32
+		// expectedCauseField is set for the faults that are field violations
+		// rather than malformed requests: they must name the offending field so
+		// a client can map the rejection back to the request body.
+		expectedCauseField string
 	}{
 		{
 			name: "no error when all fields are set and valid",
@@ -131,14 +138,38 @@ func TestVerifyRequestKey(t *testing.T) {
 			expectedCode: http.StatusBadRequest,
 		},
 		{
-			name: "invalid name returns error",
+			// A name violation is a field violation on the addressed object, so
+			// it answers 422 Invalid — not the 400 a malformed request key gets.
+			name: "invalid name returns invalid error",
 			input: &resourcepb.ResourceKey{
 				Namespace: validNamespace,
 				Group:     validGroup,
 				Resource:  validResource,
 				Name:      invalidName,
 			},
-			expectedCode: http.StatusBadRequest,
+			expectedCode:       http.StatusUnprocessableEntity,
+			expectedCauseField: "metadata.name",
+		},
+		{
+			name: "empty name returns invalid error",
+			input: &resourcepb.ResourceKey{
+				Namespace: validNamespace,
+				Group:     validGroup,
+				Resource:  validResource,
+			},
+			expectedCode:       http.StatusUnprocessableEntity,
+			expectedCauseField: "metadata.name",
+		},
+		{
+			name: "name too long returns invalid error",
+			input: &resourcepb.ResourceKey{
+				Namespace: validNamespace,
+				Group:     validGroup,
+				Resource:  validResource,
+				Name:      nameTooLong,
+			},
+			expectedCode:       http.StatusUnprocessableEntity,
+			expectedCauseField: "metadata.name",
 		},
 		{
 			name: "valid legacy UID returns no error",
@@ -160,7 +191,9 @@ func TestVerifyRequestKey(t *testing.T) {
 			expectedCode: http.StatusBadRequest,
 		},
 		{
-			name: "name too long returns error",
+			// The namespace is checked first, so this stays a bad request even
+			// though the name is invalid too.
+			name: "namespace too long outranks a too-long name",
 			input: &resourcepb.ResourceKey{
 				Namespace: namespaceTooLong,
 				Group:     validGroup,
@@ -180,6 +213,23 @@ func TestVerifyRequestKey(t *testing.T) {
 			}
 
 			require.Equal(t, test.expectedCode, err.Code)
+			require.NotEmpty(t, err.Reason, "every rejection must carry a reason a client can branch on")
+			require.NotContains(t, err.Message, "rpc error:")
+
+			if test.expectedCauseField == "" {
+				require.Equal(t, string(metav1.StatusReasonBadRequest), err.Reason)
+				return
+			}
+
+			require.Equal(t, string(metav1.StatusReasonInvalid), err.Reason)
+			require.NotNil(t, err.Details)
+			require.Equal(t, test.input.Group, err.Details.Group)
+			require.Equal(t, test.input.Resource, err.Details.Kind)
+			require.Equal(t, test.input.Name, err.Details.Name)
+			require.Len(t, err.Details.Causes, 1)
+			require.Equal(t, test.expectedCauseField, err.Details.Causes[0].Field)
+			require.Equal(t, string(field.ErrorTypeInvalid), err.Details.Causes[0].Reason)
+			require.True(t, apierrors.IsInvalid(GetError(err)), "expected Invalid, got: %v", GetError(err))
 		})
 	}
 }

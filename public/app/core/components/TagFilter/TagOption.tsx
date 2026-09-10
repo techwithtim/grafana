@@ -13,13 +13,39 @@ export interface TagSelectOption {
   count: number;
 }
 
+/**
+ * What the option is called, for anything that cannot see the badge.
+ *
+ * Every option used to be named "Tag option", so a list of them was a list of identical names and
+ * a screen-reader user had no way to tell `qa-final (2)` from `qa-final-ui (1)`. The name now
+ * carries what the badge shows — the tag, and the number of dashboards carrying it where the filter
+ * reports one (it reports zero for a tag that is already selected, whose count the badge hides too).
+ *
+ * Escaping is turned off for these interpolations alone: tag names are free-form stored text, and
+ * i18next's default escaping would announce `a&b` as `a&amp;b`. It is safe here because React sets
+ * the result as an attribute value, which is never parsed as HTML.
+ */
+function tagOptionLabel(tag: string | undefined, count: number): string {
+  if (tag === undefined) {
+    return t('tag-filter.tag-option-label', 'Tag option');
+  }
+
+  return count > 0
+    ? t('tag-filter.tag-option-label-with-count', 'Tag option {{tag}} ({{tagCount}})', {
+        tag,
+        tagCount: count,
+        interpolation: { escapeValue: false },
+      })
+    : t('tag-filter.tag-option-label-tag', 'Tag option {{tag}}', { tag, interpolation: { escapeValue: false } });
+}
+
 export const TagOption = ({ data, className, label, isFocused, innerProps }: OptionProps<TagSelectOption>) => {
   const styles = useStyles2(getStyles);
 
   return (
     <div
       className={cx(styles.option, isFocused && styles.optionFocused)}
-      aria-label={t('tag-filter.tag-option-label', 'Tag option')}
+      aria-label={tagOptionLabel(typeof label === 'string' ? label : undefined, data.count ?? 0)}
       {...innerProps}
     >
       <div className={cx(styles.optionInner, className)}>

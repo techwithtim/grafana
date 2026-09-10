@@ -129,6 +129,18 @@ async function initTranslations({
     // If translations are empty strings (no translation), fall back to the default value in source code
     returnEmptyString: false,
 
+    // `interpolation.escapeValue` is deliberately left at the i18next default of `true`, so an
+    // interpolated value reaching HTML stays escaped. It is not turned off here because `t` is
+    // exported from this package and is read by every call site in Grafana and by plugin code
+    // through `initPluginTranslations`, so a default set here removes escaping from all of them at
+    // once — including any that pass a translated string into markup.
+    //
+    // A call site whose string can only ever be an attribute value or a text node, such as an
+    // interpolated `aria-label` or tooltip naming something a user typed, wants the raw characters
+    // instead: escaping there makes the accessible name disagree with what is on screen. Those opt
+    // out one at a time with `t(key, default, { …values, interpolation: { escapeValue: false } })`,
+    // which keeps the safe default for everything that has not been examined.
+
     // Required to ensure that `resolvedLanguage` is set property when an invalid language is passed (such as through 'detect')
     supportedLngs: VALID_LANGUAGES.map((lang) => lang.code),
     fallbackLng: DEFAULT_LANGUAGE,

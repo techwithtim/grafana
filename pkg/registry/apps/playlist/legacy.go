@@ -8,9 +8,7 @@ type Playlist struct {
 	Interval string `json:"interval" db:"interval"`
 	OrgId    int64  `json:"-" db:"org_id"`
 
-	// Added for kubernetes migration + synchronization
-	// Hidden from json because this is used for openapi generation
-	// Using int64 rather than time.Time to avoid database issues with time support
+	// Unix timestamps avoid driver-specific time handling in the legacy migration path.
 	CreatedAt int64 `json:"-" db:"created_at"`
 	UpdatedAt int64 `json:"-" db:"updated_at"`
 }
@@ -29,16 +27,11 @@ type PlaylistDTO struct {
 	// The ordered list of items that the playlist will iterate over.
 	Items []PlaylistItemDTO `json:"items"`
 
-	// Returned for k8s
 	CreatedAt int64 `json:"-" db:"created_at"`
-
-	// Returned for k8s
 	UpdatedAt int64 `json:"-" db:"updated_at"`
+	OrgID     int64 `json:"-" db:"org_id"`
 
-	// Returned for k8s
-	OrgID int64 `json:"-" db:"org_id"`
-
-	// Returned for k8s and added as an annotation
+	// The legacy ID is carried in the deprecated internal-ID annotation and omitted from JSON.
 	Id int64 `json:"-" db:"id"`
 }
 
@@ -58,6 +51,9 @@ type PlaylistItemDTO struct {
 	//  dashboards behind the tag will be added to the playlist.
 	//  - dashboard_by_uid: The value is the dashboard UID
 	Value string `json:"value"`
+
+	// Optional template variable values applied when this item is played (dashboard_by_uid only)
+	Variables map[string][]string `json:"variables,omitempty"`
 }
 
 type PlaylistItem struct {
@@ -65,15 +61,13 @@ type PlaylistItem struct {
 	PlaylistId int64  `db:"playlist_id"`
 	Type       string `json:"type" db:"type"`
 	Value      string `json:"value" db:"value"`
-	Order      int    `json:"order" db:"order"`
-	Title      string `json:"title" db:"title"`
+	// Optional template variable values applied when this item is played (dashboard_by_uid only)
+	Variables map[string][]string `json:"variables,omitempty" xorm:"-" db:"-"` // the obsolete playlist_item table has no variables column
+	Order     int                 `json:"order" db:"order"`
+	Title     string              `json:"title" db:"title"`
 }
 
 type Playlists []*Playlist
-
-//
-// COMMANDS
-//
 
 type UpdatePlaylistCommand struct {
 	OrgId    int64          `json:"-"`
@@ -97,12 +91,7 @@ type DeletePlaylistCommand struct {
 	OrgId int64
 }
 
-//
-// QUERIES
-//
-
 type GetPlaylistsQuery struct {
-	// NOTE: the frontend never sends this query
 	Name  string
 	Limit int
 	OrgId int64

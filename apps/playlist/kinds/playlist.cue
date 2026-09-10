@@ -12,6 +12,14 @@ package playlist
 	//  dashboards behind the tag will be added to the playlist.
 	//  - dashboard_by_uid: The value is the dashboard UID
 	value: string
+	// Optional template variable values applied when this item is played (dashboard_by_uid only).
+	// Each key is a variable name; its value is a list of one or more values for that variable.
+	// A multi-value variable is expressed by several list elements under the same key.
+	// A write is rejected when an item carries more than 32 variables, a variable carries more
+	// than 64 values, a name is longer than 128 Unicode code points, a value is longer than 1024
+	// Unicode code points, or a name or value is empty. A name of whitespace, invisible or
+	// control characters alone counts as empty.
+	variables?: [string]: [string, ...string]
 }
 
 playlistv1: {
@@ -31,12 +39,16 @@ playlistv1: {
 			"UPDATE",
 		]
 	}
+	// items references #PlaylistItem directly on purpose. An intermediate alias
+	// (#Item: #PlaylistItem) publishes a $ref-only OpenAPI model with no type of its
+	// own, which structured-merge-diff cannot resolve: server-side apply then fails
+	// and managedFields cannot be tracked for any playlist that has items.
+
 	schema: {
-		#Item: #PlaylistItem
 		spec: {
 			title:    string
 			interval: string
-			items: [...#Item]
+			items: [...#PlaylistItem]
 		}
 	}
 }

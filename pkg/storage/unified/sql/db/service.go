@@ -3,7 +3,15 @@ package db
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
+	"net/http"
+
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	"github.com/grafana/grafana-app-sdk/logging"
+
+	"github.com/grafana/grafana/pkg/util/sqlite"
 )
 
 //go:generate mockery --with-expecter --name DB
@@ -118,11 +126,24 @@ func NewWithTxFunc(x BeginTxFunc) WithTxFunc {
 		func(ctx context.Context, opts *sql.TxOptions, f TxFunc) error {
 			t, err := x(ctx, opts)
 			if err != nil {
-				return fmt.Errorf(oneErrFmt, beginStr, err)
+				// The transaction could not even be started, so this error
+				// comes from the driver and never from caller code. Raw driver
+				// text at this point can carry deployment detail (the DSN host
+				// and port for the networked drivers, the authenticated user
+				// name, lock state), so the client only learns that storage
+				// failed while the operator gets the detail from the log.
+				logTxFailure(ctx, beginStr, err)
+				return Redact(fmt.Errorf(oneErrFmt, beginStr, err))
 			}
 
 			if err := f(ctx, t); err != nil {
 				if rollbackErr := t.Rollback(); rollbackErr != nil {
+					// Both errors are joined with %w, so errors.As reaches
+					// either of them: whatever status the transactional
+					// operation itself carries (a SQLError redaction, a
+					// conflict, a not-found) still decides the client
+					// envelope, which is why this is not redacted here.
+					logTxFailure(ctx, rollbackStr, rollbackErr)
 					return fmt.Errorf(twoErrFmt, txOpStr, err, rollbackStr,
 						rollbackErr)
 				}
@@ -130,12 +151,219 @@ func NewWithTxFunc(x BeginTxFunc) WithTxFunc {
 			}
 
 			if err = t.Commit(); err != nil {
-				return fmt.Errorf(oneErrFmt, commitStr, err)
+				// As with begin, a commit failure is the driver's own, so it
+				// is redacted for the client and logged for the operator.
+				logTxFailure(ctx, commitStr, err)
+				return Redact(fmt.Errorf(oneErrFmt, commitStr, err))
 			}
 
 			return nil
 		},
 	)
+}
+
+// StorageErrorMessage is the single client-facing message that unified storage
+// presents for a failure originating in the SQL layer. It deliberately carries
+// no schema, statement, query-template, driver or deployment detail: those
+// reach the operator through the server log instead (see logTxFailure here and
+// the failure logging in the dbutil package). Callers that need to tell such a
+// failure apart from a client error can rely on the accompanying
+// metav1.StatusReasonInternalError reason rather than on message text.
+const StorageErrorMessage = "internal storage error"
+
+// StorageBusyMessage is the client-facing message for a write that lost a race
+// for the database rather than failing: the request was not served, but the
+// same request will succeed once the lock clears. Like StorageErrorMessage it
+// names neither the engine, the statement nor the schema.
+const StorageBusyMessage = "storage is busy, please retry"
+
+// storageBusyRetryAfterSeconds is the retry hint attached to a contention
+// failure. One second is the smallest value metav1.StatusDetails can express,
+// and it is what turns the response into a retryable one for clients: the API
+// server renders a positive RetryAfterSeconds as the Retry-After header
+// (apiserver/pkg/endpoints/handlers/responsewriters.ErrorNegotiated), and
+// client-go retries a 5xx that carries one (rest.checkWait).
+const storageBusyRetryAfterSeconds = 1
+
+// InternalStorageStatus returns the generic, non-revealing metav1.Status that a
+// SQL-layer failure presents to API clients. It is the one place where that
+// envelope is defined, so the resource surface and the legacy REST surface —
+// which both render whatever status the storage error carries — stay in sync.
+func InternalStorageStatus() metav1.Status {
+	return metav1.Status{
+		Status:  metav1.StatusFailure,
+		Code:    http.StatusInternalServerError,
+		Reason:  metav1.StatusReasonInternalError,
+		Message: StorageErrorMessage,
+	}
+}
+
+// StorageBusyStatus returns the envelope for a request that failed on database
+// contention. It reports the condition the way Kubernetes reports a request the
+// server could not serve right now — StatusReasonServerTimeout with a retry
+// hint — so that a caller can tell a transient contention failure apart from a
+// broken server without reading message text, which is exactly what the
+// redaction of the driver error takes away.
+func StorageBusyStatus() metav1.Status {
+	return metav1.Status{
+		Status:  metav1.StatusFailure,
+		Code:    http.StatusInternalServerError,
+		Reason:  metav1.StatusReasonServerTimeout,
+		Message: StorageBusyMessage,
+		Details: &metav1.StatusDetails{
+			RetryAfterSeconds: storageBusyRetryAfterSeconds,
+		},
+	}
+}
+
+// BusyError marks an error as database contention for the classification below
+// when the driver error alone can no longer say so.
+//
+// SQLite reports a lost race for the write lock in two shapes. A lock upgrade
+// inside a deferred transaction fails immediately with SQLITE_BUSY, which
+// sqlite.IsBusyOrLocked still recognises in the returned error. A statement that
+// waits on the busy handler instead is interrupted when its context expires, and
+// the driver then returns the context error in place of the SQLite one, which
+// erases the busy state before any code above the statement can see it. The
+// second shape is therefore recognised where the statement runs — see the
+// classification in the dbutil package, which is the only place that knows how
+// long the statement waited and against which engine — and travels up as this
+// marker so that the envelope, the failure logging and any retry logic all
+// classify the failure the same way.
+//
+// It wraps rather than replaces, so errors.Is and errors.As keep reaching the
+// context error and everything below it, and Error() is the wrapped text
+// verbatim so that logs and error comparisons are unchanged by the marking.
+type BusyError struct {
+	Err error
+}
+
+// Error returns the wrapped error verbatim: marking a failure as contention
+// adds a classification, never client- or operator-facing text.
+func (e BusyError) Error() string { return e.Err.Error() }
+
+// Unwrap exposes the wrapped error so that errors.Is and errors.As keep
+// reaching the context error the driver returned and the driver error, if any,
+// underneath it.
+func (e BusyError) Unwrap() error { return e.Err }
+
+// Status implements the APIStatus contract so that a marked error carries the
+// retryable envelope even when it reaches the API surface directly, without a
+// SQLError or a Redact wrapper around it.
+func (e BusyError) Status() metav1.Status { return StorageBusyStatus() }
+
+// NewBusyError marks err as database contention. A nil error stays nil so that
+// call sites can mark unconditionally.
+func NewBusyError(err error) error {
+	if err == nil {
+		return nil
+	}
+	return BusyError{Err: err}
+}
+
+// IsBusy reports whether err is a lost race for the database in either of the
+// shapes BusyError describes: the driver's own busy state, or a busy wait that
+// was interrupted and marked at the statement site.
+//
+// It is the single predicate for that condition above the statement layer, so
+// retry logic and the client envelope cannot disagree about which failures are
+// transient.
+func IsBusy(err error) bool {
+	if sqlite.IsBusyOrLocked(err) {
+		return true
+	}
+	var busy BusyError
+	return errors.As(err, &busy)
+}
+
+// StatusForError picks the client-facing envelope for a database-layer error:
+// the retryable contention envelope when the database was busy or locked, and
+// the generic storage envelope otherwise.
+//
+// SQLite serializes writes, so a lock upgrade inside a deferred transaction can
+// fail immediately even with busy_timeout set, while a statement that waits on
+// the busy handler comes back as an expired deadline with the driver's busy
+// state erased (BusyError explains both shapes); the same condition used to be
+// recognisable to callers only through the driver text that is now withheld
+// from clients. Contention on the networked engines keeps the generic envelope,
+// as it had no distinguishable client-facing shape before either, and neither
+// engine's ordinary slow statement is reported as contention: only the driver's
+// busy state and the interrupted SQLite busy wait are.
+func StatusForError(err error) metav1.Status {
+	if IsBusy(err) {
+		return StorageBusyStatus()
+	}
+	return InternalStorageStatus()
+}
+
+// apiStatusProvider is the structural equivalent of
+// k8s.io/apimachinery/pkg/api/errors.APIStatus. It is redeclared here so that
+// this package keeps depending on k8s.io/apimachinery/pkg/apis/meta/v1 only,
+// and so that Redact can detect a status that an error already carries.
+type apiStatusProvider interface {
+	Status() metav1.Status
+}
+
+// redactedError hides the message of the error it wraps from API clients while
+// leaving the error itself untouched for every other consumer: Error() still
+// returns the full operator-facing text that the log and the tests expect, and
+// Unwrap() keeps errors.Is/errors.As, driver-specific classification (for
+// example pkg/util/sqlite.IsBusyOrLocked) and sql.ErrNoRows detection working.
+// The Status method makes it satisfy k8s.io/apimachinery/pkg/api/errors
+// APIStatus, which is what the unified storage error mapping prefers over the
+// err.Error() fallback when building a client response.
+type redactedError struct {
+	err error
+}
+
+// Error returns the wrapped error verbatim. The redaction applies to the
+// client-facing status only, never to logs or to error comparisons.
+func (e redactedError) Error() string { return e.err.Error() }
+
+// Unwrap exposes the wrapped error so that errors.Is and errors.As keep
+// reaching the driver error underneath.
+func (e redactedError) Unwrap() error { return e.err }
+
+// Status implements the APIStatus contract with the storage envelope that fits
+// the wrapped error: retryable when the database was busy, generic otherwise.
+func (e redactedError) Status() metav1.Status { return StatusForError(e.err) }
+
+// Redact returns err wrapped so that API clients receive the generic
+// InternalStorageStatus envelope instead of the error's own text, while the
+// error remains fully intact for logging and for errors.Is/errors.As.
+//
+// An error that already carries a status is returned unchanged: errors.As
+// matches the outermost provider first, so wrapping one would replace a
+// deliberate 404, 409 or 422 with a 500. For the same reason Redact must only
+// be applied to errors that originate in the database layer itself, never to
+// an error produced by caller code running inside a transaction.
+func Redact(err error) error {
+	if err == nil {
+		return nil
+	}
+	var existing apiStatusProvider
+	if errors.As(err, &existing) {
+		return err
+	}
+	return redactedError{err: err}
+}
+
+// logTxFailure records the operator-facing detail of a failed transaction
+// boundary operation. Client disconnects (context cancellation and deadline
+// expiry) are expected outcomes rather than storage faults, so they are logged
+// below error level to keep them from drowning real failures. No statement
+// arguments are ever logged, since they may carry regulated information.
+func logTxFailure(ctx context.Context, op string, err error) {
+	logger := logging.FromContext(ctx).With(
+		"logger", loggerName,
+		"operation", op,
+		"error", err.Error(),
+	)
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		logger.Debug(txFailureLogMsg)
+		return
+	}
+	logger.Error(txFailureLogMsg)
 }
 
 // Constants that allow testing that the correct scenario was hit.
@@ -150,4 +378,14 @@ const (
 	beginStr    = "begin"
 	commitStr   = "commit"
 	rollbackStr = "rollback"
+)
+
+const (
+	// loggerName identifies this package in the server log, following the
+	// naming already used by the unified storage SQL backend.
+	loggerName = "unified-storage-sql"
+
+	// txFailureLogMsg is a stable message so that a transaction boundary
+	// failure can be alerted on without parsing the driver error.
+	txFailureLogMsg = "transaction boundary operation failed"
 )

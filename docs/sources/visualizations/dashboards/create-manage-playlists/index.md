@@ -53,6 +53,8 @@ You can start a playlist in four different view modes. View modes determine how 
    - **Variables**
    - **Dashboard links**
 
+   Grafana applies the template variable values of each playlist item to the dashboard URL and displays them in the dashboard's variable controls. If you clear **Variables**, or you start the playlist in **Kiosk** mode, Grafana still applies the values, but the dashboard doesn't display them, so consecutive items that play the same dashboard look identical.
+
 1. Click **Start \<playlist name\>**.
 
 The playlist displays each dashboard for the time specified in the **Interval** field, set when creating or editing a playlist. After a playlist starts, you can start or stop it it using the [controls](#playlist-controls) at the top of your screen.
@@ -74,9 +76,13 @@ The playlist displays each dashboard for the time specified in the **Interval** 
 
 You can control a playlist in **Normal** mode after it's started, using the buttons at the top of your screen. Press the `Esc` key to stop the playlist.
 
-- **Next (double-right arrow)** - Advances to the next dashboard.
-- **Back (double-left arrow)** - Returns to the previous dashboard.
+- **Next (double-right arrow)** - Advances to the next dashboard. On the last dashboard, it returns to the first dashboard.
+- **Back (double-left arrow)** - Returns to the previous dashboard. On the first dashboard, it returns to the last dashboard.
 - **Stop playlist** - Ends the playlist, and exits to the current dashboard.
+
+Grafana doesn't display the playlist controls in **Kiosk** mode. Press the `Esc` key to exit kiosk mode and display them, including **Stop playlist**.
+
+If you use your browser's back or forward button while a playlist plays, Grafana ends the playlist and displays a **Playlist stopped** notification.
 
 ## Create a playlist
 
@@ -91,7 +97,23 @@ You can create a playlist to present dashboards in a sequence, with a set order 
 
    Added dashboards are displayed in a list in the **Dashboards** section of the page, in the order you added them. This is also the play order of the dashboards.
 
+1. To apply template variable values to a dashboard you added by title, click **Template variables** next to the dashboard name, then enter a variable name and its values.
+
+   Enter a variable in the **Variable name** and **Values (comma-separated)** fields, then click **Add variable**. Click the **X** next to a variable to remove it. Dashboards added by tag don't support template variables. You can't enter a single value that contains a comma in the editor, although the API accepts one. The editor accepts up to 32 variables for each dashboard row and up to 64 values for each variable.
+   - **Values**: Grafana separates the values you enter on commas, trims the surrounding spaces, and ignores blank entries, so `x, , y` becomes the two values `x` and `y`.
+   - **Validation**: Grafana rejects an empty name or a values field with no non-empty entries, shows an inline message under that field, and leaves the dashboard row unchanged.
+   - **Unique names**: Grafana rejects a variable name that another variable on the same dashboard row already uses. You can use that name again on another row, including a second row for the same dashboard.
+   - **Rename**: When you rename a variable, its values move to the new name.
+   - **Enter key**: Press the `Enter` key to commit a variable row without saving the playlist.
+   - **Removal**: When you remove the last variable, the dashboard row returns to its plain state.
+   - **Repeated dashboards**: You can add the same dashboard again with **Add by title** and give it a different set of values, so one dashboard rotates through values such as `Host1`, `Host2`, and `Host3`.
+   - **Reordering**: When you reorder or delete a dashboard row, Grafana closes any open variable editor.
+
 1. Click **Save**.
+
+{{< admonition type="caution" >}}
+Grafana places template variable values in the dashboard URL, so they're visible in browser history, in proxy and server access logs, and in any link you copy or share. Don't put secrets or other sensitive data in playlist variables.
+{{< /admonition >}}
 
 ## Edit a playlist
 
@@ -100,10 +122,11 @@ You can edit a playlist including adding, removing, and rearranging the order of
 1. Click **Dashboards** in the main menu.
 1. Click **Playlists**.
 1. Find the playlist you want to update and click **Edit playlist**. Do one or more of the following:
-   - Edit - Update the name and time interval.
-   - Add dashboards - Search for dashboards by title or tag to add them to the playlist.
-   - Rearrange dashboards - Click and drag the dashboards into your desired order.
-   - Remove dashboards - Click the **X** next to the name of the dashboard you want to remove from the playlist.
+   - **Edit**: Update the name and time interval.
+   - **Add dashboards**: Search for dashboards by title or tag to add them to the playlist.
+   - **Rearrange dashboards**: Click and drag the dashboards into your desired order.
+   - **Remove dashboards**: Click the **X** next to the name of the dashboard you want to remove from the playlist.
+   - **Template variables**: Click **Template variables** next to a dashboard added by title to add, change, or remove its variable values.
 
 1. Click **Save**.
 

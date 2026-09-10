@@ -28,7 +28,24 @@ export const PlaylistNewPage = () => {
       return;
     }
 
-    await createPlaylist({ playlist });
+    try {
+      // `unwrap()` is what makes a failed create observable here: an RTK Query mutation trigger
+      // resolves with `{ error }` instead of rejecting, so awaiting the trigger alone would fall
+      // through to the navigation below and unmount the form — discarding everything the user
+      // typed, including the variables committed on each row.
+      await createPlaylist({ playlist }).unwrap();
+    } catch {
+      // The error notification is already raised by `createPlaylist`'s `onQueryStarted`, so the
+      // only thing left to do is stay put: returning leaves the form mounted with the user's input
+      // intact, and `PlaylistForm.doSubmit` re-enables Save in its `finally`, making the retry one
+      // click. The error is deliberately not re-thrown — `doSubmit` awaits this inside
+      // react-hook-form's submit handler, where a rejection becomes an unhandled rejection.
+      return;
+    }
+
+    // Reached only once the playlist is stored. `createPlaylist` invalidates the `Playlist` tag, so
+    // awaiting it also means the list query is invalidated before `/playlists` mounts and the list
+    // shows what was just created without a manual reload.
     locationService.push('/playlists');
   };
 

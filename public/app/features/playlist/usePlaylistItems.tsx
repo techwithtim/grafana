@@ -1,4 +1,4 @@
-import { useCallback, useState } from 'react';
+import { useCallback, useRef, useState } from 'react';
 import { useAsync } from 'react-use';
 
 import { type DashboardPickerDTO } from 'app/core/components/Select/DashboardPicker';
@@ -9,14 +9,42 @@ import { loadDashboards } from './utils';
 export function usePlaylistItems(playlistItems?: PlaylistItemUI[]) {
   const [items, setItems] = useState<PlaylistItemUI[]>(playlistItems ?? []);
 
-  // Attach dashboards if any were missing
   useAsync(async () => {
-    for (const item of items) {
-      if (!item.dashboards) {
-        setItems(await loadDashboards(items));
-        return;
-      }
+    // Only the items that have no dashboards yet are worth searching for. An item whose search
+    // returned nothing carries an empty list, which is a resolved item — asking again would start a
+    // load on every render. Loading the whole list instead is what made one structural change, such
+    // as adding a dashboard to a list that already holds duplicate rows, a tag and a second
+    // dashboard, start a search for every existing row as well as the new one.
+    const unresolved = items.filter((item) => !item.dashboards);
+    if (!unresolved.length) {
+      return;
     }
+
+    // `loadDashboards` answers the items that share a type and a value with a single search, so the
+    // duplicates among them cost one request between them rather than one each.
+    const loaded = await loadDashboards(unresolved);
+    // Merge into the latest state instead of replacing it with the snapshot taken before
+    // the await, which would discard any edit made while the search was in flight.
+    // `loadDashboards` derives an item's dashboards from its type and value alone, so
+    // matching on that pair attaches the right result to each item, even when the same
+    // dashboard is listed more than once. Every other property is left untouched.
+    setItems((prev) => {
+      let merged = false;
+      const next = prev.map((prevItem) => {
+        const match = loaded.find(
+          (loadedItem) => loadedItem.type === prevItem.type && loadedItem.value === prevItem.value
+        );
+        if (!match) {
+          return prevItem;
+        }
+        merged = true;
+        return { ...prevItem, dashboards: match.dashboards };
+      });
+      // A load that resolves after the items it described are gone matches nothing. Returning
+      // the same array leaves the state identity untouched, so this effect — which depends on
+      // `items` — is not re-run by an update that changed nothing.
+      return merged ? next : prev;
+    });
   }, [items]);
 
   const addByUID = useCallback(
@@ -52,27 +80,121 @@ export function usePlaylistItems(playlistItems?: PlaylistItemUI[]) {
     [items]
   );
 
-  const moveItem = useCallback(
-    (src: number, dst: number) => {
-      if (src === dst || !items[src]) {
-        return; // nothing to do
+  /*
+   * A structural change is a functional update rather than a new array built from the render's own
+   * item list, because it is not always the first update of its batch: the editor commits what the
+   * user typed into an open variables editor before the row holding it is moved or removed, and
+   * both changes are applied together. Building from the render's list would take a snapshot from
+   * before that commit and overwrite it — the playlist would then be saved without the variable,
+   * having reported nothing.
+   */
+  const moveItem = useCallback((src: number, dst: number) => {
+    setItems((prev) => {
+      if (src === dst || !prev[src]) {
+        return prev;
       }
-      const update = Array.from(items);
+      const update = Array.from(prev);
       const [removed] = update.splice(src, 1);
       update.splice(dst, 0, removed);
-      setItems(update);
-    },
-    [items]
-  );
+      return update;
+    });
+  }, []);
 
-  const deleteItem = useCallback(
-    (index: number) => {
-      const copy = items.slice();
+  const deleteItem = useCallback((index: number) => {
+    setItems((prev) => {
+      if (!prev[index]) {
+        return prev;
+      }
+      const copy = prev.slice();
       copy.splice(index, 1);
-      setItems(copy);
-    },
-    [items]
-  );
+      return copy;
+    });
+  }, []);
 
-  return { items, addByUID, addByTag, deleteItem, moveItem };
+  const updateItemVariables = useCallback((index: number, variables?: Record<string, string[]>) => {
+    setItems((prev) => {
+      if (!prev[index]) {
+        return prev;
+      }
+
+      return prev.map((item, i) => {
+        if (i !== index) {
+          return item;
+        }
+
+        // An item may be owned by the caller or by the RTK Query cache, so build a new object
+        // rather than mutating this one. An empty map drops the property altogether, so an item
+        // without variables keeps the variable-less payload shape.
+        const { variables: _replaced, ...rest } = item;
+        return variables && Object.keys(variables).length > 0 ? { ...rest, variables } : rest;
+      });
+    });
+  }, []);
+
+  return { items, addByUID, addByTag, deleteItem, moveItem, updateItemVariables };
+}
+
+/**
+ * Gives every item a key that follows the item itself rather than the position it happens to hold.
+ *
+ * The drag and drop library restores focus after a drop to the drag handle whose draggable id it
+ * recorded when the item was lifted, and React reuses the DOM node at a position whose key has not
+ * changed. A key derived from the index therefore leaves both the focus and the node on whichever
+ * item took the moved item's place, so a keyboard user carries on operating the wrong row.
+ *
+ * A key has to survive a reorder and also the object replacement that a variables edit or the
+ * asynchronous dashboard enrichment performs, without being stored on the item itself: an item is
+ * submitted to the API by spreading its own properties, so an added property would be persisted.
+ * Each item therefore claims a previous key by object identity first, which is exact for a move or
+ * a deletion, and then by type and value, preferring the nearest position. The second pass is what
+ * carries a key across a replaced object, including when the same dashboard appears more than once,
+ * because the untouched twin has already claimed its own key in the first pass.
+ */
+export function usePlaylistItemKeys(items: PlaylistItemUI[]): string[] {
+  const tracked = useRef<{ items: PlaylistItemUI[]; keys: string[] }>({ items: [], keys: [] });
+  const nextKey = useRef(0);
+
+  const { items: previousItems, keys: previousKeys } = tracked.current;
+  const claimed = previousItems.map(() => false);
+  const keys: Array<string | undefined> = items.map(() => undefined);
+
+  const claim = (from: number, to: number) => {
+    claimed[from] = true;
+    keys[to] = previousKeys[from];
+  };
+
+  items.forEach((item, index) => {
+    const previousIndex = previousItems.findIndex((previousItem, i) => !claimed[i] && previousItem === item);
+    if (previousIndex >= 0) {
+      claim(previousIndex, index);
+    }
+  });
+
+  items.forEach((item, index) => {
+    if (keys[index] !== undefined) {
+      return;
+    }
+
+    let nearest = -1;
+    previousItems.forEach((previousItem, i) => {
+      if (claimed[i] || previousItem.type !== item.type || previousItem.value !== item.value) {
+        return;
+      }
+      if (nearest < 0 || Math.abs(i - index) < Math.abs(nearest - index)) {
+        nearest = i;
+      }
+    });
+
+    if (nearest >= 0) {
+      claim(nearest, index);
+    }
+  });
+
+  const resolved = keys.map((key) => key ?? `playlist-item-${nextKey.current++}`);
+  // Recording the result during the render keeps the next render's comparison against the list it
+  // actually rendered. Re-running this render with the same array claims every key by identity
+  // again, so a repeated or discarded render cannot renumber the rows.
+  tracked.current = { items, keys: resolved };
+
+  return resolved;
 }

@@ -2,14 +2,6 @@
 
 package v0alpha1
 
-// +k8s:openapi-gen=true
-type PlaylistItem = PlaylistPlaylistItem
-
-// NewPlaylistItem creates a new PlaylistItem object.
-func NewPlaylistItem() *PlaylistItem {
-	return NewPlaylistPlaylistItem()
-}
-
 // Shared item definition for all versions
 // +k8s:openapi-gen=true
 type PlaylistPlaylistItem struct {
@@ -23,6 +15,14 @@ type PlaylistPlaylistItem struct {
 	//  dashboards behind the tag will be added to the playlist.
 	//  - dashboard_by_uid: The value is the dashboard UID
 	Value string `json:"value"`
+	// Optional template variable values applied when this item is played (dashboard_by_uid only).
+	// Each key is a variable name; its value is a list of one or more values for that variable.
+	// A multi-value variable is expressed by several list elements under the same key.
+	// A write is rejected when an item carries more than 32 variables, a variable carries more
+	// than 64 values, a name is longer than 128 Unicode code points, a value is longer than 1024
+	// Unicode code points, or a name or value is empty. A name of whitespace, invisible or
+	// control characters alone counts as empty.
+	Variables map[string][]string `json:"variables,omitempty"`
 }
 
 // NewPlaylistPlaylistItem creates a new PlaylistPlaylistItem object.
@@ -37,15 +37,15 @@ func (PlaylistPlaylistItem) OpenAPIModelName() string {
 
 // +k8s:openapi-gen=true
 type PlaylistSpec struct {
-	Title    string         `json:"title"`
-	Interval string         `json:"interval"`
-	Items    []PlaylistItem `json:"items"`
+	Title    string                 `json:"title"`
+	Interval string                 `json:"interval"`
+	Items    []PlaylistPlaylistItem `json:"items"`
 }
 
 // NewPlaylistSpec creates a new PlaylistSpec object.
 func NewPlaylistSpec() *PlaylistSpec {
 	return &PlaylistSpec{
-		Items: []PlaylistItem{},
+		Items: []PlaylistPlaylistItem{},
 	}
 }
 

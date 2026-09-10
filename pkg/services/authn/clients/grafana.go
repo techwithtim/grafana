@@ -21,6 +21,20 @@ import (
 var _ authn.ProxyClient = new(Grafana)
 var _ authn.PasswordClient = new(Grafana)
 
+// Fixed inputs used to pay the password-hashing cost when a login does not resolve to a
+// user, so that the failed-authentication path costs the same whether or not the login
+// exists. Only their sizes matter, and those mirror real stored credentials so the work is
+// identical: user salts are util.GetRandomString(10) and a stored hash is
+// util.EncodePassword's 50 bytes hex-encoded, which keeps subtle.ConstantTimeCompare
+// comparing equal-length inputs. Their contents are deliberately uniform placeholders,
+// derived from no password and matching no user: the comparison result is discarded and
+// the not-found error is returned regardless. They are constants because
+// AuthenticatePassword runs concurrently for every request.
+const (
+	decoySalt = "0000000000"
+	decoyHash = "0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+)
+
 func ProvideGrafana(cfg *setting.Cfg, userService user.Service, tracer trace.Tracer) *Grafana {
 	return &Grafana{cfg, userService, tracer}
 }
@@ -103,6 +117,12 @@ func (c *Grafana) AuthenticatePassword(ctx context.Context, r *authn.Request, us
 	usr, err := c.userService.GetByLoginWithPassword(ctx, &user.GetUserByLoginQuery{LoginOrEmail: username})
 	if err != nil {
 		if errors.Is(err, user.ErrUserNotFound) {
+			// The password hash comparison below dominates the cost of an authentication
+			// attempt, so returning here without performing it would make a failed attempt
+			// measurably faster for a login that does not exist than for one that does,
+			// disclosing which logins exist. Spend the same cost on decoy inputs; the
+			// result is deliberately unused and the outcome is unchanged.
+			_ = comparePassword(password, decoySalt, decoyHash)
 			return nil, errIdentityNotFound.Errorf("no user found: %w", err)
 		}
 		return nil, err

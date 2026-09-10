@@ -2,8 +2,14 @@ package app
 
 import (
 	"context"
+	"maps"
+	"slices"
+	"unicode"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/validation/field"
 	"k8s.io/client-go/rest"
 	"k8s.io/klog/v2"
 
@@ -19,6 +25,322 @@ import (
 
 type PlaylistConfig struct {
 	EnableReconcilers bool
+}
+
+// playlistItemTypes are the item types published in the `type` enum of the generated
+// OpenAPI document, in the order the document lists them. Both served versions declare
+// the same three values, so the v1 constants stand for both.
+var playlistItemTypes = []playlistv1.PlaylistPlaylistItemType{
+	playlistv1.PlaylistPlaylistItemTypeDashboardByTag,
+	playlistv1.PlaylistPlaylistItemTypeDashboardByUid,
+	playlistv1.PlaylistPlaylistItemTypeDashboardById,
+}
+
+// The maxima one item's `variables` map has to satisfy to be admitted.
+//
+// They are the four numbers the playlist editor and the playback runtime already apply --
+// MAX_VARIABLES_PER_ITEM, MAX_VALUES_PER_VARIABLE, MAX_VARIABLE_NAME_LENGTH and
+// MAX_VARIABLE_VALUE_LENGTH in public/app/features/playlist/variableLimits.ts -- and they are
+// mirrored here rather than chosen here. Mirroring exactly is the point: a map the editor
+// accepts is a map this validator admits and the other way round, so neither layer can be
+// talked into a payload the other refuses. Changing a number in one place without the other
+// breaks that.
+//
+// Why the map needs a maximum at all: without one, a stored playlist was bounded only by the
+// apiserver's 16 MiB request limit, so a single object could carry megabytes of variables.
+// A namespace list response that passes 2 MiB is chunked by the apiserver, and every client
+// that does not follow a continue token then shows a truncated list -- one playlist could
+// hide the others (CWE-770, allocation without limits).
+const (
+	maxVariablesPerItem  = 32
+	maxValuesPerVariable = 64
+	// Both lengths are counted in Unicode code points, the unit the editor states them in and
+	// the unit a person typing a name means, rather than bytes or UTF-16 units.
+	maxVariableNameLength  = 128
+	maxVariableValueLength = 1024
+)
+
+// elidedNameSuffix marks a variable name that the field path of a violation had to cut. The
+// path is the only part of a refusal that carries the name, so an unbounded name would make
+// the refusal as large as the payload it refuses.
+const elidedNameSuffix = "..."
+
+// playlistGroupKind is the version-agnostic identity carried by the Invalid status of a
+// rejected write.
+var playlistGroupKind = schema.GroupKind{
+	Group: playlistv1.APIGroup,
+	Kind:  playlistv1.PlaylistKind().Kind(),
+}
+
+// playlistItem is the version-agnostic projection of one playlist item. The v1 and
+// v0alpha1 item structs are structurally identical but distinct Go types, so each is
+// normalised into this shape and a single rule set runs over it.
+type playlistItem struct {
+	itemType  string
+	value     string
+	variables map[string][]string
+}
+
+// playlistSubject is everything the item validation needs from an admitted object.
+type playlistSubject struct {
+	name  string
+	items []playlistItem
+}
+
+// playlistSubjectFor projects a Playlist of either served version and reports false for
+// anything else. The apiserver admission chain is shared with every other app installer,
+// and a DELETE carries no object at all, so a non-Playlist argument is the common case
+// and has to stay a cheap no-op.
+func playlistSubjectFor(obj runtime.Object) (playlistSubject, bool) {
+	switch typed := obj.(type) {
+	case *playlistv1.Playlist:
+		if typed == nil {
+			return playlistSubject{}, false
+		}
+		items := make([]playlistItem, 0, len(typed.Spec.Items))
+		for _, item := range typed.Spec.Items {
+			items = append(items, playlistItem{
+				itemType:  string(item.Type),
+				value:     item.Value,
+				variables: item.Variables,
+			})
+		}
+		return playlistSubject{name: typed.GetName(), items: items}, true
+	case *playlistv0alpha1.Playlist:
+		if typed == nil {
+			return playlistSubject{}, false
+		}
+		items := make([]playlistItem, 0, len(typed.Spec.Items))
+		for _, item := range typed.Spec.Items {
+			items = append(items, playlistItem{
+				itemType:  string(item.Type),
+				value:     item.Value,
+				variables: item.Variables,
+			})
+		}
+		return playlistSubject{name: typed.GetName(), items: items}, true
+	default:
+		return playlistSubject{}, false
+	}
+}
+
+// ValidatePlaylistObject reports every way obj departs from the playlist item contract the
+// generated OpenAPI document publishes for both served versions: `required: [type, value]`,
+// the three-value `type` enum, and `variables` as a map of names to lists of strings within
+// the documented maxima. Only that structural contract is enforced here -- variable names and
+// values are never checked against the target dashboard's variable definitions, which stays
+// out of scope.
+//
+// It returns nil for anything that is not a Playlist, including a nil object, because the
+// apiserver admission chain is shared with every other app installer. Every violation is
+// collected instead of returning on the first one, so a rejected write describes all of
+// them at once.
+//
+// Usage: the returned list is turned into the client-visible status error by
+// NewPlaylistInvalidError.
+func ValidatePlaylistObject(obj runtime.Object) field.ErrorList {
+	subject, ok := playlistSubjectFor(obj)
+	if !ok {
+		return nil
+	}
+
+	var errs field.ErrorList
+	itemsPath := field.NewPath("spec", "items")
+	for i, item := range subject.items {
+		errs = append(errs, validatePlaylistItem(item, itemsPath.Index(i))...)
+	}
+	return errs
+}
+
+// NewPlaylistInvalidError builds the status error for violations reported by
+// ValidatePlaylistObject. apierrors.NewInvalid renders as HTTP 422 with one entry per
+// violation in Details.Causes, each carrying the field path built below, which is what
+// makes a rejected write actionable without reading the server log.
+func NewPlaylistInvalidError(obj runtime.Object, errs field.ErrorList) *apierrors.StatusError {
+	name := ""
+	if subject, ok := playlistSubjectFor(obj); ok {
+		name = subject.name
+	}
+	return apierrors.NewInvalid(playlistGroupKind, name, errs)
+}
+
+// validatePlaylistItem applies the published item contract to one item.
+func validatePlaylistItem(item playlistItem, path *field.Path) field.ErrorList {
+	var errs field.ErrorList
+
+	typePath := path.Child("type")
+	switch {
+	case item.itemType == "":
+		errs = append(errs, field.Required(typePath, "an item type is required"))
+	case !slices.Contains(playlistItemTypes, playlistv1.PlaylistPlaylistItemType(item.itemType)):
+		errs = append(errs, field.NotSupported(typePath, item.itemType, playlistItemTypes))
+	}
+
+	if item.value == "" {
+		errs = append(errs, field.Required(path.Child("value"),
+			"an item value is required; its meaning depends on the item type"))
+	}
+
+	// Variables on a dashboard_by_tag item are deliberately accepted: the playback runtime
+	// ignores them, and rejecting a payload that carries them would break clients that
+	// round-trip an item they did not author.
+	return append(errs, validatePlaylistItemVariables(item.variables, path.Child("variables"))...)
+}
+
+// validatePlaylistItemVariables applies the published `variables` contract -- an optional
+// object whose additionalProperties are arrays of non-empty strings, within the maxima above
+// -- to one item's map.
+//
+// Every rule is written to keep the refusal small whatever the payload is: the response to a
+// hostile write must not be a second allocation problem. So an over-wide map costs one cause,
+// an over-long name or value is reported without being echoed, and no string is measured by
+// anything that walks further than the maximum it is being measured against.
+func validatePlaylistItemVariables(variables map[string][]string, path *field.Path) field.ErrorList {
+	// An absent, null or empty map is a valid variable-less item: the field is optional and
+	// the published schema constrains the map's members, not the map itself.
+	if len(variables) == 0 {
+		return nil
+	}
+
+	// An over-wide map is reported once and its members are never looked at. Reporting each
+	// name of a map that holds five thousand of them would answer one rejected write with five
+	// thousand causes, which makes the refusal the very allocation this maximum exists to
+	// refuse.
+	if len(variables) > maxVariablesPerItem {
+		return field.ErrorList{field.TooMany(path, len(variables), maxVariablesPerItem)}
+	}
+
+	var errs field.ErrorList
+	// Sorted so the causes of the resulting 422 come out in a stable order; Go randomises
+	// map iteration.
+	for _, name := range slices.Sorted(maps.Keys(variables)) {
+		values := variables[name]
+		namePath := variableNamePath(path, name)
+
+		if !withinCodePointLimit(name, maxVariableNameLength) {
+			// TooLongCharacters keeps the name itself out of the response, and the path above
+			// carries at most the first maxVariableNameLength code points of it, so the refusal
+			// stays small however long the name was. Nothing else about this variable is
+			// reported: the name is how a caller locates a variable in its own payload, and a
+			// cut name cannot do that job for further causes.
+			errs = append(errs, field.TooLongCharacters(namePath, name, maxVariableNameLength))
+			continue
+		}
+
+		if isBlankVariableName(name) {
+			// A name has to carry at least one character a person can see and type. The rule is
+			// not "not empty after trimming spaces": U+200B ZERO WIDTH SPACE and U+FEFF are not
+			// Unicode whitespace, so a trim-based rule stored them, and the browser then treated
+			// the two differently -- it emitted an invisible `var-%E2%80%8B` parameter for one
+			// and silently skipped the other. Whitespace, format and control characters are
+			// blank here and in the two places the browser applies the same rule
+			// (isBlankVariableName in public/app/features/playlist/variableLimits.ts, used by
+			// playback and by the editor), so all three layers agree on what "empty" means.
+			errs = append(errs, field.Invalid(namePath, name,
+				"a variable name must contain at least one character that is not whitespace, invisible or a control character"))
+		}
+
+		switch {
+		case len(values) == 0:
+			// The field is modelled as one or more values, and the playback runtime skips an
+			// empty list. A JSON `null` list and an empty JSON array both decode to a
+			// zero-length slice, so this one rule covers both spellings.
+			errs = append(errs, field.Invalid(namePath, values, "must contain at least one value"))
+			continue
+		case len(values) > maxValuesPerVariable:
+			// Reported once for the variable, and its values are not walked, for the same reason
+			// an over-wide map is not walked.
+			errs = append(errs, field.TooMany(namePath, len(values), maxValuesPerVariable))
+			continue
+		}
+
+		for i, value := range values {
+			switch {
+			case value == "":
+				// Go decodes a JSON `null` array member into "", so once decoded the two are
+				// indistinguishable: rejecting the empty string is the only enforceable form of
+				// the published `items: {type: string}` constraint on array members.
+				errs = append(errs, field.Invalid(namePath.Index(i), value, "a variable value must not be empty"))
+			case !withinCodePointLimit(value, maxVariableValueLength):
+				errs = append(errs, field.TooLongCharacters(namePath.Index(i), value, maxVariableValueLength))
+			}
+		}
+	}
+	return errs
+}
+
+// variableNamePath is the field path of one variable: spec.items[i].variables[name], with a
+// name longer than a name may be cut to that maximum and marked as cut.
+//
+// The full name is deliberately not in the path. It is the one place a violation would carry
+// it, and a caller that sent a five-megabyte name would otherwise be answered with a
+// five-megabyte field path.
+func variableNamePath(path *field.Path, name string) *field.Path {
+	if withinCodePointLimit(name, maxVariableNameLength) {
+		return path.Key(name)
+	}
+	return path.Key(truncateToCodePoints(name, maxVariableNameLength) + elidedNameSuffix)
+}
+
+// truncateToCodePoints returns the first limit code points of text, never a partial one.
+//
+// Ranging over a string yields the byte offset of each code point, so the offset reached after
+// limit of them is exactly where the prefix ends -- which slicing by bytes could not find
+// without splitting a multi-byte character in half.
+func truncateToCodePoints(text string, limit int) string {
+	count := 0
+	for offset := range text {
+		if count == limit {
+			return text[:offset]
+		}
+		count++
+	}
+	return text
+}
+
+// withinCodePointLimit reports whether text is at most limit Unicode code points long.
+//
+// It is the Go half of isWithinCodePointLimit in
+// public/app/features/playlist/variableLimits.ts, counted the same way and for the same
+// reason: a character means a code point to the person who typed one and to the JSON string
+// that stores it, so a name of astral characters is not charged twice for each of them.
+//
+// The work it does is bounded by limit rather than by its argument, which matters because the
+// argument is untrusted: a string of no more bytes than the limit provably holds no more code
+// points than the limit and is never walked, and a longer one is walked only until it passes
+// the limit -- so a five-megabyte value costs limit iterations, not five million.
+func withinCodePointLimit(text string, limit int) bool {
+	if len(text) <= limit {
+		return true
+	}
+
+	count := 0
+	for range text {
+		count++
+		if count > limit {
+			return false
+		}
+	}
+	return true
+}
+
+// isBlankVariableName reports whether name carries no character that can be seen or typed.
+//
+// Whitespace, Unicode format characters (Cf: U+200B ZERO WIDTH SPACE, U+FEFF, the zero-width
+// joiners, the bidi controls, U+00AD SOFT HYPHEN) and control characters (Cc) are all blank,
+// because a name made only of those is a variable nobody can read in the editor, reproduce in
+// a URL, or ask about. It is the same set the browser refuses, in the same three positions of
+// the feature: this validator, the playback guard, and the editor's own check.
+//
+// The walk stops at the first character that is not blank, and is only ever reached for a name
+// already known to be within maxVariableNameLength code points.
+func isBlankVariableName(name string) bool {
+	for _, r := range name {
+		if !unicode.IsSpace(r) && !unicode.Is(unicode.Cf, r) && !unicode.Is(unicode.Cc, r) {
+			return false
+		}
+	}
+	return true
 }
 
 func getPatchClient(restConfig rest.Config, playlistKind resource.Kind) (operator.PatchClient, error) {
@@ -58,6 +380,17 @@ func New(cfg app.Config) (app.App, error) {
 
 	playlistValidator := &simple.Validator{
 		ValidateFunc: func(ctx context.Context, req *app.AdmissionRequest) error {
+			// ValidatePlaylistObject is invoked here and again from the apiserver admission
+			// plugin in pkg/registry/apps/playlist/register.go, and neither call is redundant.
+			// This one covers every wrapper that drives the app's own admission (an operator or
+			// a webhook deployment). The SDK's apiserver admission wrapper, however, passes any
+			// error returned from this hook through admission.NewForbidden, which reaches the
+			// client as HTTP 403 with the causes flattened into a message; the register.go call
+			// site is the only one that can preserve the Invalid/422 status and its per-field
+			// causes. Do not delete either call.
+			if errs := ValidatePlaylistObject(req.Object); len(errs) > 0 {
+				return NewPlaylistInvalidError(req.Object, errs)
+			}
 			return nil
 		},
 	}

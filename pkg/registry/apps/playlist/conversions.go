@@ -9,13 +9,31 @@ import (
 	"github.com/grafana/grafana/pkg/util"
 )
 
+// LegacyUpdateCommandToUnstructured converts a deprecated /api/playlists body into the
+// unstructured object the resource API stores.
 func LegacyUpdateCommandToUnstructured(cmd UpdatePlaylistCommand) unstructured.Unstructured {
-	items := make([]map[string]string, 0, len(cmd.Items))
+	// Unstructured content must only hold JSON-compatible values: apimachinery walks it with
+	// runtime.DeepCopyJSONValue, which understands []any and map[string]any and panics on any
+	// other container -- a []map[string]any item list included. Both the item list and the
+	// typed map of string slices inside it are therefore converted all the way down.
+	items := make([]any, 0, len(cmd.Items))
 	for _, item := range cmd.Items {
-		items = append(items, map[string]string{
+		entry := map[string]any{
 			"type":  item.Type,
 			"value": item.Value,
-		})
+		}
+		if len(item.Variables) > 0 {
+			variables := make(map[string]any, len(item.Variables))
+			for name, values := range item.Variables {
+				encoded := make([]any, 0, len(values))
+				for _, value := range values {
+					encoded = append(encoded, value)
+				}
+				variables[name] = encoded
+			}
+			entry["variables"] = variables
+		}
+		items = append(items, entry)
 	}
 	obj := unstructured.Unstructured{
 		Object: map[string]interface{}{
@@ -61,7 +79,6 @@ func UnstructuredToLegacyPlaylistDTO(item unstructured.Unstructured) *PlaylistDT
 	return dto
 }
 
-// Read legacy ID from metadata annotations
 func getLegacyID(item *unstructured.Unstructured) int64 {
 	meta, err := utils.MetaAccessor(item)
 	if err != nil {

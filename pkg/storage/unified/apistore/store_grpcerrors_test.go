@@ -247,6 +247,96 @@ func TestNonRetryableGRPCErrorIsConverted(t *testing.T) {
 	})
 }
 
+// A name violation reaches the client boundary in one of two shapes, depending on
+// how much structure the server attached, and neither may reach an API client as
+// gRPC transport syntax or as an envelope without a reason.
+func TestInvalidNameFromBothErrorShapes(t *testing.T) {
+	const nameMsg = "name must consist of alphanumeric characters, '-', '_', ':' or '.'"
+
+	// The shape a server that discards the structured result produces: a bare
+	// status whose message is the validation text and nothing else.
+	bare := grpcstatus.Error(grpccodes.InvalidArgument, nameMsg)
+
+	// The shape a server that keeps the structured result produces: the 422
+	// invalid-name envelope, carried as a status detail.
+	structured := grpcErrorWithResult(grpccodes.InvalidArgument, resource.NewInvalidNameError(
+		&resourcepb.ResourceKey{
+			Namespace: "default", Group: "example.grafana.app", Resource: "examples", Name: "bad name here",
+		}, nameMsg))
+
+	tryUpdate := func(in runtime.Object, _ storage.ResponseMeta) (runtime.Object, *uint64, error) {
+		return in.(*unstructured.Unstructured).DeepCopy(), nil, nil
+	}
+
+	t.Run("a bare status is converted, not passed through", func(t *testing.T) {
+		for name, call := range map[string]func(*Storage) error{
+			"GuaranteedUpdate": func(s *Storage) error {
+				return s.GuaranteedUpdate(testContext(t), "example/test", &unstructured.Unstructured{}, false, &storage.Preconditions{}, tryUpdate, nil)
+			},
+			"Delete": func(s *Storage) error {
+				return s.Delete(testContext(t), "example/test", &unstructured.Unstructured{}, nil, nil, nil, storage.DeleteOptions{})
+			},
+		} {
+			t.Run(name, func(t *testing.T) {
+				client := &alwaysFailsClient{value: testObject(t), err: bare}
+				err := call(testStorage(t, client))
+
+				requireKubernetesError(t, err)
+				var apistatus apierrors.APIStatus
+				require.ErrorAs(t, err, &apistatus)
+				st := apistatus.Status()
+				require.NotEmpty(t, st.Reason, "the envelope must carry a reason a client can branch on")
+				require.Equal(t, nameMsg, st.Message)
+				require.NotContains(t, st.Message, "rpc error:", "gRPC transport syntax must not reach a client")
+				require.Equal(t, int32(http.StatusBadRequest), st.Code)
+			})
+		}
+	})
+
+	t.Run("an attached invalid-name result keeps its field cause", func(t *testing.T) {
+		for name, call := range map[string]func(*Storage) error{
+			"GuaranteedUpdate": func(s *Storage) error {
+				return s.GuaranteedUpdate(testContext(t), "example/test", &unstructured.Unstructured{}, false, &storage.Preconditions{}, tryUpdate, nil)
+			},
+			"Delete": func(s *Storage) error {
+				return s.Delete(testContext(t), "example/test", &unstructured.Unstructured{}, nil, nil, nil, storage.DeleteOptions{})
+			},
+		} {
+			t.Run(name, func(t *testing.T) {
+				client := &alwaysFailsClient{value: testObject(t), err: structured}
+				err := call(testStorage(t, client))
+
+				requireKubernetesError(t, err)
+				require.True(t, apierrors.IsInvalid(err), "expected Invalid, got: %v", err)
+				var apistatus apierrors.APIStatus
+				require.ErrorAs(t, err, &apistatus)
+				st := apistatus.Status()
+				require.Equal(t, int32(http.StatusUnprocessableEntity), st.Code)
+				require.Equal(t, metav1.StatusReasonInvalid, st.Reason)
+				require.NotNil(t, st.Details)
+				require.Len(t, st.Details.Causes, 1)
+				require.Equal(t, "metadata.name", st.Details.Causes[0].Field)
+				require.NotContains(t, st.Message, "rpc error:")
+			})
+		}
+	})
+
+	t.Run("a rejected name is never retried", func(t *testing.T) {
+		for name, err := range map[string]error{"bare status": bare, "attached result": structured} {
+			t.Run(name, func(t *testing.T) {
+				client := &alwaysFailsClient{value: testObject(t), err: err}
+				s := testStorage(t, client)
+
+				require.Error(t, s.GuaranteedUpdate(testContext(t), "example/test", &unstructured.Unstructured{}, false, &storage.Preconditions{}, tryUpdate, nil))
+				require.Equal(t, 1, client.updates, "an invalid name cannot become valid by retrying")
+
+				require.Error(t, s.Delete(testContext(t), "example/test", &unstructured.Unstructured{}, nil, nil, nil, storage.DeleteOptions{}))
+				require.Equal(t, 1, client.deletes, "an invalid name cannot become valid by retrying")
+			})
+		}
+	})
+}
+
 func TestExhaustedConflictRetriesReturnKubernetesError(t *testing.T) {
 	conflict := grpcErrorWithResult(grpccodes.AlreadyExists, &resourcepb.ErrorResult{
 		Code:    http.StatusConflict,

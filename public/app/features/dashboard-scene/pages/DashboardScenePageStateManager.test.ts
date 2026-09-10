@@ -1198,6 +1198,11 @@ describe('DashboardScenePageStateManager v2', () => {
     });
 
     // TODO: Fix this test, v2 does not return undefined dashboard, but throws instead. The code needs to be updated.
+    // Why it stays skipped: DashboardScenePageStateManagerV2 propagates the loader rejection instead of
+    // resolving with an undefined dashboard and a loadError, so the assertions below cannot pass as written.
+    // Un-skipping it as-is also lets that rejection escape through DashboardLoaderSrv as an unhandled
+    // rejection, which Jest turns into a worker child process exception: the whole suite then reports zero
+    // tests run instead of one failing case. Re-enabling it needs the v2 loader change described above.
     it.skip("should error when the dashboard doesn't exist", async () => {
       const getDashSpy = jest.fn();
       setupDashboardAPI(undefined, getDashSpy, () => {

@@ -17,7 +17,7 @@ import {
 import { type Playlist } from '../../api/clients/playlist/v1';
 
 import { ShareModal } from './ShareModal';
-import { useCanWritePlaylists } from './utils';
+import { playlistLabel, useCanWritePlaylists } from './utils';
 
 interface Props {
   setStartPlaylist: (playlistItem: Playlist) => void;
@@ -31,7 +31,12 @@ const PlaylistCardComponent = ({ playlist, setStartPlaylist, setPlaylistToDelete
     <Card noMargin>
       <Card.Heading>
         <Stack direction="row" gap={1} alignItems="center" wrap>
-          {playlist.spec?.title}
+          {/*
+           * Named through the shared label rather than straight from the spec, so a playlist whose
+           * stored title is blank still has a heading here — the same one its delete confirmation
+           * uses. Without it the card was a row of buttons with nothing above them.
+           */}
+          {playlistLabel(playlist)}
           {isManaged(playlist) && (
             <ManagedBadge
               managerKind={getManagerKind(playlist)}
