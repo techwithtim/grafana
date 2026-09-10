@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { of, Subject, throwError } from 'rxjs';
 import { TestProvider } from 'test/helpers/TestProvider';
@@ -133,7 +133,10 @@ describe('PlaylistNewPage', () => {
       await userEvent.type(screen.getByRole('textbox', { name: 'Name' }), 'A new name');
       await userEvent.clear(screen.getByRole('textbox', { name: 'Interval' }));
       await userEvent.type(screen.getByRole('textbox', { name: 'Interval' }), '10m');
-      fireEvent.submit(screen.getByRole('button', { name: /save/i }));
+      // A playlist with no items cannot be saved — Save presents as unavailable and the submit
+      // refuses it — so the reachable path adds a dashboard first.
+      await userEvent.click(await screen.findByRole('button', { name: 'mocked-dashboard-picker' }));
+      await userEvent.click(screen.getByRole('button', { name: /save/i }));
       await waitFor(() => expect(postSpy).toHaveBeenCalledTimes(1));
 
       expect(postSpy).toHaveBeenCalledWith(
@@ -143,7 +146,7 @@ describe('PlaylistNewPage', () => {
             spec: {
               title: 'A new name',
               interval: '10m',
-              items: [],
+              items: [{ type: 'dashboard_by_uid', value: 'uid_1' }],
             },
           }),
         })
@@ -271,6 +274,9 @@ describe('PlaylistNewPage', () => {
       const { postSpy } = getTestContext({ isAvailable: true, repositories });
 
       await userEvent.type(screen.getByRole('textbox', { name: 'Name' }), 'Repo Playlist');
+      // An item-less playlist is refused before either save path is chosen, so add a dashboard
+      // first — the drawer-versus-direct-create decision is what this case is about.
+      await userEvent.click(await screen.findByRole('button', { name: 'mocked-dashboard-picker' }));
       // Select the (only) repository. No selection = stored in Grafana (a cleared placeholder, not a
       // literal row), so ArrowDown highlights the first repo. Options are virtualized in jsdom and
       // not reliably queryable, but downshift still tracks the highlighted index.
@@ -278,7 +284,7 @@ describe('PlaylistNewPage', () => {
       await userEvent.click(combobox);
       await userEvent.keyboard('{ArrowDown}{Enter}');
 
-      fireEvent.submit(screen.getByRole('button', { name: /save/i }));
+      await userEvent.click(screen.getByRole('button', { name: /save/i }));
 
       // The provisioning save drawer opens...
       expect(await screen.findByRole('heading', { name: /save provisioned playlist/i })).toBeInTheDocument();

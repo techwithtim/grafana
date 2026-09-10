@@ -1,10 +1,13 @@
+import { css } from '@emotion/css';
 import { isEqual } from 'lodash';
 import { useCallback, useId, useMemo, useRef, useState } from 'react';
+import tinycolor from 'tinycolor2';
 
+import { type GrafanaTheme2, rangeUtil } from '@grafana/data';
 import { selectors } from '@grafana/e2e-selectors';
 import { Trans, t } from '@grafana/i18n';
 import { config } from '@grafana/runtime';
-import { Box, Button, Field, FieldSet, Input, LinkButton, Stack } from '@grafana/ui';
+import { Box, Button, Field, FieldSet, Input, LinkButton, Stack, useStyles2 } from '@grafana/ui';
 import { type RepositoryView } from 'app/api/clients/provisioning/v0alpha1';
 import { Form } from 'app/core/components/Form/Form';
 import { FormPrompt } from 'app/core/components/FormPrompt/FormPrompt';
@@ -16,7 +19,11 @@ import { getManagerIdentity, isManagedByRepository } from 'app/features/provisio
 import { type Playlist, type PlaylistSpec } from '../../api/clients/playlist/v1';
 import { getGrafanaSearcher } from '../search/service/searcher';
 
-import { PlaylistVariablesCommitContext, usePlaylistVariablesCommit } from './PlaylistItemVariables';
+import {
+  MIN_HIT_TARGET_SIZE,
+  PlaylistVariablesCommitContext,
+  usePlaylistVariablesCommit,
+} from './PlaylistItemVariables';
 import { PlaylistTable } from './PlaylistTable';
 import { type PlaylistItemUI } from './types';
 import { usePlaylistItems } from './usePlaylistItems';
@@ -40,12 +47,104 @@ function toApiItems(
 }
 
 /**
+ * `required` is satisfied by any non-empty string, so a name of nothing but spaces used to be
+ * accepted and stored: the list then showed a card with no visible name, and its delete
+ * confirmation had no name to name. The name is submitted trimmed (see `doSubmit`), so this is also
+ * what keeps the value that is validated and the value that is stored the same one.
+ */
+function validateTitle(value: string | undefined): true | string {
+  return (value ?? '').trim().length > 0
+    ? true
+    : t('playlist-edit.form.name-blank', 'Name cannot consist only of spaces');
+}
+
+/**
+ * The interval is validated with the parser playback itself uses: `PlaylistSrv.start` turns the
+ * saved string into a delay with `rangeUtil.intervalToMs`, which throws on anything the interval
+ * grammar does not recognise. An interval the editor accepted but that parser rejects produces a
+ * playlist that cannot be played at all, so the editor accepts exactly what playback accepts —
+ * `5m`, `90s`, `1h`, and a unit-less number as seconds — and nothing else.
+ */
+function validateInterval(value: string | undefined): true | string {
+  try {
+    rangeUtil.intervalToMs(value ?? '');
+    return true;
+  } catch {
+    return t('playlist-edit.form.interval-invalid', 'Interval must be a duration such as 30s, 5m or 1h');
+  }
+}
+
+/**
  * The tag filter is an "add by tag" trigger here and holds no selected tags of its own. The empty
  * list is a module constant rather than a literal in the markup because `TagFilter` compares this
  * prop by reference and re-queries the dashboard tag facets whenever its identity changes, so a new
  * `[]` on every render made each structural edit of the item list issue redundant search requests.
  */
 const noSelectedTags: string[] = [];
+
+/**
+ * What the Save control is answering for: the state of the save itself, not of one field.
+ *
+ * `saving` is a request already in flight, `no-items` a playlist with nothing to play, and
+ * `invalid-fields` a name or interval the form has rejected. `available` is the only value that
+ * lets a save through.
+ */
+type SaveState = 'available' | 'saving' | 'no-items' | 'invalid-fields';
+
+interface SaveConditions {
+  /** A save already running. Read from the synchronous flag as well as the rendered state. */
+  busy: boolean;
+  itemCount: number;
+  invalidFieldCount: number;
+}
+
+/**
+ * The one place the Save control's availability is decided.
+ *
+ * The button renders from this and the submit re-checks it, because the two used to disagree: the
+ * button carried the native `disabled` attribute — which `Button` pairs with `aria-disabled="false"`
+ * whenever it has no tooltip to keep reachable — while the submit itself trusted the attribute to
+ * have stopped everything, so a save that got past the attribute had nothing left to refuse it.
+ *
+ * Ordered by what the user has to do about it, most immediate first, so the one reason reported is
+ * the one that is actionable now.
+ */
+function describeSaveState({ busy, itemCount, invalidFieldCount }: SaveConditions): SaveState {
+  if (busy) {
+    return 'saving';
+  }
+  if (itemCount === 0) {
+    return 'no-items';
+  }
+  if (invalidFieldCount > 0) {
+    return 'invalid-fields';
+  }
+  return 'available';
+}
+
+/**
+ * What the Save control says about the state it is in, on hover, on focus, and — for a save it
+ * refuses — in the form's live region.
+ *
+ * Every state has text, including `available`: the tooltip is what turns `Button`'s
+ * `aria-disabled` path on, which is what keeps the control focusable and its reason reachable
+ * instead of leaving an inert element that reports itself as enabled. Supplying the tooltip in
+ * every state also keeps the rendered element the same one across a state change — `Button` wraps
+ * itself in `Tooltip` only when it has one, and a control that gains or loses that wrapper is
+ * remounted, which would drop the focus of the user who had just activated it.
+ */
+function saveStateMessage(state: SaveState): string {
+  switch (state) {
+    case 'saving':
+      return t('playlist-edit.form.save-state-saving', 'Saving this playlist');
+    case 'no-items':
+      return t('playlist-edit.form.save-state-no-items', 'Add at least one dashboard before saving');
+    case 'invalid-fields':
+      return t('playlist-edit.form.save-state-invalid-fields', 'Correct the fields marked with an error before saving');
+    case 'available':
+      return t('playlist-edit.form.save-state-available', 'Save this playlist');
+  }
+}
 
 interface Props {
   onSubmit: (playlist: Playlist) => void | Promise<void>;
@@ -71,6 +170,7 @@ export const PlaylistForm = ({
   onRepositoryChange,
   disableRepositorySelect,
 }: Props) => {
+  const styles = useStyles2(getStyles);
   const [saving, setSaving] = useState(false);
   const playlistNameId = useId();
   const playlistIntervalId = useId();
@@ -120,7 +220,52 @@ export const PlaylistForm = ({
   // not be visible until the next render, which is too late.
   const submitInFlight = useRef(false);
 
+  /**
+   * The last refused save, as the form's live region announces it.
+   *
+   * A refusal used to be silent: the save stopped, nothing moved, and the only sign was a message
+   * inside a panel that may be scrolled out of view. The serial is what makes the same refusal
+   * announceable twice — a live region re-reads a child it did not have before, and identical text
+   * in the same node is not a change — and it is the announcement's key for exactly that reason.
+   */
+  const [refusedSave, setRefusedSave] = useState<{ serial: number; message: string } | undefined>(undefined);
+
+  const announceRefusedSave = useCallback((message: string) => {
+    setRefusedSave((previous) => ({ serial: (previous?.serial ?? 0) + 1, message }));
+  }, []);
+
+  /**
+   * The inputs `describeSaveState` decides on, gathered in one place so the button and the submit
+   * guard cannot drift apart on what "the same conditions" means.
+   *
+   * `invalidFieldCount` is the caller's to supply because only the render has react-hook-form's
+   * errors in hand, and only the submit knows they have just been re-validated.
+   */
+  const saveConditions = (invalidFieldCount: number): SaveConditions => ({
+    // The ref is the synchronous half of `saving`: a second activation can reach the submit handler
+    // before the render that would have shown the button as busy, and each save creates its own
+    // playlist.
+    busy: saving || submitInFlight.current,
+    itemCount: items.length,
+    invalidFieldCount,
+  });
+
   const doSubmit = async (specUpdates: Playlist['spec']) => {
+    // Save reports `aria-disabled` rather than carrying the native `disabled` attribute, so that
+    // the reason it is unavailable stays reachable — and it is this form's submit control, which
+    // means a click or Enter on an unavailable Save still reaches here through the browser's own
+    // submit. This is what refuses it, from the same value the button renders from.
+    //
+    // No field can be invalid at this point: `Form` submits through react-hook-form's
+    // `handleSubmit`, which validates every field first, calls this only for a valid form, and
+    // focuses the first offending field itself when it is not. The two conditions it knows nothing
+    // about — an empty item list and a save already in flight — are the ones re-checked.
+    const state = describeSaveState(saveConditions(0));
+    if (state !== 'available') {
+      announceRefusedSave(saveStateMessage(state));
+      return;
+    }
+
     // Text typed into a variable editor and not yet added is part of what the user is saving, so
     // it is committed here before anything is sent. An editor that refuses it — an empty value, a
     // duplicated name — has put its message on screen and this save stops: going ahead would store
@@ -130,9 +275,19 @@ export const PlaylistForm = ({
     const maySave = settlePendingVariables();
     settledVariablesRef.current = undefined;
     if (!maySave) {
+      // The editor that refused has marked its own field and taken focus to it, so what is
+      // announced here is the one thing it cannot say: that the playlist was not saved. Which
+      // variable is wrong, and why, is on the field the user has just been moved to.
+      announceRefusedSave(
+        t(
+          'playlist-edit.form.save-refused-variables',
+          'Playlist not saved. Complete or remove the template variable marked with an error, then save again.'
+        )
+      );
       return;
     }
 
+    setRefusedSave(undefined);
     submitInFlight.current = true;
     setSaving(true);
     // What the editors settled is overlaid on the memoised payload: settling commits to the next
@@ -147,7 +302,10 @@ export const PlaylistForm = ({
         spec: {
           ...specUpdates,
           interval: specUpdates?.interval ?? '5m',
-          title: specUpdates?.title ?? '',
+          // Trimmed here rather than in the field so the editor keeps showing what was typed:
+          // surrounding whitespace is not part of a playlist's name, and storing it would leave a
+          // name that renders as blank in the list and in the delete confirmation.
+          title: specUpdates?.title?.trim() ?? '',
           items: submittedItems,
         },
       });
@@ -160,9 +318,9 @@ export const PlaylistForm = ({
   return (
     <Form<PlaylistSpec> onSubmit={doSubmit} validateOn={'onBlur'}>
       {({ register, errors, formState, reset }) => {
-        // `saving` is part of the condition so a second click cannot start a second save while the
-        // first request is still in flight — each one would create an independent playlist.
-        const isDisabled = saving || items.length === 0 || Object.keys(errors).length > 0;
+        // The one value the Save control presents and the submit refuses from. It is not a second
+        // opinion about validity: `doSubmit` runs `describeSaveState` over the same conditions.
+        const saveState = describeSaveState(saveConditions(Object.keys(errors).length));
         return (
           <>
             <FormPrompt
@@ -181,7 +339,10 @@ export const PlaylistForm = ({
             >
               <Input
                 type="text"
-                {...register('title', { required: t('playlist-edit.form.name-required', 'Name is required') })}
+                {...register('title', {
+                  required: t('playlist-edit.form.name-required', 'Name is required'),
+                  validate: validateTitle,
+                })}
                 placeholder={t('playlist-edit.form.name-placeholder', 'Name')}
                 defaultValue={name}
                 data-testid={selectors.pages.PlaylistForm.name}
@@ -197,6 +358,7 @@ export const PlaylistForm = ({
                 type="text"
                 {...register('interval', {
                   required: t('playlist-edit.form.interval-required', 'Interval is required'),
+                  validate: validateInterval,
                 })}
                 placeholder={t('playlist-edit.form.interval-placeholder', '5m')}
                 defaultValue={interval ?? '5m'}
@@ -255,11 +417,29 @@ export const PlaylistForm = ({
               </Field>
             </FieldSet>
 
+            {/*
+              Where a refused save is announced. It is rendered in every state, empty until there
+              is something to say, because a live region has to be in the document before the text
+              appears in it — one inserted together with its message is not a change to a region
+              and is not announced. `sr-only` because everything announced here is either visible
+              on the control itself (its tooltip) or on the field the refusal moved focus to.
+            */}
+            <div role="status" aria-live="polite" aria-atomic="true" className="sr-only">
+              {refusedSave && <span key={refusedSave.serial}>{refusedSave.message}</span>}
+            </div>
+
             <Stack>
               <Button
                 type="submit"
                 variant="primary"
-                disabled={isDisabled}
+                className={styles.saveButton}
+                disabled={saveState !== 'available'}
+                // Given in every state, which is what makes `Button` report `aria-disabled` and
+                // drop the native attribute: an unavailable Save then stays focusable and
+                // hoverable, so the reason travels with the control instead of being something the
+                // user has to deduce from a dead button. It is also what keeps this element from
+                // being remounted — and its focus dropped — as the state changes.
+                tooltip={saveStateMessage(saveState)}
                 // The spinner alone conveys the in-flight save visually; `aria-busy` conveys it to
                 // assistive technology, which does not otherwise hear that the button is waiting.
                 aria-busy={saving}
@@ -267,7 +447,7 @@ export const PlaylistForm = ({
               >
                 <Trans i18nKey="playlist-edit.form.save">Save</Trans>
               </Button>
-              <LinkButton variant="secondary" href={`${config.appSubUrl}/playlists`}>
+              <LinkButton variant="secondary" className={styles.cancelButton} href={`${config.appSubUrl}/playlists`}>
                 <Trans i18nKey="playlist-edit.form.cancel">Cancel</Trans>
               </LinkButton>
             </Stack>
@@ -277,3 +457,70 @@ export const PlaylistForm = ({
     </Form>
   );
 };
+
+/**
+ * How far the hover, focus and pressed fills of the form's primary button are taken from
+ * `theme.colors.primary.main`, in HSL lightness percentage points.
+ *
+ * `Button` paints `variant="primary" fill="solid"` as `primary.main` at rest and `primary.shade`
+ * while hovered or focused [packages/grafana-ui/src/components/Button/Button.tsx:406-426], and
+ * `shade` is derived by *lightening* `main` on a dark theme [createColors.ts:372-374]. White
+ * `primary.contrastText` on that lighter fill measures 3.55:1 — below the 4.5:1 that normal text
+ * needs — while the rest state measures 4.61:1, so the button lost contrast exactly when the
+ * pointer or the keyboard reached it.
+ *
+ * Taking the fill the other way keeps a visible state change and raises the ratio in both themes:
+ * white measures 6.10:1 on the hover fill and 7.95:1 on the pressed one. The two steps are far
+ * enough apart to read as rest -> hover -> pressed rather than as one flattened colour, and small
+ * enough that the button still reads as the same primary control. The values are derived from the
+ * theme token rather than written as hex so a re-themed `primary.main` carries them with it.
+ */
+const HOVER_FILL_DARKEN = 8;
+const PRESSED_FILL_DARKEN = 16;
+
+function getStyles(theme: GrafanaTheme2) {
+  /**
+   * The 44 px box both form buttons offer a pointer. A `size="md"` `Button` is 32 px tall, so it
+   * was 12 px short of it. `Button` is an `inline-flex` that centres its content, so the minima are
+   * the whole change and the label keeps its own size; `justifyContent` only matters for a label
+   * narrower than the box, which is not the case for either of these two but is what makes the
+   * rule correct rather than incidentally right.
+   */
+  const hitTarget = {
+    minWidth: MIN_HIT_TARGET_SIZE,
+    minHeight: MIN_HIT_TARGET_SIZE,
+    justifyContent: 'center',
+  };
+
+  return {
+    /**
+     * The form's Save button.
+     *
+     * `Button` composes `cx(styles.button, { [styles.disabled]: disabled }, className)`, so a
+     * caller's class is merged last and wins for the declarations it repeats. Only the fills of the
+     * states a user can reach are repeated here: the unavailable state keeps the component's own
+     * disabled fill, whose text is exempt from the contrast requirement, which is why these rules
+     * are withheld from a control carrying either form of the disabled signal.
+     */
+    saveButton: css({
+      ...hitTarget,
+      "&:not([disabled]):not([aria-disabled='true'])": {
+        '&:hover, &:focus, &:focus-visible': {
+          background: tinycolor(theme.colors.primary.main).darken(HOVER_FILL_DARKEN).toString(),
+        },
+        // Declared after hover so the pressed fill is what shows while the pointer is both over
+        // the button and held down, which is the only way a pointer reaches this state.
+        '&:active': {
+          background: tinycolor(theme.colors.primary.main).darken(PRESSED_FILL_DARKEN).toString(),
+        },
+      },
+    }),
+    /**
+     * The form's Cancel link.
+     *
+     * Only the box: `LinkButton`'s secondary fills already carry their text at 7:1 or better in
+     * both themes, in every state, so there is nothing here to correct about its colours.
+     */
+    cancelButton: css(hitTarget),
+  };
+}

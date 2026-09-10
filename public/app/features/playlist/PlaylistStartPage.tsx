@@ -1,12 +1,14 @@
+import { css } from '@emotion/css';
 import { useEffect, useRef, useState } from 'react';
 import { useParams } from 'react-router-dom-v5-compat';
 
 import { Trans, t } from '@grafana/i18n';
-import { Alert, LinkButton, LoadingPlaceholder, Stack } from '@grafana/ui';
+import { Alert, LinkButton, LoadingPlaceholder, Stack, useStyles2 } from '@grafana/ui';
 import { Page } from 'app/core/components/Page/Page';
 
 import { useGetPlaylistQuery } from '../../api/clients/playlist/v1';
 
+import { MIN_HIT_TARGET_SIZE } from './PlaylistItemVariables';
 import { type PlaylistStartFailureReason, playlistSrv } from './PlaylistSrv';
 
 /**
@@ -69,6 +71,7 @@ function getProblemMessage(problem: StartProblem): { title: string; body: string
  * the playlist list.
  */
 export default function PlaylistStartPage() {
+  const styles = useStyles2(getStyles);
   const { uid = '' } = useParams();
   const { data, isLoading, isError } = useGetPlaylistQuery({ name: uid });
   const [startFailure, setStartFailure] = useState<StartProblem | undefined>();
@@ -107,11 +110,11 @@ export default function PlaylistStartPage() {
               <Stack direction="row" gap={1}>
                 {/* A playlist that never loaded has no editor worth offering, so only the list is. */}
                 {problem !== 'load-failed' && (
-                  <LinkButton variant="secondary" href={`/playlists/edit/${uid}`}>
+                  <LinkButton className={styles.recoveryAction} variant="secondary" href={`/playlists/edit/${uid}`}>
                     <Trans i18nKey="playlist.playlist-start-page.edit-playlist">Edit playlist</Trans>
                   </LinkButton>
                 )}
-                <LinkButton variant="secondary" href="/playlists">
+                <LinkButton className={styles.recoveryAction} variant="secondary" href="/playlists">
                   <Trans i18nKey="playlist.playlist-start-page.back-to-playlists">Back to playlists</Trans>
                 </LinkButton>
               </Stack>
@@ -123,4 +126,19 @@ export default function PlaylistStartPage() {
       </Page.Contents>
     </Page>
   );
+}
+
+function getStyles() {
+  return {
+    /**
+     * The 44 px box for the two ways out of a failed start, which a `size="md"` `LinkButton` is
+     * 12 px short of. These are the only controls on the page when it cannot play anything, so
+     * they are the whole of its recovery affordance.
+     */
+    recoveryAction: css({
+      minWidth: MIN_HIT_TARGET_SIZE,
+      minHeight: MIN_HIT_TARGET_SIZE,
+      justifyContent: 'center',
+    }),
+  };
 }

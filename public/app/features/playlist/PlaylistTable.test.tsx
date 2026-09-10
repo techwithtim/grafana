@@ -362,6 +362,88 @@ function draggableIds() {
   return rowWrappers().map((wrapper) => wrapper.getAttribute('data-rfd-draggable-id'));
 }
 
+/** The drag handle of each row, in row order. */
+function dragHandles(): HTMLElement[] {
+  return Array.from(document.querySelectorAll<HTMLElement>('[data-playlist-item-drag-handle]'));
+}
+
+/**
+ * The two cells of the row at `index`: the one holding the item's icon, name and variable summary,
+ * and the one holding its disclosure, delete and drag controls.
+ */
+function rowCells(index: number): [HTMLElement, HTMLElement] {
+  const cells = rowWrappers()[index]?.firstElementChild?.children;
+  const [info, actions] = Array.from(cells ?? []);
+  if (!(info instanceof HTMLElement) || !(actions instanceof HTMLElement)) {
+    throw new Error(`the row at position ${index} does not hold an item cell and a controls cell`);
+  }
+  return [info, actions];
+}
+
+/**
+ * The narrow layout, `theme.breakpoints.down('sm')` with the theme's 544 px `sm` and its 0.05 px
+ * step. Spelled the way emotion serializes it, with the spaces removed.
+ */
+const MOBILE_MEDIA = '(max-width:543.95px)';
+
+/**
+ * jsdom's CSSOM exposes neither the rule constructors nor `CSSRule.MEDIA_RULE` on `window`, so the
+ * two rule kinds below are told apart by the members each of them owns.
+ */
+function isMediaRule(rule: CSSRule): rule is CSSMediaRule {
+  return 'media' in rule && 'cssRules' in rule;
+}
+
+function isStyleRule(rule: CSSRule): rule is CSSStyleRule {
+  return 'selectorText' in rule && 'style' in rule;
+}
+
+/** Every style rule emotion has injected, from inside `media` when one is named and outside it otherwise. */
+function injectedStyleRules(media?: string): CSSStyleRule[] {
+  const rules: CSSStyleRule[] = [];
+  for (const styleElement of Array.from(document.querySelectorAll('style'))) {
+    for (const rule of Array.from(styleElement.sheet?.cssRules ?? [])) {
+      if (isMediaRule(rule)) {
+        if (media && (rule.conditionText || rule.media.mediaText).replace(/\s/g, '') === media) {
+          rules.push(...Array.from(rule.cssRules).filter(isStyleRule));
+        }
+      } else if (!media && isStyleRule(rule)) {
+        rules.push(rule);
+      }
+    }
+  }
+  return rules;
+}
+
+/**
+ * The value `property` takes for `element` under a pseudo-class or pseudo-element, or inside a
+ * media block, read out of the rules emotion injected.
+ *
+ * `getComputedStyle` cannot answer either question: jsdom applies only the rules whose media list
+ * names `screen`, so an `@media (max-width: …)` block is invisible to it however narrow the window
+ * is said to be, and it resolves no `:hover`, `:active`, `:focus-visible` or `::before` state at
+ * all. The rule text is available though — emotion injects its rules as `<style>` elements that
+ * jsdom parses into real stylesheets — so the declarations of those states are read straight out of
+ * them. Every class on the element is considered because `cx` hands `IconButton` a single merged
+ * class, and the last declaration found wins, as it would in the cascade.
+ */
+function declaredValue(
+  element: Element,
+  property: string,
+  { pseudo = '', media }: { pseudo?: string; media?: string } = {}
+): string {
+  const selectors = new Set(Array.from(element.classList, (name) => `.${name}${pseudo}`));
+  let declared = '';
+
+  for (const rule of injectedStyleRules(media)) {
+    if (rule.selectorText.split(',').some((selector) => selectors.has(selector.trim()))) {
+      declared = rule.style.getPropertyValue(property) || declared;
+    }
+  }
+
+  return declared;
+}
+
 function activeElementName() {
   const active = document.activeElement;
   if (!active || active === document.body) {
@@ -853,6 +935,25 @@ describe('PlaylistTable', () => {
       ).toBeInTheDocument();
     });
 
+    /**
+     * `ConfirmModal` builds its own button row from `size="md"` buttons, 32 px tall, and inherits
+     * `Modal`'s 24 px dismiss control. Neither is reachable through a prop, so the box is set from
+     * here through `modalClass`, which lands on this dialog and no other in the product.
+     */
+    it('offers every control in the confirmation a 44 px box', async () => {
+      const { user } = renderStatefulTable();
+      await addVariableToFirstRow(user);
+      await user.click(deleteButtons()[0]);
+
+      const dialog = screen.getByRole('dialog', { name: 'Delete playlist item' });
+      const controls = within(dialog).getAllByRole('button');
+      expect(controls.length).toBeGreaterThanOrEqual(3);
+
+      for (const control of controls) {
+        expect(window.getComputedStyle(control)).toMatchObject({ minWidth: '44px', minHeight: '44px' });
+      }
+    });
+
     it('removes it once the deletion is confirmed, without leaving focus on the page body', async () => {
       const { user, deleteItem } = renderStatefulTable();
       await addVariableToFirstRow(user);
@@ -901,6 +1002,40 @@ describe('PlaylistTable', () => {
       // The dismissal changes nothing, so the editor the variable was typed into is still open.
       expect(disclosureStates()).toEqual(['true', 'false']);
       expect(within(editorFor(0)).getByRole('textbox', { name: 'Values for shard, item 1' })).toHaveValue('a, b');
+    });
+
+    /**
+     * The dialog unmounted and took focus with it: `document.activeElement` was the page body, so a
+     * keyboard user who declined the deletion was returned to the top of the page with the row they
+     * were working on somewhere below. Nothing was removed, so the control that asked the question
+     * is the one to go back to.
+     */
+    it('returns focus to the delete control of the row when the confirmation is dismissed', async () => {
+      const { user } = renderStatefulTable();
+      // The second entry of the duplicated dashboard, so the control focus returns to is not the
+      // one a lookup that ignored the position would have found first.
+      await user.click(disclosureButtons()[1]);
+      const editor = editorFor(1);
+      await user.type(within(editor).getByRole('textbox', { name: 'Variable name' }), 'shard');
+      await user.type(within(editor).getByRole('textbox', { name: 'Values (comma-separated)' }), 'a, b');
+      await user.click(within(editor).getByRole('button', { name: 'Add variable' }));
+      expect(
+        await within(editor).findByRole('textbox', { name: 'Variable name for shard, item 2' })
+      ).toBeInTheDocument();
+
+      await user.click(deleteButtons()[1]);
+      expect(confirmDialog()).toBeInTheDocument();
+
+      await user.click(screen.getByRole('button', { name: 'Cancel' }));
+
+      await waitFor(() => {
+        expect(document.activeElement).toBe(deleteButtons()[1]);
+      });
+      expect(document.activeElement).toHaveAttribute('data-playlist-item-delete');
+      // The row that asked, not the row that happened to be first: both entries hold the same
+      // dashboard, so the position is the only thing that tells the two delete controls apart.
+      expect(document.activeElement?.closest('[data-playlist-item-index]')).toBe(rowWrappers()[1]);
+      expect(rows()).toHaveLength(4);
     });
   });
 
@@ -958,6 +1093,163 @@ describe('PlaylistTable', () => {
       expect(whiteSpace).toBe('nowrap');
       expect(flexShrink).toBe('0');
     }
+  });
+
+  /**
+   * A flex item is floored at the width of its own content unless it is given a zero minimum, and
+   * both of the row's cells were, so a long dashboard name and the variable preview beside it made
+   * the row wider than a 375 px viewport: the runtime measurement behind the finding had the row's
+   * controls ending 9.7 px outside the row itself and the document 457–572 px wide. jsdom computes
+   * no layout, so what is asserted is the rules that decide that width.
+   */
+  it('lets the item name and its variable preview reflow, keeping the row controls on a narrow canvas', () => {
+    renderTable();
+
+    const [info, actions] = rowCells(0);
+    // Zero minimum and wrapping together: the cell takes the width the controls leave, and the
+    // name, the count and the preview take as many lines as that width needs.
+    expect(declaredValue(info, 'min-width')).toBe('0');
+    expect(declaredValue(info, 'flex-wrap')).toBe('wrap');
+    // Only `anywhere` lowers the cell's own minimum width, so a name or a value with no space in
+    // it cannot decide how wide the row has to be.
+    expect(declaredValue(info, 'overflow-wrap')).toBe('anywhere');
+    // The controls are what the row is operated with, so they keep their own width instead.
+    expect(declaredValue(actions, 'flex-shrink')).toBe('0');
+
+    const preview = screen.getAllByText(/host=Host1/)[0];
+    expect(info).toContainElement(preview);
+    expect(declaredValue(preview, 'white-space')).toBe('normal');
+    expect(declaredValue(preview, 'overflow-wrap')).toBe('anywhere');
+    expect(declaredValue(preview, 'min-width')).toBe('0');
+    // The stored text this previews still cannot reorder the name it sits beside.
+    expect(window.getComputedStyle(preview).unicodeBidi).toBe('isolate');
+  });
+
+  /**
+   * The drag-and-drop library makes the handle a focusable control without giving it a component of
+   * its own, so left alone it takes the browser's 1 px outline — measured at roughly 1:1 against
+   * the row behind it — while the two `IconButton`s beside it paint the design system's ring. The
+   * ring is not a computed style jsdom resolves, so the assertion is on what the handle's class
+   * declares for the state, and on it being the same declaration the delete control carries.
+   */
+  /**
+   * The three controls of a row measured 16×16, 16×16 and 16×22 — the size of the glyph in each of
+   * them — which is what an automated audit failed eleven of on this list. The box is what grows:
+   * the glyph, the fills and the ring are unchanged, and the assertions below are on both halves of
+   * that so a later "simplification" of the box cannot take the glyph with it.
+   */
+  it('offers every row control a 44 px box without enlarging the glyph inside it', () => {
+    renderTable();
+
+    for (const control of [disclosureButtons()[0], deleteButtons()[0], dragHandles()[0]]) {
+      const { minWidth, minHeight } = window.getComputedStyle(control);
+      expect({ control: control.getAttribute('aria-label'), minWidth, minHeight }).toEqual({
+        control: control.getAttribute('aria-label'),
+        minWidth: '44px',
+        minHeight: '44px',
+      });
+    }
+
+    // The row has to be tall enough to hold them, and says so itself rather than depending on
+    // whichever control happens to be in it.
+    expect(window.getComputedStyle(rowCells(0)[1].parentElement!).minHeight).toBe('44px');
+
+    // Every glyph keeps the 16 px of `size="md"`. The handle's own glyph is the one at risk: it is
+    // laid out by the handle's class rather than by a component, and an earlier attempt at this box
+    // collapsed the handle to the glyph instead.
+    for (const glyph of Array.from(document.querySelectorAll<SVGElement>('[data-testid^="icon-"]'))) {
+      expect([glyph.getAttribute('width'), glyph.getAttribute('height')]).toEqual(['16', '16']);
+    }
+    expect(window.getComputedStyle(dragHandles()[0].querySelector('svg')!).flex).toBe('0 0 auto');
+    expect(window.getComputedStyle(dragHandles()[0]).display).toBe('inline-flex');
+  });
+
+  it('gives the drag handle the same focus ring as the controls beside it, unclipped', () => {
+    renderTable();
+    const handle = dragHandles()[0];
+
+    for (const property of ['outline', 'outline-offset', 'box-shadow']) {
+      const declared = declaredValue(handle, property, { pseudo: ':focus-visible' });
+      expect(declared).not.toBe('');
+      expect(declared).toBe(declaredValue(deleteButtons()[0], property, { pseudo: ':focus-visible' }));
+    }
+    // The visible part of the ring is the box shadow, so it has to be painted in a real colour
+    // rather than in the transparent outline the mixin uses to reserve the space.
+    expect(declaredValue(handle, 'box-shadow', { pseudo: ':focus-visible' })).toMatch(/#[\da-f]{3,8}|rgba?\(/i);
+    // Which is worth having only on a control that can hold focus in the first place.
+    expect(handle).toHaveAttribute('tabindex', '0');
+
+    // The ring is drawn outside the element, so an ancestor that clips its overflow would hide it
+    // — the defect this must not reproduce from the playback controls.
+    for (let ancestor = handle.parentElement; ancestor && ancestor !== document.body; ) {
+      const { overflow, overflowX, overflowY } = window.getComputedStyle(ancestor);
+      expect([overflow, overflowX, overflowY]).not.toContain('hidden');
+      expect([overflow, overflowX, overflowY]).not.toContain('clip');
+      ancestor = ancestor.parentElement;
+    }
+  });
+
+  /**
+   * The audit behind this recorded no pressed state anywhere on the row — `IconButton` clears the
+   * backdrop it paints on hover again while a text-filled button is active — and no hover state at
+   * all on the drag handle, which is the one control here without a component of its own. jsdom
+   * resolves none of those states in `getComputedStyle`, so the declarations are read from the
+   * rules the classes carry.
+   */
+  it('answers hover and press on each of the row own controls', () => {
+    renderTable();
+    const handle = dragHandles()[0];
+
+    const hovered = declaredValue(handle, 'background-color', { pseudo: ':hover' });
+    const pressed = declaredValue(handle, 'background-color', { pseudo: ':active' });
+    expect(hovered).not.toBe('');
+    expect(pressed).not.toBe('');
+    expect(pressed).not.toBe(hovered);
+
+    // The disclosure and the delete control paint on a layer behind their glyph, so their pressed
+    // state is painted there — in the same colour the handle takes, so one row reads as one set of
+    // controls — and the layer is made opaque, which is what `IconButton` had undone.
+    for (const button of [disclosureButtons()[0], deleteButtons()[0]]) {
+      expect(declaredValue(button, 'background-color', { pseudo: ':active:before' })).toBe(pressed);
+      expect(declaredValue(button, 'opacity', { pseudo: ':active:before' })).toBe('1');
+    }
+    expect(pressed).not.toMatch(/transparent|rgba\(0,\s*0,\s*0,\s*0\)/);
+  });
+
+  /**
+   * The library returns focus to the handle it lifted only for a drag it drove with the keyboard. A
+   * pointer drag never gave the handle focus, so the drop left it on the document body with the row
+   * moved and nothing on the page focused.
+   */
+  it('leaves focus on the drag handle of the row a drop moved', async () => {
+    const { moveItem } = renderStatefulTable(distinctItems());
+    const idsBefore = draggableIds();
+
+    await endDrag(dropResult(0, 2));
+
+    expect(moveItem).toHaveBeenCalledWith(0, 2);
+    await waitFor(() => {
+      expect(document.activeElement).toHaveAttribute('data-playlist-item-drag-handle');
+    });
+    // The handle of the row that was dragged, at the position it was dropped on, which its own
+    // draggable id is what identifies: the two rows around it are not the row that moved.
+    expect(document.activeElement).toBe(dragHandles()[2]);
+    expect(rowWrappers()[2]).toHaveAttribute('data-rfd-draggable-id', idsBefore[0]);
+  });
+
+  it('gives the variables panel less of an indent on a narrow viewport than on a wide one', async () => {
+    const { user } = renderTable();
+    await user.click(disclosureButtons()[0]);
+
+    const panel = variablesPanels()[0];
+    const wide = declaredValue(panel, 'padding-inline-start');
+    const narrow = declaredValue(panel, 'padding-inline-start', { media: MOBILE_MEDIA });
+
+    // The indent ties the panel to the row it belongs to, which is worth three spacing units of a
+    // wide viewport and one of a narrow one: the editor's stacked fields need the width more.
+    expect(Number.parseFloat(wide)).toBeGreaterThan(0);
+    expect(Number.parseFloat(narrow)).toBeGreaterThan(0);
+    expect(Number.parseFloat(narrow)).toBeLessThan(Number.parseFloat(wide));
   });
 });
 

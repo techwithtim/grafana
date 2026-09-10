@@ -1,5 +1,6 @@
 import { render, screen, testWithFeatureToggles, waitFor } from 'test/test-utils';
 
+import { selectors } from '@grafana/e2e-selectors';
 import { setBackendSrv } from '@grafana/runtime';
 import { setupMockServer } from '@grafana/test-utils/server';
 import { getFolderFixtures } from '@grafana/test-utils/unstable';
@@ -146,6 +147,56 @@ describe('DashboardPicker', () => {
       await user.click(await screen.findByRole('button', { name: 'Clear value' }));
 
       expect(onChange).toHaveBeenCalledWith(undefined);
+    });
+
+    /**
+     * A menu that cannot fit the screen has to give way by wrapping, never by growing.
+     *
+     * grafana-ui sizes the portalled menu from its content and marks every option `nowrap`, which
+     * makes an option's minimum width its full length: at a 375px viewport a menu holding one long
+     * `folder/dashboard` title measured 668px, 310px of it off-screen with no horizontal page
+     * scroll to reach it. jsdom does no layout, so what is asserted here is the geometry input the
+     * browser resolves that width from — the option's own text may wrap and break, and the menu is
+     * capped at the viewport — rather than a pixel width.
+     */
+    it('should let long option content wrap and cap the menu at the viewport width', async () => {
+      const { user } = render(<DashboardPicker />);
+
+      await user.click(screen.getByRole('combobox'));
+
+      const optionLabel = await screen.findByText(`${folderA.item.title}/${folderA_dashbdD.item.title}`);
+      // The wrapping belongs to the option's own content, which is what carries the width.
+      expect(optionLabel.closest(`[data-testid="${selectors.components.Select.option}"]`)).toBeInTheDocument();
+      expect(optionLabel).toHaveStyle({ whiteSpace: 'normal', overflowWrap: 'anywhere' });
+
+      // grafana-ui's own menu list (the labelled element) sits inside react-select's menu, which is
+      // the box that used to overhang the viewport.
+      const menu = screen.getByLabelText('Select options menu').parentElement;
+      expect(menu).toHaveStyle({ maxWidth: '100vw' });
+    });
+
+    it('should render the selected dashboard in the control without the menu wrapping', async () => {
+      const { user } = render(<DashboardPicker onChange={jest.fn()} />);
+
+      const expectedLabel = `${folderA.item.title}/${folderA_dashbdD.item.title}`;
+      await user.type(screen.getByRole('combobox'), folderA_dashbdD.item.title);
+      await user.click(await screen.findByText(expectedLabel));
+
+      // The wrapping applies to the menu only, so the pickers that display their selection are
+      // unaffected: the control shows the label as plain text, exactly as it did before.
+      const selectedValue = await screen.findByText(expectedLabel);
+      expect(selectedValue).not.toHaveStyle({ overflowWrap: 'anywhere' });
+      expect(screen.queryByLabelText('Select options menu')).not.toBeInTheDocument();
+    });
+
+    it('should keep a formatOptionLabel a consumer provides, wrapping its menu output', async () => {
+      const formatOptionLabel = jest.fn((item, meta) => `${meta.context}:${item.label}`);
+      const { user } = render(<DashboardPicker formatOptionLabel={formatOptionLabel} />);
+
+      await user.click(screen.getByRole('combobox'));
+
+      const optionLabel = await screen.findByText(`menu:${folderA.item.title}/${folderA_dashbdD.item.title}`);
+      expect(optionLabel).toHaveStyle({ whiteSpace: 'normal' });
     });
 
     it('should ignore stale unknown fallback when value changes to another dashboard', async () => {

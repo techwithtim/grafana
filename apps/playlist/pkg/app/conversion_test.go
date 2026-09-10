@@ -5,10 +5,14 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/conversion"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 
 	"github.com/grafana/grafana-app-sdk/k8s"
@@ -451,5 +455,310 @@ func TestNewPlaylistInvalidErrorForANonPlaylist(t *testing.T) {
 	}
 	if got := status.ErrStatus.Details.Name; got != "" {
 		t.Errorf("details.Name = %q, want an empty name", got)
+	}
+}
+
+// conversionScheme builds a scheme registered the way the App SDK's installer registers this
+// group: both served versions, plus the group's internal hub version under the preferred
+// version's Go type (grafana-app-sdk k8s/apiserver/installer.go:289-291). The hub sharing the
+// v1 Go type is what produces the object every conversion below has to survive -- a
+// *v1.Playlist whose apiVersion and kind the apiserver has cleared.
+func conversionScheme(t *testing.T) *runtime.Scheme {
+	t.Helper()
+
+	scheme := runtime.NewScheme()
+	scheme.AddKnownTypeWithName(playlistV1GVK, &v1.Playlist{})
+	scheme.AddKnownTypeWithName(playlistV0alpha1GVK, &v0alpha1.Playlist{})
+	scheme.AddKnownTypeWithName(internalPlaylistGVK(), &v1.Playlist{})
+
+	if err := RegisterConversions(scheme); err != nil {
+		t.Fatalf("RegisterConversions returned an unexpected error: %v", err)
+	}
+	return scheme
+}
+
+func internalPlaylistGVK() schema.GroupVersionKind {
+	return schema.GroupVersionKind{
+		Group:   playlistV1GVK.Group,
+		Version: runtime.APIVersionInternal,
+		Kind:    playlistV1GVK.Kind,
+	}
+}
+
+// v0alpha1Fixture is a Playlist carrying every part of an object a conversion has to move:
+// the metadata an apiserver stamps on it (including the field ownership these conversions
+// exist to preserve), a spec with and without item variables, and a non-empty status.
+func v0alpha1Fixture() *v0alpha1.Playlist {
+	created := metav1.Date(2026, 9, 10, 6, 0, 0, 0, time.UTC)
+	owned := metav1.Date(2026, 9, 10, 6, 1, 0, 0, time.UTC)
+	descriptive := "recorded by the conversion test"
+
+	return &v0alpha1.Playlist{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: playlistV0alpha1GVK.GroupVersion().String(),
+			Kind:       playlistV0alpha1GVK.Kind,
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "across-versions",
+			Namespace:         "default",
+			UID:               "8f1e0a3c-1d5b-4f2a-9c1e-2f3d4b5a6c7d",
+			ResourceVersion:   "1789019651030981",
+			Generation:        3,
+			CreationTimestamp: created,
+			Labels:            map[string]string{"grafana.app/managedBy": "test"},
+			Annotations:       map[string]string{"grafana.app/updatedBy": "user:1"},
+			Finalizers:        []string{"playlist.grafana.app/cleanup"},
+			ManagedFields: []metav1.ManagedFieldsEntry{{
+				Manager:    "qa-v0alpha1-writer",
+				Operation:  metav1.ManagedFieldsOperationUpdate,
+				APIVersion: playlistV0alpha1GVK.GroupVersion().String(),
+				Time:       &owned,
+				FieldsType: "FieldsV1",
+				FieldsV1:   metav1.NewFieldsV1(`{"f:spec":{"f:interval":{},"f:items":{},"f:title":{}}}`),
+			}},
+		},
+		Spec: v0alpha1.PlaylistSpec{
+			Title:    "Written through v0alpha1",
+			Interval: "5m",
+			Items: []v0alpha1.PlaylistPlaylistItem{
+				{
+					Type:      v0alpha1.PlaylistPlaylistItemTypeDashboardByUid,
+					Value:     "xCmMwXdVz",
+					Variables: map[string][]string{"host": {"h1", "h2"}, "cluster": {"c1"}},
+				},
+				{
+					Type:  v0alpha1.PlaylistPlaylistItemTypeDashboardByTag,
+					Value: "graph-ng",
+				},
+			},
+		},
+		Status: v0alpha1.PlaylistStatus{
+			OperatorStates: map[string]v0alpha1.PlayliststatusOperatorState{
+				"qa-probe": {
+					LastEvaluation:   "1789019651030981",
+					State:            v0alpha1.PlaylistStatusOperatorStateStateSuccess,
+					DescriptiveState: &descriptive,
+					Details:          map[string]any{"reason": "converted"},
+				},
+			},
+			AdditionalFields: map[string]any{"reserved": "value"},
+		},
+	}
+}
+
+// bodyJSON renders the spec and status of either version's Playlist for comparison across
+// versions, where the Go types differ but the JSON shape is identical by construction.
+func bodyJSON(t *testing.T, spec any, status any) string {
+	t.Helper()
+
+	encoded, err := json.Marshal(map[string]any{"spec": spec, "status": status})
+	if err != nil {
+		t.Fatalf("unable to marshal a playlist body: %v", err)
+	}
+	return string(encoded)
+}
+
+// TestRegisterConversionsSurvivesTheInternalHub is the unit-level form of the defect behind
+// the cross-version managedFields loss: the second hop starts from a *v1.Playlist whose
+// TypeMeta the apiserver cleared, which is exactly what the App SDK's own conversion could
+// not encode.
+func TestRegisterConversionsSurvivesTheInternalHub(t *testing.T) {
+	scheme := conversionScheme(t)
+	source := v0alpha1Fixture()
+
+	hub, err := scheme.ConvertToVersion(source, internalPlaylistGVK().GroupVersion())
+	if err != nil {
+		t.Fatalf("converting v0alpha1 to the internal hub returned an unexpected error: %v", err)
+	}
+	hubPlaylist, ok := hub.(*v1.Playlist)
+	if !ok {
+		t.Fatalf("the internal hub object is %T, want *v1.Playlist", hub)
+	}
+	// The state the SDK's conversion tripped over, asserted rather than assumed: the apiserver
+	// strips the identity of an object it converts into the internal version.
+	if hubPlaylist.APIVersion != "" || hubPlaylist.Kind != "" {
+		t.Fatalf("the hub object still names %q/%q, so this test no longer covers the cleared-TypeMeta case",
+			hubPlaylist.APIVersion, hubPlaylist.Kind)
+	}
+
+	back, err := scheme.ConvertToVersion(hubPlaylist, playlistV0alpha1GVK.GroupVersion())
+	if err != nil {
+		t.Fatalf("converting the internal hub object back to v0alpha1 returned an unexpected error: %v", err)
+	}
+	roundTripped, ok := back.(*v0alpha1.Playlist)
+	if !ok {
+		t.Fatalf("the converted object is %T, want *v0alpha1.Playlist", back)
+	}
+
+	if got, want := roundTripped.APIVersion, playlistV0alpha1GVK.GroupVersion().String(); got != want {
+		t.Errorf("apiVersion = %q, want %q", got, want)
+	}
+	if !reflect.DeepEqual(roundTripped.ObjectMeta, source.ObjectMeta) {
+		t.Errorf("metadata after the round trip = %#v, want %#v", roundTripped.ObjectMeta, source.ObjectMeta)
+	}
+	if got, want := bodyJSON(t, roundTripped.Spec, roundTripped.Status), bodyJSON(t, source.Spec, source.Status); got != want {
+		t.Errorf("spec and status after the round trip = %s, want %s", got, want)
+	}
+}
+
+// TestRegisterConversionsBothDirections pins the full-fidelity conversion of every part of an
+// object, in both directions, through the scheme the apiserver uses.
+func TestRegisterConversionsBothDirections(t *testing.T) {
+	scheme := conversionScheme(t)
+	source := v0alpha1Fixture()
+
+	converted, err := scheme.ConvertToVersion(source, playlistV1GVK.GroupVersion())
+	if err != nil {
+		t.Fatalf("converting v0alpha1 to v1 returned an unexpected error: %v", err)
+	}
+	asV1, ok := converted.(*v1.Playlist)
+	if !ok {
+		t.Fatalf("the converted object is %T, want *v1.Playlist", converted)
+	}
+	if got, want := asV1.APIVersion, playlistV1GVK.GroupVersion().String(); got != want {
+		t.Errorf("apiVersion = %q, want %q", got, want)
+	}
+	if !reflect.DeepEqual(asV1.ObjectMeta, source.ObjectMeta) {
+		t.Errorf("v1 metadata = %#v, want %#v", asV1.ObjectMeta, source.ObjectMeta)
+	}
+	if got, want := bodyJSON(t, asV1.Spec, asV1.Status), bodyJSON(t, source.Spec, source.Status); got != want {
+		t.Errorf("v1 spec and status = %s, want %s", got, want)
+	}
+	// The item variables are the field this feature added, so they are checked as typed values
+	// too: an item that carries them keeps every name and value, and an item that does not
+	// stays without the field rather than gaining an empty map.
+	wantVariables := map[string][]string{"host": {"h1", "h2"}, "cluster": {"c1"}}
+	if got := asV1.Spec.Items[0].Variables; !reflect.DeepEqual(got, wantVariables) {
+		t.Errorf("v1 spec.items[0].variables = %#v, want %#v", got, wantVariables)
+	}
+	if got := asV1.Spec.Items[1].Variables; got != nil {
+		t.Errorf("v1 spec.items[1].variables = %#v, want nil", got)
+	}
+
+	// The source must not have been touched by the conversion, and the destination must not
+	// share the maps and slices it copied: an apiserver that mutates one object would
+	// otherwise change the other.
+	asV1.Spec.Items[0].Variables["host"][0] = "mutated"
+	asV1.Labels["grafana.app/managedBy"] = "mutated"
+	asV1.Status.OperatorStates["qa-probe"].Details["reason"] = "mutated"
+	if got := source.Spec.Items[0].Variables["host"][0]; got != "h1" {
+		t.Errorf("mutating the converted object changed the source variables to %q", got)
+	}
+	if got := source.Labels["grafana.app/managedBy"]; got != "test" {
+		t.Errorf("mutating the converted object changed the source labels to %q", got)
+	}
+	if got := source.Status.OperatorStates["qa-probe"].Details["reason"]; got != "converted" {
+		t.Errorf("mutating the converted object changed the source status details to %v", got)
+	}
+
+	// And back, from a fresh fixture so the mutations above cannot be mistaken for fidelity.
+	source = v0alpha1Fixture()
+	asV1, ok = mustConvert(t, scheme, source, playlistV1GVK.GroupVersion()).(*v1.Playlist)
+	if !ok {
+		t.Fatalf("the converted object is not a *v1.Playlist")
+	}
+	reverted, ok := mustConvert(t, scheme, asV1, playlistV0alpha1GVK.GroupVersion()).(*v0alpha1.Playlist)
+	if !ok {
+		t.Fatalf("the reverted object is not a *v0alpha1.Playlist")
+	}
+	if !reflect.DeepEqual(reverted.ObjectMeta, source.ObjectMeta) {
+		t.Errorf("v0alpha1 metadata after both conversions = %#v, want %#v", reverted.ObjectMeta, source.ObjectMeta)
+	}
+	if got, want := bodyJSON(t, reverted.Spec, reverted.Status), bodyJSON(t, source.Spec, source.Status); got != want {
+		t.Errorf("v0alpha1 spec and status after both conversions = %s, want %s", got, want)
+	}
+}
+
+func mustConvert(t *testing.T, scheme *runtime.Scheme, in runtime.Object, target schema.GroupVersion) runtime.Object {
+	t.Helper()
+
+	out, err := scheme.ConvertToVersion(in, target)
+	if err != nil {
+		t.Fatalf("converting %T to %s returned an unexpected error: %v", in, target, err)
+	}
+	return out
+}
+
+// TestConvertPlaylistReplacesTheDestination covers the direct call the scheme's Convert makes
+// available to callers that supply their own destination: a conversion replaces the object it
+// is given, so nothing of a reused destination may survive.
+func TestConvertPlaylistReplacesTheDestination(t *testing.T) {
+	source := v0alpha1Fixture()
+	destination := &v1.Playlist{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   "stale",
+			Labels: map[string]string{"stale": "label"},
+		},
+		Spec: v1.PlaylistSpec{
+			Title:    "stale title",
+			Interval: "99m",
+			Items: []v1.PlaylistPlaylistItem{
+				{Type: v1.PlaylistPlaylistItemTypeDashboardById, Value: "7", Variables: map[string][]string{"stale": {"variable"}}},
+				{Type: v1.PlaylistPlaylistItemTypeDashboardByTag, Value: "stale"},
+				{Type: v1.PlaylistPlaylistItemTypeDashboardByTag, Value: "stale"},
+			},
+		},
+		Status: v1.PlaylistStatus{
+			OperatorStates: map[string]v1.PlayliststatusOperatorState{"stale": {LastEvaluation: "0"}},
+		},
+	}
+
+	if err := convertPlaylistV0alpha1ToV1(source, destination, nil); err != nil {
+		t.Fatalf("convertPlaylistV0alpha1ToV1 returned an unexpected error: %v", err)
+	}
+
+	if got := destination.Name; got != source.Name {
+		t.Errorf("name = %q, want %q", got, source.Name)
+	}
+	if _, ok := destination.Labels["stale"]; ok {
+		t.Errorf("the stale label survived the conversion: %#v", destination.Labels)
+	}
+	if got := len(destination.Spec.Items); got != len(source.Spec.Items) {
+		t.Errorf("len(spec.items) = %d, want %d", got, len(source.Spec.Items))
+	}
+	if _, ok := destination.Status.OperatorStates["stale"]; ok {
+		t.Errorf("the stale operator state survived the conversion: %#v", destination.Status.OperatorStates)
+	}
+	if got, want := bodyJSON(t, destination.Spec, destination.Status), bodyJSON(t, source.Spec, source.Status); got != want {
+		t.Errorf("spec and status = %s, want %s", got, want)
+	}
+}
+
+// TestConvertPlaylistRejectsOtherTypes covers the guards on the conversion functions. The
+// scheme only ever calls them with the pair they were registered for, so a mismatch means
+// something else is calling them, and it has to be told rather than silently mis-converted.
+func TestConvertPlaylistRejectsOtherTypes(t *testing.T) {
+	cases := []struct {
+		name    string
+		convert func(a, b any, scope conversion.Scope) error
+		a       any
+		b       any
+	}{
+		{"v0alpha1 to v1 with a wrong source", convertPlaylistV0alpha1ToV1, &v1.Playlist{}, &v1.Playlist{}},
+		{"v0alpha1 to v1 with a wrong destination", convertPlaylistV0alpha1ToV1, &v0alpha1.Playlist{}, &v0alpha1.Playlist{}},
+		{"v1 to v0alpha1 with a wrong source", convertPlaylistV1ToV0alpha1, &v0alpha1.Playlist{}, &v0alpha1.Playlist{}},
+		{"v1 to v0alpha1 with a wrong destination", convertPlaylistV1ToV0alpha1, &v1.Playlist{}, &v1.Playlist{}},
+		{"v0alpha1 to v1 with a nil source", convertPlaylistV0alpha1ToV1, nil, &v1.Playlist{}},
+		{"v1 to v0alpha1 with a nil destination", convertPlaylistV1ToV0alpha1, &v1.Playlist{}, nil},
+		// A typed nil satisfies the type assertion, so the guards have to reject it by value
+		// as well: dereferencing it would panic inside the apiserver's conversion path.
+		{"v0alpha1 to v1 with a typed nil source", convertPlaylistV0alpha1ToV1, (*v0alpha1.Playlist)(nil), &v1.Playlist{}},
+		{"v0alpha1 to v1 with a typed nil destination", convertPlaylistV0alpha1ToV1, &v0alpha1.Playlist{}, (*v1.Playlist)(nil)},
+		{"v1 to v0alpha1 with a typed nil source", convertPlaylistV1ToV0alpha1, (*v1.Playlist)(nil), &v0alpha1.Playlist{}},
+		{"v1 to v0alpha1 with a typed nil destination", convertPlaylistV1ToV0alpha1, &v1.Playlist{}, (*v0alpha1.Playlist)(nil)},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := tc.convert(tc.a, tc.b, nil); err == nil {
+				t.Fatalf("conversion of (%T, %T) returned no error", tc.a, tc.b)
+			}
+		})
+	}
+}
+
+func TestRegisterConversionsRejectsANilScheme(t *testing.T) {
+	if err := RegisterConversions(nil); err == nil {
+		t.Fatal("RegisterConversions(nil) returned no error")
 	}
 }

@@ -94,6 +94,12 @@ describe('PlaylistStartPage', () => {
     expect(screen.getByText(/no dashboards to play/i)).toBeInTheDocument();
     expect(screen.getByRole('link', { name: 'Edit playlist' })).toHaveAttribute('href', '/playlists/edit/playlist-uid');
     expect(screen.getByRole('link', { name: 'Back to playlists' })).toHaveAttribute('href', '/playlists');
+
+    // These two are the whole of the page's recovery affordance, and a `size="md"` button is 12 px
+    // short of a 44 px target.
+    for (const action of screen.getAllByRole('link')) {
+      expect(window.getComputedStyle(action)).toMatchObject({ minWidth: '44px', minHeight: '44px' });
+    }
   });
 
   it('names unresolvable dashboards as the cause and offers the editor and the list', async () => {

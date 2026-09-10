@@ -1,4 +1,4 @@
-import { css } from '@emotion/css';
+import { css, cx } from '@emotion/css';
 import { Draggable } from '@hello-pangea/dnd';
 import pluralize from 'pluralize';
 import { useId, type ReactNode } from 'react';
@@ -7,9 +7,15 @@ import { type GrafanaTheme2 } from '@grafana/data';
 import { selectors } from '@grafana/e2e-selectors';
 import { Trans, t } from '@grafana/i18n';
 import { Icon, IconButton, useStyles2, Spinner, type IconName } from '@grafana/ui';
+import { getFocusStyles, getMouseFocusStyles } from '@grafana/ui/internal';
 import { TagBadge } from 'app/core/components/TagFilter/TagBadge';
 
-import { PlaylistItemVariables, inLogicalOrder } from './PlaylistItemVariables';
+import {
+  MIN_HIT_TARGET_SIZE,
+  PlaylistItemVariables,
+  inLogicalOrder,
+  pressedControlBackground,
+} from './PlaylistItemVariables';
 import { type PlaylistItemUI } from './types';
 
 interface Props {
@@ -254,7 +260,10 @@ export const PlaylistTableRows = ({
              * name below carries the same summary without it.
              */}
             {variablesSummary !== undefined && (
-              <span key="variables-preview" className={styles.variablesSummary}>
+              // The preview is the one part of the row whose length the stored data decides, so it
+              // is the part that reflows: the count beside it is a fixed short phrase and keeps its
+              // own line.
+              <span key="variables-preview" className={cx(styles.variablesSummary, styles.variablesPreview)}>
                 <span aria-hidden="true">{'· '}</span>
                 {variablesSummary}
               </span>
@@ -299,12 +308,13 @@ export const PlaylistTableRows = ({
                 aria-label={itemLabel(item, variablesSummary)}
               >
                 <div className={styles.row}>
-                  <div className={styles.actions}>{renderItem(item, variablesSummary)}</div>
+                  <div className={styles.itemInfo}>{renderItem(item, variablesSummary)}</div>
                   <div className={styles.actions}>
                     {hasVariableEditor && (
                       <IconButton
                         name={isExpanded ? 'angle-down' : 'angle-right'}
                         size="md"
+                        className={styles.compactControl}
                         onClick={() => onToggleExpanded(index)}
                         aria-expanded={isExpanded}
                         // Named in both states, which is what a disclosure is: the panel below is
@@ -323,11 +333,16 @@ export const PlaylistTableRows = ({
                     <IconButton
                       name="times"
                       size="md"
+                      className={styles.compactControl}
                       onClick={() => onDelete(index)}
                       data-testid={selectors.pages.PlaylistForm.itemDelete}
+                      // The marker the table finds this control by to move focus back onto it: a
+                      // deletion that is asked about and then dismissed removes nothing, so the
+                      // control that asked the question is still on the row it belongs to.
+                      data-playlist-item-delete=""
                       tooltip={t('playlist-edit.form.table-delete', 'Delete playlist item')}
                     />
-                    <div {...provided.dragHandleProps} data-playlist-item-drag-handle="">
+                    <div {...provided.dragHandleProps} data-playlist-item-drag-handle="" className={styles.dragHandle}>
                       <Icon
                         title={t('playlist-edit.form.table-drag', 'Reorder playlist item')}
                         name="draggabledots"
@@ -385,6 +400,13 @@ function getStyles(theme: GrafanaTheme2) {
       display: 'flex',
       alignItems: 'center',
       justifyContent: 'space-between',
+      // Stated rather than left to the content: the row's height is now decided by the 44 px
+      // targets in it, and saying so is what keeps a row without any of them — none exists today,
+      // but a row whose controls are all conditional could — the same height as its neighbours.
+      minHeight: MIN_HIT_TARGET_SIZE,
+      // The item's name now takes whatever width the controls leave, so the two cells need a gap
+      // of their own: a reflowed title would otherwise end flush against the disclosure button.
+      columnGap: theme.spacing(1),
       marginBottom: '3px',
 
       border: `1px solid ${theme.colors.border.medium}`,
@@ -395,10 +417,101 @@ function getStyles(theme: GrafanaTheme2) {
     rightMargin: css({
       marginRight: '5px',
     }),
+    /**
+     * The cell holding the item's icon, its name and its variable summary.
+     *
+     * A flex item is floored at the width of its own content unless it is given a zero minimum, so
+     * a long dashboard name and the summary beside it pushed this cell — and with it the row's
+     * disclosure, delete and drag controls — past the width of a 375 px viewport. The zero minimum
+     * is what lets the cell take the width the controls leave instead, and wrapping is what it does
+     * with the content that no longer fits on one line: the name, the count and the value preview
+     * take as many lines as the row's width needs, and every control stays on the canvas.
+     *
+     * `anywhere` rather than `break-word` because only `anywhere` lowers the cell's own minimum
+     * width: a name or a variable value with no space in it would otherwise still decide how wide
+     * the row has to be, which is the overflow this removes.
+     */
+    itemInfo: css({
+      alignItems: 'center',
+      display: 'flex',
+      flexWrap: 'wrap',
+      rowGap: theme.spacing(0.25),
+      minWidth: 0,
+      overflowWrap: 'anywhere',
+    }),
     actions: css({
       alignItems: 'center',
       justifyContent: 'center',
       display: 'flex',
+      // The controls are how the row is operated, so they keep their own width whatever the name
+      // beside them does: shrinking them is what took them off the canvas on a narrow viewport.
+      flexShrink: 0,
+    }),
+    /**
+     * The drag handle, which the drag-and-drop library makes a focusable control without giving it
+     * a component of its own to paint one.
+     *
+     * Left to the browser it takes a 1 px auto outline, measured at roughly 1:1 against the row
+     * behind it, while the disclosure and delete controls beside it — both `IconButton`s — paint
+     * the design system's ring. It is therefore given the same ring, from the same mixin, so the
+     * three controls of a row indicate keyboard focus alike. The ring is drawn as a box shadow 4 px
+     * outside the element and nothing between here and the list clips: the row's own padding is
+     * wider than that, and neither the row, the panel below it nor the list constrains overflow.
+     */
+    dragHandle: css({
+      /**
+       * The 44 px box, and the one control here that needs its own centring to keep it.
+       *
+       * The handle has no component of its own, so laying the glyph out is this class's job: an
+       * earlier attempt at the same box used `display: flex` alone, which made the glyph the only
+       * flex item and collapsed the handle from 16×22 to 16×16 — the box shrank to the glyph
+       * instead of the glyph sitting in the box. The glyph is therefore given `flex: none`, which
+       * holds its own 16 px while the box around it is sized by the minima below, and both axes are
+       * centred so the ring, the fills and the glyph stay concentric.
+       */
+      display: 'inline-flex',
+      alignItems: 'center',
+      justifyContent: 'center',
+      minWidth: MIN_HIT_TARGET_SIZE,
+      minHeight: MIN_HIT_TARGET_SIZE,
+      '> svg': {
+        flex: 'none',
+      },
+      borderRadius: theme.shape.radius.default,
+      // The one control of the row that answered a pointer with nothing at all: no hover state and
+      // no pressed state, so there was no way to tell it apart from the glyph beside it before
+      // starting a drag. It takes the same two backgrounds the `IconButton`s next to it take, on
+      // itself rather than on a layer behind it, because it has no such layer of its own.
+      '&:hover': {
+        backgroundColor: theme.colors.action.hover,
+      },
+      '&:active': {
+        backgroundColor: pressedControlBackground(theme),
+      },
+      '&:focus-visible': getFocusStyles(theme),
+      // Pointer interaction leaves the handle focused — the library returns focus to it after a
+      // drop — so, exactly as `IconButton` does, the ring is kept for the keyboard and the browser
+      // outline is dropped for the pointer rather than shown to it.
+      '&:focus:not(:focus-visible)': getMouseFocusStyles(theme),
+    }),
+    /**
+     * The row's disclosure and delete controls, which are `IconButton`s.
+     *
+     * They paint hover and press on a `::before` layer behind the glyph, and the rule `IconButton`
+     * carries for the active state clears that layer for a text-filled button — so the backdrop
+     * that appeared on hover disappeared again the moment the control was pressed. The press is
+     * painted back here, without touching the glyph or its size.
+     */
+    compactControl: css({
+      // The 44 px box. `IconButton` is already an `inline-flex` that centres its glyph and its
+      // `::before` layer, so the minima are the whole change: the glyph keeps its 16 px, the hover
+      // and press layer keeps its own size, and both stay in the middle of the larger box.
+      minWidth: MIN_HIT_TARGET_SIZE,
+      minHeight: MIN_HIT_TARGET_SIZE,
+      '&:active:before, &:active:hover:before': {
+        backgroundColor: pressedControlBackground(theme),
+        opacity: 1,
+      },
     }),
     settings: css({
       label: 'settings',
@@ -406,21 +519,47 @@ function getStyles(theme: GrafanaTheme2) {
     }),
     variables: css({
       paddingInlineStart: theme.spacing(3),
+      [theme.breakpoints.down('sm')]: {
+        // Narrow viewports need the width for the editor's own fields more than for the indent
+        // that ties the panel to its row: three spacing units of it, on top of the panel's padding
+        // and the page's, left the stacked inputs too narrow to read what is typed into them.
+        paddingInlineStart: theme.spacing(1),
+      },
     }),
-    // The summary shares a flex cell with the dashboard name, so left to shrink and wrap it broke
-    // the phrase itself across two lines beside a long wrapped title. It holds its one line here and
-    // the name, which wraps correctly already, absorbs the remaining width.
+    // The count shares a flex cell with the dashboard name, so left to shrink and wrap it broke the
+    // phrase itself across two lines beside a long wrapped title. It holds its one line here — the
+    // cell wraps it onto a line of its own when the row runs out of width — and the name and the
+    // value preview, which both wrap correctly, absorb the remaining width.
     variablesSummary: css({
       marginInlineStart: theme.spacing(1),
       color: theme.colors.text.secondary,
       fontSize: theme.typography.bodySmall.fontSize,
       whiteSpace: 'nowrap',
       flexShrink: 0,
+      // The cell around this one breaks words wherever it has to; the count is a fixed phrase of
+      // two words that reads as one thing, so it opts back out of that.
+      overflowWrap: 'normal',
       // The summary is built out of stored variable text. Isolating it keeps whatever direction
       // that text resolves to inside this element, so it cannot reorder the dashboard name or the
       // count it sits beside — the counterpart, inside the string, of dropping the explicit
       // bidirectional controls.
       unicodeBidi: 'isolate',
+    }),
+    /**
+     * The variable values previewed beside the count, which is the one part of the row as long as
+     * the stored data makes it.
+     *
+     * It reflows rather than holding a single line: at 375 px a preview of up to 48 code points on
+     * its own exceeds the width the row has, and it is the text this row can afford to break —
+     * `variablesSummary`, which this is merged over, holds the fixed count phrase together. That
+     * class's bidirectional isolation is kept by the merge, because the values are stored text and
+     * must not reorder the name they sit beside.
+     */
+    variablesPreview: css({
+      whiteSpace: 'normal',
+      flexShrink: 1,
+      minWidth: 0,
+      overflowWrap: 'anywhere',
     }),
   };
 }

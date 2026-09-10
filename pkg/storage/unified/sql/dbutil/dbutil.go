@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"strings"
 	"text/template"
+	"time"
 
 	"github.com/go-sql-driver/mysql"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -87,10 +88,11 @@ func (e SQLError) Error() string {
 // through the wrapping the SQL backend applies on the way out (for example
 // fmt.Errorf("transactional operation: %w", err)).
 //
-// The envelope is chosen from the wrapped driver error: database contention
-// keeps a retryable shape (see db.StatusForError), because withholding the
-// driver text would otherwise leave a caller unable to tell a lost race for the
-// database from a server that is actually broken.
+// The envelope is chosen from the wrapped error: database contention keeps a
+// retryable shape (see db.StatusForError, and classifyStatementError for the
+// form of contention whose driver error is gone by the time it is wrapped),
+// because withholding the driver text would otherwise leave a caller unable to
+// tell a lost race for the database from a server that is actually broken.
 func (e SQLError) Status() metav1.Status {
 	return db.StatusForError(e.Err)
 }
@@ -166,6 +168,33 @@ func IsUniqueViolation(err error) bool {
 	return false
 }
 
+// classifyStatementError marks a statement failure that is database contention
+// the driver could no longer report as such, so that everything above the
+// statement — the client envelope through SQLError.Status, the failure logging
+// below, and any retry logic reading db.IsBusy — classifies it as the lost race
+// for the database it is.
+//
+// This is the last point at which the condition is recognisable. The SQLite
+// driver interrupts a statement whose context expired and returns the context
+// error in place of SQLITE_BUSY, so above here nothing distinguishes a write
+// that sat waiting for the database write lock from any other expired deadline;
+// what does distinguish it is how long the statement spent inside the driver,
+// which only this call site measures (see sqlite.IsInterruptedBusyWait).
+//
+// The classification is deliberately confined to the SQLite dialect. The
+// networked engines report their own contention as a driver error and keep the
+// generic envelope, as they always have, so an ordinary slow statement against
+// them is never relabelled by the wait it happens to have taken.
+func classifyStatementError(err error, dialectName string, waited time.Duration) error {
+	if err == nil || dialectName != sqltemplate.SQLite.DialectName() {
+		return err
+	}
+	if !sqlite.IsInterruptedBusyWait(err, waited) {
+		return err
+	}
+	return db.NewBusyError(err)
+}
+
 // logSQLFailure records the operator-facing detail of a failed database
 // operation: the query template, the kind of call, the driver error and the
 // executed statement, plus the argument and scan destination counts. This is
@@ -180,6 +209,13 @@ func IsUniqueViolation(err error) bool {
 // the backend detects that an object already exists and answers 409 — logging
 // that at error level would report every duplicate name, and every write that
 // loses a create race, as a server fault.
+//
+// Database contention is the one class between those two: the request was not
+// served, so it cannot be silent like a client disconnect, but nothing is broken
+// either, so reporting it as a fault would be wrong. It is logged at warning
+// level, and it is matched before the deadline case below because the
+// interrupted form of contention arrives as an expired deadline that is not a
+// client disconnect at all.
 //
 // Statement arguments are never logged. They are the potentially regulated
 // information that SQLError keeps unexported, and only Debug() — a local
@@ -198,8 +234,11 @@ func logSQLFailure(ctx context.Context, e SQLError) {
 	switch {
 	case errors.Is(e.Err, sql.ErrNoRows),
 		errors.Is(e.Err, context.Canceled),
-		errors.Is(e.Err, context.DeadlineExceeded),
 		IsUniqueViolation(e.Err):
+		logger.Debug(sqlFailureLogMsg)
+	case db.IsBusy(e.Err):
+		logger.Warn(sqlFailureLogMsg)
+	case errors.Is(e.Err, context.DeadlineExceeded):
 		logger.Debug(sqlFailureLogMsg)
 	default:
 		logger.Error(sqlFailureLogMsg)
@@ -221,11 +260,16 @@ func Exec(ctx context.Context, x db.ContextExecer, tmpl *template.Template, req 
 	query := sqltemplate.FormatSQL(rawQuery)
 
 	args := req.GetArgs()
-	ctx = withOtelAttrs(ctx, tmpl.Name(), req.DialectName())
+	dialectName := req.DialectName()
+	ctx = withOtelAttrs(ctx, tmpl.Name(), dialectName)
+	// The time the statement spends in the driver is what tells an interrupted
+	// busy wait apart from any other expired deadline, so it is measured here,
+	// where the statement runs, and classified before the error is wrapped.
+	started := time.Now()
 	res, err := x.ExecContext(ctx, query, args...)
 	if err != nil {
 		sqlErr := SQLError{
-			Err:          err,
+			Err:          classifyStatementError(err, dialectName, time.Since(started)),
 			CallType:     "Exec",
 			TemplateName: tmpl.Name(),
 			arguments:    args,
@@ -255,11 +299,16 @@ func QueryRows(ctx context.Context, x db.ContextExecer, tmpl *template.Template,
 	query := sqltemplate.FormatSQL(rawQuery)
 
 	args := req.GetArgs()
-	ctx = withOtelAttrs(ctx, tmpl.Name(), req.DialectName())
+	dialectName := req.DialectName()
+	ctx = withOtelAttrs(ctx, tmpl.Name(), dialectName)
+	// As in Exec: an interrupted busy wait is only recognisable from how long
+	// the statement waited, so the read path measures it too. A reader is held
+	// by the same lock when the database is not in WAL mode.
+	started := time.Now()
 	rows, err := x.QueryContext(ctx, query, args...)
 	if err != nil {
 		sqlErr := SQLError{
-			Err:          err,
+			Err:          classifyStatementError(err, dialectName, time.Since(started)),
 			CallType:     "Query",
 			TemplateName: tmpl.Name(),
 			arguments:    args,

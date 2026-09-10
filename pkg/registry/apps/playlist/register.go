@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apiserver/pkg/admission"
 	"k8s.io/apiserver/pkg/authorization/authorizer"
 	restclient "k8s.io/client-go/rest"
@@ -64,6 +65,24 @@ func RegisterAppInstaller(
 	installer.AppInstaller = i
 
 	return installer, nil
+}
+
+// AddToScheme registers the App SDK's kinds and then replaces the conversions it registered
+// between the two served playlist versions with ones that do not depend on the object's
+// TypeMeta -- see playlistapp.RegisterConversions for why the SDK's own conversions fail on
+// the apiserver's internal-hub round trip, and which request paths that broke.
+//
+// The order matters and is the whole mechanism: a conversion is keyed by its (source,
+// destination) Go type pair, so registering after the delegate replaces the pair's entry.
+// Registering before it would be overwritten and change nothing.
+func (p *AppInstaller) AddToScheme(scheme *runtime.Scheme) error {
+	if err := p.AppInstaller.AddToScheme(scheme); err != nil {
+		return err
+	}
+	if err := playlistapp.RegisterConversions(scheme); err != nil {
+		return fmt.Errorf("registering the playlist cross-version conversions: %w", err)
+	}
+	return nil
 }
 
 func (p *AppInstaller) GetAuthorizer() authorizer.Authorizer {

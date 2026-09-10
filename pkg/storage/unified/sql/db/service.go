@@ -216,17 +216,81 @@ func StorageBusyStatus() metav1.Status {
 	}
 }
 
+// BusyError marks an error as database contention for the classification below
+// when the driver error alone can no longer say so.
+//
+// SQLite reports a lost race for the write lock in two shapes. A lock upgrade
+// inside a deferred transaction fails immediately with SQLITE_BUSY, which
+// sqlite.IsBusyOrLocked still recognises in the returned error. A statement that
+// waits on the busy handler instead is interrupted when its context expires, and
+// the driver then returns the context error in place of the SQLite one, which
+// erases the busy state before any code above the statement can see it. The
+// second shape is therefore recognised where the statement runs — see the
+// classification in the dbutil package, which is the only place that knows how
+// long the statement waited and against which engine — and travels up as this
+// marker so that the envelope, the failure logging and any retry logic all
+// classify the failure the same way.
+//
+// It wraps rather than replaces, so errors.Is and errors.As keep reaching the
+// context error and everything below it, and Error() is the wrapped text
+// verbatim so that logs and error comparisons are unchanged by the marking.
+type BusyError struct {
+	Err error
+}
+
+// Error returns the wrapped error verbatim: marking a failure as contention
+// adds a classification, never client- or operator-facing text.
+func (e BusyError) Error() string { return e.Err.Error() }
+
+// Unwrap exposes the wrapped error so that errors.Is and errors.As keep
+// reaching the context error the driver returned and the driver error, if any,
+// underneath it.
+func (e BusyError) Unwrap() error { return e.Err }
+
+// Status implements the APIStatus contract so that a marked error carries the
+// retryable envelope even when it reaches the API surface directly, without a
+// SQLError or a Redact wrapper around it.
+func (e BusyError) Status() metav1.Status { return StorageBusyStatus() }
+
+// NewBusyError marks err as database contention. A nil error stays nil so that
+// call sites can mark unconditionally.
+func NewBusyError(err error) error {
+	if err == nil {
+		return nil
+	}
+	return BusyError{Err: err}
+}
+
+// IsBusy reports whether err is a lost race for the database in either of the
+// shapes BusyError describes: the driver's own busy state, or a busy wait that
+// was interrupted and marked at the statement site.
+//
+// It is the single predicate for that condition above the statement layer, so
+// retry logic and the client envelope cannot disagree about which failures are
+// transient.
+func IsBusy(err error) bool {
+	if sqlite.IsBusyOrLocked(err) {
+		return true
+	}
+	var busy BusyError
+	return errors.As(err, &busy)
+}
+
 // StatusForError picks the client-facing envelope for a database-layer error:
-// the retryable contention envelope when the driver reports that the database
-// was busy or locked, and the generic storage envelope otherwise.
+// the retryable contention envelope when the database was busy or locked, and
+// the generic storage envelope otherwise.
 //
 // SQLite serializes writes, so a lock upgrade inside a deferred transaction can
-// fail immediately even with busy_timeout set; the same condition used to be
+// fail immediately even with busy_timeout set, while a statement that waits on
+// the busy handler comes back as an expired deadline with the driver's busy
+// state erased (BusyError explains both shapes); the same condition used to be
 // recognisable to callers only through the driver text that is now withheld
 // from clients. Contention on the networked engines keeps the generic envelope,
-// as it had no distinguishable client-facing shape before either.
+// as it had no distinguishable client-facing shape before either, and neither
+// engine's ordinary slow statement is reported as contention: only the driver's
+// busy state and the interrupted SQLite busy wait are.
 func StatusForError(err error) metav1.Status {
-	if sqlite.IsBusyOrLocked(err) {
+	if IsBusy(err) {
 		return StorageBusyStatus()
 	}
 	return InternalStorageStatus()

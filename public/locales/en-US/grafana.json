@@ -13515,13 +13515,20 @@
       "delete-item-confirm": "Delete item",
       "delete-item-title": "Delete playlist item",
       "heading": "Add dashboards",
+      "interval-invalid": "Interval must be a duration such as 30s, 5m or 1h",
       "interval-label": "Interval",
       "interval-placeholder": "5m",
       "interval-required": "Interval is required",
+      "name-blank": "Name cannot consist only of spaces",
       "name-label": "Name",
       "name-placeholder": "Name",
       "name-required": "Name is required",
       "save": "Save",
+      "save-refused-variables": "Playlist not saved. Complete or remove the template variable marked with an error, then save again.",
+      "save-state-available": "Save this playlist",
+      "save-state-invalid-fields": "Correct the fields marked with an error before saving",
+      "save-state-no-items": "Add at least one dashboard before saving",
+      "save-state-saving": "Saving this playlist",
       "table-delete": "Delete playlist item",
       "table-drag": "Reorder playlist item",
       "table-empty": "Playlist is empty. Add dashboards below.",
@@ -13576,7 +13583,9 @@
       "message_one": "This list is too large to load completely, so it shows {{count}} playlist. Playlists it leaves out are missing from the search results as well.",
       "message_other": "This list is too large to load completely, so it shows the first {{count}} playlists. Playlists it leaves out are missing from the search results as well.",
       "title": "Not all playlists are shown"
-    }
+    },
+    "untitled-playlist": "Untitled playlist",
+    "untitled-playlist-named": "Untitled playlist ({{name}})"
   },
   "playlists": {
     "empty-state": {
@@ -16492,7 +16501,9 @@
     "no-tags": "No tags found",
     "placeholder": "Filter by tag",
     "select-aria-label": "Tag filter",
-    "tag-option-label": "Tag option"
+    "tag-option-label": "Tag option",
+    "tag-option-label-tag": "Tag option {{tag}}",
+    "tag-option-label-with-count": "Tag option {{tag}} ({{tagCount}})"
   },
   "team-picker": {
     "noOptionsMessage-no-teams-found": "No teams found",

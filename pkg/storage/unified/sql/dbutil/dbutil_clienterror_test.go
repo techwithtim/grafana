@@ -7,16 +7,22 @@
 package dbutil_test
 
 import (
+	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/serializer"
+	"k8s.io/apiserver/pkg/endpoints/handlers/responsewriters"
 
 	"github.com/grafana/grafana/pkg/storage/unified/resource"
 	"github.com/grafana/grafana/pkg/storage/unified/sql/db"
@@ -169,6 +175,95 @@ func TestSQLErrorContentionEnvelopeStaysRetryable(t *testing.T) {
 	// "busy" is the condition the message deliberately names; what must not
 	// appear is the engine, the statement, the schema or the template.
 	for _, f := range []string{".sql", "resource_insert", "insert", "guid", "query:", "sqlite", "locked", "write failed"} {
+		require.NotContains(t, lowered, f,
+			"a contention response must disclose no more than a generic one: %q in %s", f, body)
+	}
+}
+
+// TestInterruptedBusyWaitEnvelopeIsRetryable is the end-to-end contract for the
+// form of contention QA reproduced against a running server: an external
+// BEGIN IMMEDIATE holds the write lock, the write sits in the SQLite busy
+// handler until its transaction deadline expires, and the driver then returns
+// the context error with the busy state erased. It walks that failure through
+// the same mapping as the test above and all the way into the response the API
+// server writes, because the retry hint is only worth anything if the header is
+// actually rendered.
+//
+// The error shape is the one observed live: the SQLError from the statement,
+// wrapped by the transaction boundary together with the rollback failure that
+// database/sql produces because it had already rolled the transaction back when
+// the deadline expired.
+func TestInterruptedBusyWaitEnvelopeIsRetryable(t *testing.T) {
+	t.Parallel()
+
+	driverErr := fmt.Errorf("exec: %w", context.DeadlineExceeded)
+	sqlErr := dbutil.SQLError{
+		Err:          db.NewBusyError(driverErr),
+		CallType:     "Exec",
+		TemplateName: "resource_insert.sql",
+		Query:        `INSERT INTO "resource" ("guid") VALUES (?);`,
+	}
+	wrapped := fmt.Errorf("transactional operation: %w; rollback: %w",
+		error(sqlErr), sql.ErrTxDone)
+
+	require.ErrorIs(t, wrapped, context.DeadlineExceeded,
+		"the context error must stay reachable for everything that classifies it")
+	require.True(t, db.IsBusy(wrapped),
+		"the marking must survive the wrapping the write path applies")
+
+	res := resource.AsErrorResult(wrapped)
+	require.Equal(t, int32(http.StatusInternalServerError), res.Code)
+	require.Equal(t, string(metav1.StatusReasonServerTimeout), res.Reason)
+	require.Equal(t, db.StorageBusyMessage, res.Message)
+	require.NotNil(t, res.Details)
+	require.Equal(t, int32(1), res.Details.RetryAfterSeconds)
+
+	clientErr := resource.GetError(res)
+	require.True(t, apierrors.IsServerTimeout(clientErr))
+	delay, ok := apierrors.SuggestsClientDelay(clientErr)
+	require.True(t, ok, "the client must be told it may retry")
+	require.Equal(t, 1, delay)
+
+	// The write path converts more than once — the resource server builds the
+	// result, the storage client turns it back into an error, and the apistore
+	// layer converts it again before the API server renders it (see
+	// apistore.Store.Create) — so the retry hint has to survive a round trip
+	// and not just a single conversion.
+	clientErr = resource.GetError(resource.AsErrorResult(clientErr))
+	require.True(t, apierrors.IsServerTimeout(clientErr))
+	delay, ok = apierrors.SuggestsClientDelay(clientErr)
+	require.True(t, ok, "the retry hint must survive the conversions the write path performs")
+	require.Equal(t, 1, delay)
+
+	// The response the API server writes for that error. This is the only way
+	// to establish the Retry-After claim: the header is rendered from
+	// Details.RetryAfterSeconds by ErrorNegotiated, which is the funnel both
+	// the resource surface and the legacy REST surface reach.
+	scheme := runtime.NewScheme()
+	metav1.AddToGroupVersion(scheme, metav1.Unversioned)
+	codecs := serializer.NewCodecFactory(scheme)
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost,
+		"/apis/playlist.grafana.app/v1/namespaces/default/playlists", nil)
+	code := responsewriters.ErrorNegotiated(clientErr, codecs, metav1.Unversioned,
+		recorder, request)
+
+	require.Equal(t, http.StatusInternalServerError, code)
+	require.Equal(t, "1", recorder.Header().Get("Retry-After"),
+		"a contended write must be retryable without the client parsing message text")
+
+	body := recorder.Body.String()
+	t.Logf("client-facing response: %d %v %s", code, recorder.Header(), body)
+	require.Contains(t, body, db.StorageBusyMessage)
+	require.Contains(t, body, string(metav1.StatusReasonServerTimeout))
+	lowered := strings.ToLower(body)
+	// "busy" is the condition the message deliberately names; the engine, the
+	// statement, the schema, the template and the driver error must not appear.
+	for _, f := range []string{
+		".sql", "resource_insert", "insert", "guid", "query:", "sqlite",
+		"locked", "deadline", "transaction", "rollback",
+	} {
 		require.NotContains(t, lowered, f,
 			"a contention response must disclose no more than a generic one: %q in %s", f, body)
 	}

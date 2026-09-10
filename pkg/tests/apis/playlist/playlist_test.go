@@ -761,6 +761,234 @@ func doPlaylistTests(t *testing.T, helper *apis.K8sTestHelper) *apis.K8sTestHelp
 		require.Nil(t, legacyGet.Result.Items[1].Variables)
 	})
 
+	// Both served versions are backed by one stored object, so a client on either version may
+	// write an object the other one created. That makes the apiserver convert between the two
+	// Go types on paths a same-version request never reaches: structured field management
+	// (metadata.managedFields) records ownership per apiVersion and has to re-express the
+	// object in every version an owner used, and a server-side apply is merged in the hub
+	// version before it is written.
+	//
+	// Those conversions are registered on the scheme by
+	// playlistapp.RegisterConversions (apps/playlist/pkg/app/conversion.go), wired in
+	// pkg/registry/apps/playlist/register.go. Without them the App SDK's own conversion
+	// handler reads the source version off the object's TypeMeta, which the apiserver clears
+	// on the hub hop, and every conversion out of the hub type fails -- silently wiping
+	// metadata.managedFields on a cross-version update and answering a cross-version apply
+	// with HTTP 500.
+	t.Run("Keep field ownership and status when a playlist crosses served versions", func(t *testing.T) {
+		clientV1 := helper.GetResourceClient(apis.ResourceClientArgs{
+			User: helper.Org1.Editor,
+			GVR:  gvr,
+		})
+		clientV0alpha1 := helper.GetResourceClient(apis.ResourceClientArgs{
+			User: helper.Org1.Editor,
+			GVR: schema.GroupVersionResource{
+				Group:    gvr.Group,
+				Version:  "v0alpha1",
+				Resource: gvr.Resource,
+			},
+		})
+
+		const (
+			name            = "playlist-across-versions"
+			v0alpha1Owner   = "qa-v0alpha1-writer"
+			v1Owner         = "qa-v1-writer"
+			v1Applier       = "qa-v1-applier"
+			v0alpha1Applier = "qa-v0alpha1-applier"
+			statusOwner     = "qa-status-writer"
+		)
+
+		// entryOf returns the ownership entry a named manager holds on the main resource.
+		// Ownership of the status subresource is tracked in a separate entry with the same
+		// manager name, so those are skipped: only the entries a spec write produces are
+		// compared here.
+		entryOf := func(t *testing.T, obj *unstructured.Unstructured, manager string) metav1.ManagedFieldsEntry {
+			t.Helper()
+			for _, entry := range obj.GetManagedFields() {
+				if entry.Manager == manager && entry.Subresource == "" {
+					return entry
+				}
+			}
+			require.FailNowf(t, "missing ownership entry",
+				"manager %q owns nothing on %s; entries: %+v", manager, obj.GetName(), obj.GetManagedFields())
+			return metav1.ManagedFieldsEntry{}
+		}
+		ownedFields := func(t *testing.T, entry metav1.ManagedFieldsEntry) string {
+			t.Helper()
+			require.NotNil(t, entry.FieldsV1, "entry %q carries no fieldsV1", entry.Manager)
+			return entry.FieldsV1.GetRawString()
+		}
+
+		created, err := clientV0alpha1.Resource.Create(context.Background(),
+			helper.LoadYAMLOrJSON(`{
+				"apiVersion": "playlist.grafana.app/v0alpha1",
+				"kind": "Playlist",
+				"metadata": { "name": "`+name+`" },
+				"spec": {
+				  "title": "Written through v0alpha1",
+				  "interval": "5m",
+				  "items": [
+					{ "type": "dashboard_by_uid", "value": "xCmMwXdVz", "variables": { "host": ["h1", "h2"] } },
+					{ "type": "dashboard_by_tag", "value": "graph-ng" }
+				  ]
+				}
+			  }`),
+			metav1.CreateOptions{FieldManager: v0alpha1Owner},
+		)
+		// Registered before the assertions, which are fatal: an object created by a request
+		// whose response then failed an assertion would otherwise survive into the sibling
+		// sub-tests that assert the exact contents of the playlist list.
+		t.Cleanup(func() {
+			err := clientV1.Resource.Delete(context.Background(), name, metav1.DeleteOptions{})
+			if err != nil && !apierrors.IsNotFound(err) {
+				t.Errorf("failed to clean up playlist %s: %v", name, err)
+			}
+		})
+		require.NoError(t, err)
+		require.Equal(t, name, created.GetName())
+
+		// The create is recorded against the version that made it.
+		createdEntry := entryOf(t, created, v0alpha1Owner)
+		require.Equal(t, "playlist.grafana.app/v0alpha1", createdEntry.APIVersion)
+		require.Equal(t, metav1.ManagedFieldsOperationUpdate, createdEntry.Operation)
+		require.Contains(t, ownedFields(t, createdEntry), `"f:title"`)
+		require.Contains(t, ownedFields(t, createdEntry), `"f:items"`)
+
+		// Reading through the newer version reports the same ownership, still stamped with the
+		// version that wrote it.
+		found, err := clientV1.Resource.Get(context.Background(), name, metav1.GetOptions{})
+		require.NoError(t, err)
+		require.Equal(t, "playlist.grafana.app/v1", found.GetAPIVersion())
+		require.Equal(t, "playlist.grafana.app/v0alpha1", entryOf(t, found, v0alpha1Owner).APIVersion)
+
+		// The cross-version update: only spec.title changes, so field management has to split
+		// ownership between the two managers -- and to do that it must express the v1 object in
+		// v0alpha1. This is the write that used to answer 200 with metadata.managedFields
+		// silently emptied.
+		update := found.DeepCopy()
+		require.NoError(t, unstructured.SetNestedField(update.Object, "Updated through v1", "spec", "title"))
+		updatedAcross, err := clientV1.Resource.Update(context.Background(), update,
+			metav1.UpdateOptions{FieldManager: v1Owner})
+		require.NoError(t, err)
+		require.NotEmpty(t, updatedAcross.GetManagedFields(),
+			"the v1 update emptied metadata.managedFields: cross-version field management failed")
+
+		v1Entry := entryOf(t, updatedAcross, v1Owner)
+		require.Equal(t, "playlist.grafana.app/v1", v1Entry.APIVersion)
+		require.Contains(t, ownedFields(t, v1Entry), `"f:title"`, "the v1 update must own the field it changed")
+		keptEntry := entryOf(t, updatedAcross, v0alpha1Owner)
+		require.Equal(t, "playlist.grafana.app/v0alpha1", keptEntry.APIVersion)
+		require.Contains(t, ownedFields(t, keptEntry), `"f:items"`,
+			"the v0alpha1 writer must keep the fields the v1 update did not change")
+		require.NotContains(t, ownedFields(t, keptEntry), `"f:title"`,
+			"the field the v1 update changed must have moved to the v1 manager")
+
+		// Ownership was persisted, not just echoed, and reads the same through both versions.
+		for _, client := range []*apis.K8sResourceClient{clientV1, clientV0alpha1} {
+			fresh, err := client.Resource.Get(context.Background(), name, metav1.GetOptions{})
+			require.NoError(t, err)
+			require.Len(t, fresh.GetManagedFields(), 2,
+				"both managers must survive in storage, read through %s", client.Args.GVR.Version)
+			freshTitle, _, err := unstructured.NestedString(fresh.Object, "spec", "title")
+			require.NoError(t, err)
+			require.Equal(t, "Updated through v1", freshTitle)
+		}
+
+		// A server-side apply through v1 of an object owned through v0alpha1 used to fail with
+		// HTTP 500 ("failed to encode object"), because the merged object is produced in the hub
+		// version and then has to be converted back. The apply states title and items, so
+		// spec.interval stays with the original v0alpha1 owner.
+		applied, err := clientV1.Resource.Apply(context.Background(), name,
+			helper.LoadYAMLOrJSON(`{
+				"apiVersion": "playlist.grafana.app/v1",
+				"kind": "Playlist",
+				"metadata": { "name": "`+name+`" },
+				"spec": {
+				  "title": "Applied through v1",
+				  "items": [
+					{ "type": "dashboard_by_uid", "value": "xCmMwXdVz", "variables": { "host": ["h3"], "cluster": ["c1"] } }
+				  ]
+				}
+			  }`),
+			metav1.ApplyOptions{Force: true, FieldManager: v1Applier},
+		)
+		require.NoError(t, err, "a server-side apply through v1 must not fail on an object owned through v0alpha1")
+
+		appliedEntry := entryOf(t, applied, v1Applier)
+		require.Equal(t, metav1.ManagedFieldsOperationApply, appliedEntry.Operation)
+		require.Equal(t, "playlist.grafana.app/v1", appliedEntry.APIVersion)
+		require.Equal(t, "playlist.grafana.app/v0alpha1", entryOf(t, applied, v0alpha1Owner).APIVersion)
+		require.Contains(t, ownedFields(t, entryOf(t, applied, v0alpha1Owner)), `"f:interval"`,
+			"the apply did not state spec.interval, so it must stay with the v0alpha1 owner")
+
+		appliedItems, _, err := unstructured.NestedSlice(applied.Object, "spec", "items")
+		require.NoError(t, err)
+		require.Equal(t, []any{map[string]any{
+			"type":  "dashboard_by_uid",
+			"value": "xCmMwXdVz",
+			"variables": map[string]any{
+				"host":    []any{"h3"},
+				"cluster": []any{"c1"},
+			},
+		}}, appliedItems, "the applied items, including their variables, must survive the hub round trip")
+		appliedInterval, _, err := unstructured.NestedString(applied.Object, "spec", "interval")
+		require.NoError(t, err)
+		require.Equal(t, "5m", appliedInterval, "a field the apply did not state must keep its stored value")
+
+		// An operator writes status through the version it runs on. A later apply through that
+		// same version must not drop it: the apply is merged against the live object, so the
+		// status the apply does not mention has to come back unchanged.
+		withStatus, err := clientV0alpha1.Resource.Get(context.Background(), name, metav1.GetOptions{})
+		require.NoError(t, err)
+		require.NoError(t, unstructured.SetNestedMap(withStatus.Object, map[string]any{
+			"lastEvaluation":   "1",
+			"state":            "success",
+			"descriptiveState": "recorded by the cross-version test",
+		}, "status", "operatorStates", "qa-probe"))
+		stated, err := clientV0alpha1.Resource.UpdateStatus(context.Background(), withStatus,
+			metav1.UpdateOptions{FieldManager: statusOwner})
+		require.NoError(t, err)
+		probeState, ok, err := unstructured.NestedString(stated.Object, "status", "operatorStates", "qa-probe", "state")
+		require.NoError(t, err)
+		require.True(t, ok, "the status write did not persist")
+		require.Equal(t, "success", probeState)
+
+		appliedV0alpha1, err := clientV0alpha1.Resource.Apply(context.Background(), name,
+			helper.LoadYAMLOrJSON(`{
+				"apiVersion": "playlist.grafana.app/v0alpha1",
+				"kind": "Playlist",
+				"metadata": { "name": "`+name+`" },
+				"spec": {
+				  "title": "Applied through v0alpha1",
+				  "interval": "9m"
+				}
+			  }`),
+			metav1.ApplyOptions{Force: true, FieldManager: v0alpha1Applier},
+		)
+		require.NoError(t, err)
+		appliedV0alpha1Title, _, err := unstructured.NestedString(appliedV0alpha1.Object, "spec", "title")
+		require.NoError(t, err)
+		require.Equal(t, "Applied through v0alpha1", appliedV0alpha1Title)
+		appliedV0alpha1Interval, _, err := unstructured.NestedString(appliedV0alpha1.Object, "spec", "interval")
+		require.NoError(t, err)
+		require.Equal(t, "9m", appliedV0alpha1Interval)
+		require.Equal(t, metav1.ManagedFieldsOperationApply, entryOf(t, appliedV0alpha1, v0alpha1Applier).Operation)
+
+		// The status the apply never mentioned, on the response and in storage. The App SDK's
+		// generic strategy still logs "PrepareForUpdate set status error" on this path, because
+		// it is handed the hub-typed new object and the v0alpha1-typed old one and type-asserts
+		// the status of its own version (grafana-app-sdk k8s/apiserver/strategy.go:70-85); the
+		// copy it fails to make is redundant here, which is what these assertions pin.
+		afterApply, err := clientV0alpha1.Resource.Get(context.Background(), name, metav1.GetOptions{})
+		require.NoError(t, err)
+		for _, obj := range []*unstructured.Unstructured{appliedV0alpha1, afterApply} {
+			state, ok, err := unstructured.NestedString(obj.Object, "status", "operatorStates", "qa-probe", "state")
+			require.NoError(t, err)
+			require.True(t, ok, "the apply through v0alpha1 dropped status.operatorStates")
+			require.Equal(t, "success", state)
+		}
+	})
+
 	t.Run("Refuse playlist item variables that break the published maxima", func(t *testing.T) {
 		// The maxima are enforced by admission (apps/playlist/pkg/app/app.go), which the
 		// aggregated apiserver consults for every write path, so this sub-test is what proves a

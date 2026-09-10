@@ -530,6 +530,58 @@ describe('PlaylistPage', () => {
     });
   });
 
+  describe('deleting a playlist whose stored title is blank', () => {
+    /**
+     * The editor refuses a name that is blank once trimmed, but a playlist stored before it did —
+     * or written straight through the API, whose app validator checks neither title nor interval —
+     * still has one, and its delete confirmation used to be titled with that blank string and to
+     * ask about deleting "  playlist".
+     */
+    function mockBlankTitledPlaylists() {
+      jest.spyOn(backendSrv, 'fetch').mockImplementation(() =>
+        of(
+          createFetchResponse({
+            items: [
+              { spec: { title: '   ', interval: '10m', items: [] }, metadata: { name: 'playlist-blank' } },
+              { spec: { title: 'Named playlist', interval: '10m', items: [] }, metadata: { name: 'playlist-named' } },
+            ],
+          })
+        )
+      );
+    }
+
+    beforeEach(() => {
+      // Legacy (playlistsRBAC off) write access, so each card renders "Delete playlist".
+      (contextSrv as jest.Mocked<typeof contextSrv>).isEditor = true;
+    });
+
+    it('names the playlist by its resource name in the confirmation dialog', async () => {
+      mockBlankTitledPlaylists();
+      const user = userEvent.setup();
+      setup();
+
+      const [deleteButton] = await screen.findAllByRole('button', { name: /delete playlist/i });
+      await user.click(deleteButton);
+
+      const dialog = await screen.findByRole('dialog', { name: 'Untitled playlist (playlist-blank)' });
+      expect(
+        within(dialog).getByText('Are you sure you want to delete Untitled playlist (playlist-blank) playlist?')
+      ).toBeInTheDocument();
+    });
+
+    it('still names a playlist that has a title by its title', async () => {
+      mockBlankTitledPlaylists();
+      const user = userEvent.setup();
+      setup();
+
+      const deleteButtons = await screen.findAllByRole('button', { name: /delete playlist/i });
+      await user.click(deleteButtons[1]);
+
+      const dialog = await screen.findByRole('dialog', { name: 'Named playlist' });
+      expect(within(dialog).getByText('Are you sure you want to delete Named playlist playlist?')).toBeInTheDocument();
+    });
+  });
+
   describe('pull request banner', () => {
     afterEach(() => {
       locationService.push('/playlists');

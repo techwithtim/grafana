@@ -2,6 +2,7 @@ package db_test
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"net/http"
@@ -352,6 +353,14 @@ func TestStatusForError(t *testing.T) {
 			sqlite.ErrTestBusy,
 			sqlite.ErrTestLocked,
 			fmt.Errorf("transactional operation: %w", sqlite.ErrTestBusy),
+			// The interrupted form of the same condition: the driver replaced
+			// SQLITE_BUSY with the context error, so the busy state is carried
+			// by the marking the statement site applied instead.
+			db.NewBusyError(context.DeadlineExceeded),
+			fmt.Errorf("transactional operation: %w",
+				db.NewBusyError(fmt.Errorf("exec: %w", context.DeadlineExceeded))),
+			fmt.Errorf("transactional operation: %w; rollback: %w",
+				db.NewBusyError(context.DeadlineExceeded), sql.ErrTxDone),
 		} {
 			status := db.StatusForError(err)
 			require.Equal(t, metav1.StatusFailure, status.Status)
@@ -361,15 +370,30 @@ func TestStatusForError(t *testing.T) {
 			require.NotNil(t, status.Details)
 			require.Positive(t, status.Details.RetryAfterSeconds,
 				"a retry hint is what makes the response retryable for clients")
+			require.Equal(t, int32(1), status.Details.RetryAfterSeconds,
+				"one second is the retry hint the API server renders as Retry-After")
 		}
 	})
 
 	t.Run("any other failure is reported generically", func(t *testing.T) {
 		t.Parallel()
 
-		require.Equal(t, db.InternalStorageStatus(), db.StatusForError(errTest))
-		require.Equal(t, db.InternalStorageStatus(),
-			db.StatusForError(fmt.Errorf("no such table: resource (1): %w", errTest)))
+		for _, err := range []error{
+			errTest,
+			fmt.Errorf("no such table: resource (1): %w", errTest),
+			// A client that hung up, and a deadline that no statement site
+			// attributed to the database write lock, are not contention: an
+			// expired deadline on its own says nothing about why.
+			context.Canceled,
+			fmt.Errorf("exec: %w", context.Canceled),
+			context.DeadlineExceeded,
+			fmt.Errorf("exec: %w", context.DeadlineExceeded),
+			sql.ErrNoRows,
+			sqlite.ErrTestUniqueConstraintViolation,
+		} {
+			require.Equal(t, db.InternalStorageStatus(), db.StatusForError(err),
+				"unexpected envelope for %v", err)
+		}
 	})
 
 	t.Run("the retryable message discloses no more than the generic one", func(t *testing.T) {
@@ -383,6 +407,91 @@ func TestStatusForError(t *testing.T) {
 				"contention message must not disclose %q", forbidden)
 		}
 	})
+}
+
+// TestBusyError pins the marker that carries the busy condition from the
+// statement site, which is the last place it is recognisable, up to the
+// envelope: the driver replaces SQLITE_BUSY with the context error for any
+// statement it interrupts, so nothing above the statement can tell a write that
+// lost the race for the database from any other expired deadline.
+func TestBusyError(t *testing.T) {
+	t.Parallel()
+
+	t.Run("nil stays nil", func(t *testing.T) {
+		t.Parallel()
+		require.NoError(t, db.NewBusyError(nil))
+	})
+
+	t.Run("the wrapped error is left intact", func(t *testing.T) {
+		t.Parallel()
+
+		wrapped := fmt.Errorf("exec: %w", context.DeadlineExceeded)
+		err := db.NewBusyError(wrapped)
+
+		require.Equal(t, wrapped.Error(), err.Error(),
+			"marking a failure adds a classification, never text")
+		require.ErrorIs(t, err, context.DeadlineExceeded,
+			"the context error must stay reachable for the failure logging")
+		require.NotErrorIs(t, err, context.Canceled)
+	})
+
+	t.Run("it carries the retryable envelope on its own", func(t *testing.T) {
+		t.Parallel()
+
+		var apistatus apierrors.APIStatus
+		require.ErrorAs(t, db.NewBusyError(context.DeadlineExceeded), &apistatus)
+		require.Equal(t, db.StorageBusyStatus(), apistatus.Status())
+	})
+
+	t.Run("redaction keeps the retryable envelope", func(t *testing.T) {
+		t.Parallel()
+
+		err := db.Redact(fmt.Errorf("commit: %w", db.NewBusyError(context.DeadlineExceeded)))
+
+		var apistatus apierrors.APIStatus
+		require.ErrorAs(t, err, &apistatus)
+		require.Equal(t, db.StorageBusyStatus(), apistatus.Status())
+	})
+}
+
+// TestIsBusy pins the single predicate for a lost race for the database, so
+// that retry logic and the client envelope cannot disagree about which
+// failures are transient.
+func TestIsBusy(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "the driver's busy state", err: sqlite.ErrTestBusy, want: true},
+		{name: "the driver's locked state", err: sqlite.ErrTestLocked, want: true},
+		{
+			name: "the driver's busy state through wrapping",
+			err:  fmt.Errorf("transactional operation: %w", sqlite.ErrTestBusy),
+			want: true,
+		},
+		{name: "an interrupted busy wait", err: db.NewBusyError(context.DeadlineExceeded), want: true},
+		{
+			name: "an interrupted busy wait through wrapping",
+			err:  fmt.Errorf("transactional operation: %w", db.NewBusyError(context.DeadlineExceeded)),
+			want: true,
+		},
+		{name: "a cancelled request", err: context.Canceled, want: false},
+		{name: "an unattributed expired deadline", err: context.DeadlineExceeded, want: false},
+		{name: "no rows", err: sql.ErrNoRows, want: false},
+		{name: "a duplicate row", err: sqlite.ErrTestUniqueConstraintViolation, want: false},
+		{name: "a generic failure", err: errTest, want: false},
+		{name: "no error", err: nil, want: false},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			require.Equal(t, tc.want, db.IsBusy(tc.err))
+		})
+	}
 }
 
 func TestInternalStorageStatus(t *testing.T) {

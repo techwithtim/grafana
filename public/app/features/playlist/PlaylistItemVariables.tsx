@@ -2,6 +2,7 @@ import { css, cx } from '@emotion/css';
 import {
   Fragment,
   createContext,
+  useCallback,
   useContext,
   useEffect,
   useId,
@@ -59,12 +60,14 @@ type RowControl = RowField | 'remove';
  * `names` are candidate committed rows in priority order and the request resolves to the first one
  * that still has `control` rendered, because a row named here may have been removed, renamed again
  * by the caller, or never have unmounted at all. `fallbackToNewRow` is what a removal asks for when
- * no committed row survives it.
+ * no committed row survives it, and `newRowField` says which of the add row's two fields it lands
+ * on — the name, unless what raised the request is a message about the values beside it.
  */
 interface FocusRequest {
   names: string[];
   control: RowControl;
   fallbackToNewRow: boolean;
+  newRowField?: RowField;
 }
 
 interface RowDraft {
@@ -97,6 +100,17 @@ const EMPTY_ROW_STATE: RowState = { drafts: new Map(), errors: new Map() };
 type SettleOutcome = 'settled' | 'blocked';
 
 /**
+ * Why a settle was asked for.
+ *
+ * Only `submit` is a save the user asked for and can have refused, and only a refused save moves
+ * focus to the field that refused it. A `structural-change` settle — a row being collapsed,
+ * deleted or lifted for a drag — is the last chance to honour text rather than a request to store
+ * anything: what the user asked for goes ahead either way, so a message left on another row's
+ * field must not pull focus out of the action they are performing.
+ */
+export type SettleIntent = 'submit' | 'structural-change';
+
+/**
  * The link between the editors open under a form and the moments their text has to be honoured.
  *
  * An editor holds text that is not yet part of the playlist item — a half-typed add row, or a row
@@ -111,14 +125,17 @@ type SettleOutcome = 'settled' | 'blocked';
  */
 export interface PlaylistVariablesCommitScope {
   /** Registers an open editor and returns the function that removes it again. */
-  register: (settle: () => SettleOutcome) => () => void;
+  register: (settle: (intent: SettleIntent) => SettleOutcome) => () => void;
   /**
    * Commits what every open editor is holding and reports whether the caller may go on: an editor
    * that cannot commit its text shows a message for it and makes the answer `false`. Each editor
    * is asked even after one has refused, so one row's rejected text cannot leave another row's
    * valid text uncommitted.
+   *
+   * The intent is passed on to the editors, because what a refusal does about focus depends on
+   * whether a save was being asked for.
    */
-  settle: () => boolean;
+  settle: (intent: SettleIntent) => boolean;
 }
 
 export const PlaylistVariablesCommitContext = createContext<PlaylistVariablesCommitScope | undefined>(undefined);
@@ -133,7 +150,7 @@ export function usePlaylistVariablesCommit(): {
   commitScope: PlaylistVariablesCommitScope;
   settlePendingVariables: () => boolean;
 } {
-  const editorsRef = useRef<Set<() => SettleOutcome>>(new Set());
+  const editorsRef = useRef<Set<(intent: SettleIntent) => SettleOutcome>>(new Set());
 
   const commitScope = useMemo<PlaylistVariablesCommitScope>(
     () => ({
@@ -144,12 +161,12 @@ export function usePlaylistVariablesCommit(): {
           editors.delete(settle);
         };
       },
-      settle: () => {
+      settle: (intent) => {
         let settled = true;
         // A copy, because an editor that commits re-renders its parent, and a set being iterated
         // is not the place to discover a registration or a removal.
         for (const settle of Array.from(editorsRef.current)) {
-          if (settle() === 'blocked') {
+          if (settle(intent) === 'blocked') {
             settled = false;
           }
         }
@@ -159,7 +176,11 @@ export function usePlaylistVariablesCommit(): {
     []
   );
 
-  return { commitScope, settlePendingVariables: commitScope.settle };
+  // Named for the one caller that decides something by the answer, and bound to the intent that
+  // caller has: a submit is the only settle a user asked to store something with.
+  const settlePendingVariables = useCallback(() => commitScope.settle('submit'), [commitScope]);
+
+  return { commitScope, settlePendingVariables };
 }
 
 /**
@@ -317,6 +338,7 @@ export const PlaylistItemVariables = ({ variables, itemPosition, onChange }: Pro
    */
   const rowControls = useRef(new Map<string, Map<RowControl, HTMLElement>>());
   const newNameInput = useRef<HTMLInputElement | null>(null);
+  const newValuesInput = useRef<HTMLInputElement | null>(null);
   const pendingFocus = useRef<FocusRequest | undefined>(undefined);
   // Read by nothing: the state exists only so that raising a request always causes a render for the
   // effect below to run in. Elided rather than named, because a name here would be an unused one.
@@ -393,7 +415,8 @@ export const PlaylistItemVariables = ({ variables, itemPosition, onChange }: Pro
       }
     }
     if (request.fallbackToNewRow) {
-      newNameInput.current?.focus();
+      const field = request.newRowField === 'values' ? newValuesInput : newNameInput;
+      field.current?.focus();
     }
     // A request that resolves to nothing and asks for no fallback deliberately leaves focus where
     // it is: it was raised for an element that turns out not to have been unmounted, and taking
@@ -593,7 +616,7 @@ export const PlaylistItemVariables = ({ variables, itemPosition, onChange }: Pro
    * every commit rebuild the item from the same starting point, so the last would be the only one
    * to survive and the others would be silently undone.
    */
-  const settlePending = (): SettleOutcome => {
+  const settlePending = (intent: SettleIntent): SettleOutcome => {
     // A stored map beyond the budget is rendered as a message with no controls in it, so there is
     // nothing here the user could have typed.
     if (!withinBudget) {
@@ -602,9 +625,10 @@ export const PlaylistItemVariables = ({ variables, itemPosition, onChange }: Pro
 
     let next = new Map(committed);
     let changed = false;
-    let blocked = false;
     const settledRows: string[] = [];
     const nextErrors = new Map(errors);
+    /** The committed rows this settle is refusing, and the field of each one that is refusing it. */
+    const blockedRows: Array<{ name: string; field: RowField }> = [];
 
     for (const [name, draft] of drafts) {
       if (!committed.has(name)) {
@@ -620,7 +644,7 @@ export const PlaylistItemVariables = ({ variables, itemPosition, onChange }: Pro
       );
       if (error) {
         nextErrors.set(name, error);
-        blocked = true;
+        blockedRows.push({ name, field: error.field });
         continue;
       }
 
@@ -636,7 +660,6 @@ export const PlaylistItemVariables = ({ variables, itemPosition, onChange }: Pro
     const newValues = parseValues(newDraft.values);
     const newRowError = newRowHasText ? validate(newName, newValues, Array.from(next.keys()), true) : undefined;
     if (newRowError) {
-      blocked = true;
       setNewError(newRowError);
     } else if (newRowHasText) {
       next = new Map(next).set(newName, newValues);
@@ -659,7 +682,28 @@ export const PlaylistItemVariables = ({ variables, itemPosition, onChange }: Pro
       onChange(Object.fromEntries(next));
     }
 
-    return blocked ? 'blocked' : 'settled';
+    // What was refused is on screen, but a save the user asked for stopped without anything moving:
+    // the messages sit inside a panel that can be scrolled out of view, so the refusal was
+    // discoverable only by looking for it. Focus therefore goes to the field that is refusing —
+    // which is also what announces the reason, since `Field` names its input with the message
+    // through `aria-describedby` — while the form announces that the playlist was not saved.
+    //
+    // The first offender in the order the rows are shown, and the add row last, because it is the
+    // last thing in the panel. Only one field is asked for: focus is a single place, and the
+    // remaining messages stay where they are for the user to work through. And only for a submit,
+    // for the reason recorded on `SettleIntent`.
+    if (intent === 'submit') {
+      const firstBlockedRow = displayOrder(entries)
+        .map(([rowName]) => blockedRows.find(({ name }) => name === rowName))
+        .find((candidate) => candidate !== undefined);
+      if (firstBlockedRow) {
+        requestFocus({ names: [firstBlockedRow.name], control: firstBlockedRow.field, fallbackToNewRow: false });
+      } else if (newRowError) {
+        requestFocus({ names: [], control: 'name', fallbackToNewRow: true, newRowField: newRowError.field });
+      }
+    }
+
+    return blockedRows.length > 0 || newRowError ? 'blocked' : 'settled';
   };
 
   // The registration is made once per editor and calls whatever the latest render produced, so a
@@ -670,7 +714,7 @@ export const PlaylistItemVariables = ({ variables, itemPosition, onChange }: Pro
   useEffect(() => {
     settleRef.current = settlePending;
   });
-  useEffect(() => commitScope?.register(() => settleRef.current()), [commitScope]);
+  useEffect(() => commitScope?.register((intent) => settleRef.current(intent)), [commitScope]);
 
   const removeRow = (name: string) => {
     // The remove button unmounts with its row, and focus on an unmounted element falls to the
@@ -930,6 +974,9 @@ export const PlaylistItemVariables = ({ variables, itemPosition, onChange }: Pro
           error={newError?.field === 'values' ? newError.message : undefined}
         >
           <Input
+            // Where a refused save lands when the values are what it refused: the message names
+            // this field, so this is the field the user is taken to.
+            ref={newValuesInput}
             id={newValuesId}
             value={newDraft.values}
             maxLength={MAX_VARIABLE_VALUES_TEXT_LENGTH}
@@ -941,7 +988,7 @@ export const PlaylistItemVariables = ({ variables, itemPosition, onChange }: Pro
         <div />
 
         <Button
-          className={styles.add}
+          className={cx(styles.add, styles.addButton)}
           type="button"
           variant="secondary"
           size="sm"
@@ -972,6 +1019,52 @@ export const PlaylistItemVariables = ({ variables, itemPosition, onChange }: Pro
     </div>
   );
 };
+
+/**
+ * How far the pressed state of a compact control moves away from the surface it sits on.
+ *
+ * Enough to be seen next to the hover state it replaces — which is `theme.colors.action.hover`, a
+ * translucent overlay a fifth of the way to the foreground — and not so far that pressing a 16 px
+ * glyph paints a block of colour beside its neighbours.
+ */
+const PRESSED_EMPHASIS = 0.2;
+
+/**
+ * The background a compact control of the playlist editor takes while it is held down.
+ *
+ * `IconButton` paints its hover state on a layer behind the glyph and clears that layer's
+ * background again while a text-filled button is active, so pressing the row's disclosure, its
+ * delete control or a variable's remove button looked exactly like not touching it: the measured
+ * pressed backdrop was `rgba(0, 0, 0, 0)` where hover had painted `theme.colors.action.hover`. One
+ * step of emphasis away from the surface these controls sit on is the delta — lighter on a dark
+ * theme, darker on a light one, and beyond the hover overlay in both.
+ *
+ * Exported because those controls live in two components: the row's own three in
+ * `PlaylistTableRows`, and the remove button of each variable row here.
+ */
+export function pressedControlBackground(theme: GrafanaTheme2): string {
+  return theme.colors.emphasize(theme.colors.background.secondary, PRESSED_EMPHASIS);
+}
+
+/**
+ * The smallest box, in pixels, any control of the playlist editor offers a pointer.
+ *
+ * The editor's controls were the size of the glyph inside them: the row's disclosure and delete
+ * buttons measured 16×16, its drag handle 16×22, "Add variable" 24 px high and Save 32 px — targets
+ * a person aiming with a thumb, a trackpad or a tremor misses, and which an automated audit failed
+ * eleven of in one list. Every one of them is grown to this box.
+ *
+ * It is the size, and only the size: each control keeps its glyph, its fills, its focus ring and
+ * its position, so the box grows around what was already there rather than turning a compact list
+ * of icons into a row of buttons.
+ *
+ * Exported because the controls it applies to live in three of this feature's components — the
+ * row's own three in `PlaylistTableRows`, the remove and add controls here, and the form's Save in
+ * `PlaylistForm`, all of which already import from this module. `StartModal` repeats the number
+ * instead of importing it, so the playlist list page does not pull the variables editor into its
+ * bundle for one constant.
+ */
+export const MIN_HIT_TARGET_SIZE = 44;
 
 function getStyles(theme: GrafanaTheme2) {
   return {
@@ -1043,7 +1136,31 @@ function getStyles(theme: GrafanaTheme2) {
       paddingBlockStart: theme.spacing(1.5),
     }),
     remove: css({
-      marginBlockStart: theme.spacing(0.5),
+      /**
+       * The 44 px box, with the glyph kept where it was.
+       *
+       * `IconButton` centres its glyph and its hover layer in its content box, so the padding
+       * below — the whole 12 px the box gains over the 32 px input beside it — returns that content
+       * box to the input's height and puts both back on its centre line, instead of the 6 px (half
+       * the gain) below it that centring in the taller box would give. The border box, which is
+       * what a pointer hits and what the focus ring is drawn around, still starts at the top of the
+       * row: nothing is moved into the row above and no negative margin is needed to hold the two
+       * apart.
+       *
+       * `IconButton`'s own `padding: 0` is a shorthand, so this longhand is all that changes; the
+       * 4 px nudge this replaces existed to align a 16 px control against the same input.
+       */
+      minWidth: MIN_HIT_TARGET_SIZE,
+      minHeight: MIN_HIT_TARGET_SIZE,
+      paddingBlockEnd: MIN_HIT_TARGET_SIZE - theme.spacing.gridSize * 4,
+      // `IconButton` paints hover and press on a `::before` layer behind the glyph, and its own
+      // rule for the active state clears that layer, so the press is painted back here. Both
+      // selectors it uses are matched, because the one that wins while the pointer is still over
+      // the button is the one that names hover as well.
+      '&:active:before, &:active:hover:before': {
+        backgroundColor: pressedControlBackground(theme),
+        opacity: 1,
+      },
       [theme.breakpoints.down('sm')]: {
         // The other cell of the stacked variable's second row, so it repeats `valuesCell`'s
         // margin: the taller margin box would otherwise decide the track and the grouping gap
@@ -1054,6 +1171,18 @@ function getStyles(theme: GrafanaTheme2) {
     add: css({
       gridColumn: '1 / -1',
       justifySelf: 'start',
+    }),
+    /**
+     * The 44 px box for the add button, which was 24 px high because it is a `size="sm"` `Button`.
+     *
+     * Kept apart from `add` because that class also places the note about a row that has not been
+     * added yet, and a note is not a target: giving it this box would leave a paragraph of text
+     * padded to the height of a button.
+     */
+    addButton: css({
+      minWidth: MIN_HIT_TARGET_SIZE,
+      minHeight: MIN_HIT_TARGET_SIZE,
+      justifyContent: 'center',
     }),
   };
 }

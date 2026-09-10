@@ -10,34 +10,41 @@ export function usePlaylistItems(playlistItems?: PlaylistItemUI[]) {
   const [items, setItems] = useState<PlaylistItemUI[]>(playlistItems ?? []);
 
   useAsync(async () => {
-    for (const item of items) {
-      if (!item.dashboards) {
-        const loaded = await loadDashboards(items);
-        // Merge into the latest state instead of replacing it with the snapshot taken before
-        // the await, which would discard any edit made while the search was in flight.
-        // `loadDashboards` derives an item's dashboards from its type and value alone, so
-        // matching on that pair attaches the right result to each item, even when the same
-        // dashboard is listed more than once. Every other property is left untouched.
-        setItems((prev) => {
-          let merged = false;
-          const next = prev.map((prevItem) => {
-            const match = loaded.find(
-              (loadedItem) => loadedItem.type === prevItem.type && loadedItem.value === prevItem.value
-            );
-            if (!match) {
-              return prevItem;
-            }
-            merged = true;
-            return { ...prevItem, dashboards: match.dashboards };
-          });
-          // A load that resolves after the items it described are gone matches nothing. Returning
-          // the same array leaves the state identity untouched, so this effect — which depends on
-          // `items` — is not re-run by an update that changed nothing.
-          return merged ? next : prev;
-        });
-        return;
-      }
+    // Only the items that have no dashboards yet are worth searching for. An item whose search
+    // returned nothing carries an empty list, which is a resolved item — asking again would start a
+    // load on every render. Loading the whole list instead is what made one structural change, such
+    // as adding a dashboard to a list that already holds duplicate rows, a tag and a second
+    // dashboard, start a search for every existing row as well as the new one.
+    const unresolved = items.filter((item) => !item.dashboards);
+    if (!unresolved.length) {
+      return;
     }
+
+    // `loadDashboards` answers the items that share a type and a value with a single search, so the
+    // duplicates among them cost one request between them rather than one each.
+    const loaded = await loadDashboards(unresolved);
+    // Merge into the latest state instead of replacing it with the snapshot taken before
+    // the await, which would discard any edit made while the search was in flight.
+    // `loadDashboards` derives an item's dashboards from its type and value alone, so
+    // matching on that pair attaches the right result to each item, even when the same
+    // dashboard is listed more than once. Every other property is left untouched.
+    setItems((prev) => {
+      let merged = false;
+      const next = prev.map((prevItem) => {
+        const match = loaded.find(
+          (loadedItem) => loadedItem.type === prevItem.type && loadedItem.value === prevItem.value
+        );
+        if (!match) {
+          return prevItem;
+        }
+        merged = true;
+        return { ...prevItem, dashboards: match.dashboards };
+      });
+      // A load that resolves after the items it described are gone matches nothing. Returning
+      // the same array leaves the state identity untouched, so this effect — which depends on
+      // `items` — is not re-run by an update that changed nothing.
+      return merged ? next : prev;
+    });
   }, [items]);
 
   const addByUID = useCallback(

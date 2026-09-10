@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { useState } from 'react';
 
@@ -186,6 +186,23 @@ function CollapsibleSettleHarness({
 }
 
 /**
+ * The editor under a settle that is not a submit, which is what `PlaylistTable` performs before it
+ * collapses, deletes or lifts a row: that change goes ahead whatever the editors answer, so a
+ * message on a field is not a refusal of anything the user asked to store.
+ */
+function StructuralSettleHarness({ onSettle }: { onSettle: (settled: boolean) => void }) {
+  const { commitScope } = usePlaylistVariablesCommit();
+  return (
+    <PlaylistVariablesCommitContext.Provider value={commitScope}>
+      <PlaylistItemVariables onChange={jest.fn()} />
+      <button type="button" onClick={() => onSettle(commitScope.settle('structural-change'))}>
+        Collapse a row
+      </button>
+    </PlaylistVariablesCommitContext.Provider>
+  );
+}
+
+/**
  * The editor inside a real form with a real submit button, which is the shape `PlaylistForm` gives
  * it. Pressing that button is the interaction the editor has to survive: the press moves focus out
  * of the field being edited before the click that submits has been delivered, so anything
@@ -226,6 +243,19 @@ function SubmitHarness({
 
 function settleButton() {
   return screen.getByRole('button', { name: 'Settle' });
+}
+
+/**
+ * Asks the harness to settle, the way a submit reaching the form does: the click is dispatched
+ * without moving focus first, so the fields are settled while one of them is still being edited.
+ *
+ * The act is awaited because a refused settle moves focus to the field it is refusing, and the
+ * work a focus change schedules is not flushed by the click that caused it.
+ */
+async function settle() {
+  await act(async () => {
+    fireEvent.click(settleButton());
+  });
 }
 
 function submitButton() {
@@ -314,8 +344,8 @@ function isStyleRule(rule: CSSRule): rule is CSSStyleRule {
 }
 
 /**
- * The pixel value `property` takes for `element` in the stacked layout, or 0 when nothing declares
- * it there.
+ * The value `property` takes for `element` in the stacked layout, or the empty string when nothing
+ * declares it there.
  *
  * `getComputedStyle` cannot answer this: jsdom applies only the rules whose media list names
  * `screen`, so an `@media (max-width: …)` block is invisible to it however narrow the window is
@@ -325,7 +355,7 @@ function isStyleRule(rule: CSSRule): rule is CSSStyleRule {
  * `IconButton` a single merged class, and the last declaration found wins, as it would in the
  * cascade.
  */
-function mobilePixels(element: HTMLElement, property: string): number {
+function mobileDeclaration(element: HTMLElement, property: string): string {
   const selectors = new Set(Array.from(element.classList, (name) => `.${name}`));
   let declared = '';
 
@@ -342,6 +372,37 @@ function mobilePixels(element: HTMLElement, property: string): number {
     }
   }
 
+  return declared;
+}
+
+/**
+ * The value `property` takes for `element` under the pseudo-class or pseudo-element selector
+ * `pseudo`, or the empty string when nothing declares it there.
+ *
+ * `getComputedStyle` resolves no `:hover`, `:active` or `::before` state in jsdom, so these
+ * declarations are read out of the injected rules the same way the stacked layout's are. Every
+ * class on the element is considered because `cx` hands `IconButton` a single merged class, and the
+ * last declaration found wins, as it would in the cascade — which is what makes this able to see a
+ * state the component's own rule declared and this editor's class overrode.
+ */
+function pseudoDeclaration(element: HTMLElement, pseudo: string, property: string): string {
+  const selectors = new Set(Array.from(element.classList, (name) => `.${name}${pseudo}`));
+  let declared = '';
+
+  for (const styleElement of Array.from(document.querySelectorAll('style'))) {
+    for (const rule of Array.from(styleElement.sheet?.cssRules ?? [])) {
+      if (isStyleRule(rule) && rule.selectorText.split(',').some((selector) => selectors.has(selector.trim()))) {
+        declared = rule.style.getPropertyValue(property) || declared;
+      }
+    }
+  }
+
+  return declared;
+}
+
+/** The same declaration as a number of pixels, or 0 where the stacked layout declares none. */
+function mobilePixels(element: HTMLElement, property: string): number {
+  const declared = mobileDeclaration(element, property);
   return declared ? Number.parseFloat(declared) : 0;
 }
 
@@ -1253,20 +1314,108 @@ describe('PlaylistItemVariables', () => {
     expect(newValues()).toHaveValue('');
   });
 
+  it('offers a 44 px box on the remove and add controls, with the glyph and the input alignment kept', () => {
+    setup(<PlaylistItemVariables variables={{ host: ['Host1'] }} onChange={jest.fn()} />);
+
+    for (const control of [removeButton('host'), addButton()]) {
+      const { minWidth, minHeight } = window.getComputedStyle(control);
+      expect({ control: control.textContent || control.getAttribute('aria-label'), minWidth, minHeight }).toEqual({
+        control: control.textContent || control.getAttribute('aria-label'),
+        minWidth: '44px',
+        minHeight: '44px',
+      });
+    }
+
+    // The remove control's box grows downwards from the top of its grid row, so the glyph would sit
+    // 6 px below the centre of the 32 px input beside it. The padding is what puts it back: 12 px
+    // of the 44 leaves a 32 px content box, which is where `IconButton` centres both the glyph and
+    // the layer it paints hover and press on.
+    expect(window.getComputedStyle(removeButton('host')).paddingBlockEnd).toBe('12px');
+    // The glyph itself is untouched at `size="md"`.
+    const glyph = removeButton('host').querySelector('svg');
+    expect([glyph?.getAttribute('width'), glyph?.getAttribute('height')]).toEqual(['16', '16']);
+  });
+
+  it('leaves the note about an unadded variable out of the add button box', async () => {
+    const { user } = setup(<PlaylistItemVariables onChange={jest.fn()} />);
+
+    await user.type(newName(), 'host');
+
+    // The note shares the add button's grid cell, so it shares that placement class — but a
+    // paragraph is not a target, and padding it to the height of a button would be a layout defect
+    // dressed up as an accessibility fix.
+    const note = screen.getByText(PENDING_HINT);
+    expect(window.getComputedStyle(note.closest('div')!).minHeight).not.toBe('44px');
+  });
+
   it('refuses the form when the add row cannot be added, and shows why', async () => {
     const onChange = jest.fn();
     const onSettle = jest.fn();
     const { user } = setup(<SettleHarness onChange={onChange} onSettle={onSettle} />);
 
     await user.type(newValues(), 'Host9');
-    fireEvent.click(settleButton());
+    await settle();
 
-    await waitFor(() => {
-      expect(screen.getByRole('alert')).toHaveTextContent(NAME_REQUIRED);
-    });
+    expect(screen.getByRole('alert')).toHaveTextContent(NAME_REQUIRED);
     expect(onSettle).toHaveBeenCalledWith(false);
     expect(onChange).not.toHaveBeenCalled();
     expect(newValues()).toHaveValue('Host9');
+  });
+
+  it('takes focus to the add row field its refusal names, and names that field with the reason', async () => {
+    const onSettle = jest.fn();
+    const { user } = setup(<SettleHarness onChange={jest.fn()} onSettle={onSettle} />);
+
+    // A name with no values: what the save is refused for is the values, so that is where the user
+    // is taken — a refusal the user cannot find is the one they read as nothing having happened.
+    await user.type(newName(), 'host');
+    await settle();
+
+    expect(onSettle).toHaveBeenCalledWith(false);
+    expect(newValues()).toHaveFocus();
+    // `Field` names the input with its own message, so arriving on the field is what announces the
+    // reason; the enclosing form announces that the playlist was not saved.
+    expect(newValues()).toHaveAccessibleDescription(VALUE_REQUIRED);
+
+    // The refusal is not a dead end: correcting the field it named lets the same settle through.
+    await user.type(newValues(), 'Host1');
+    await settle();
+    expect(onSettle).toHaveBeenLastCalledWith(true);
+  });
+
+  it('leaves focus where it is when the settle was a row change rather than a save', async () => {
+    const onSettle = jest.fn();
+    const { user } = setup(<StructuralSettleHarness onSettle={onSettle} />);
+
+    await user.type(newName(), 'host');
+    const trigger = screen.getByRole('button', { name: 'Collapse a row' });
+    await user.click(trigger);
+
+    // The message still appears — the text could not be added and saying so is not optional — but
+    // the change the user asked for is the one that goes ahead, and their place in the page is not
+    // taken away for a message about a row they are not in.
+    expect(onSettle).toHaveBeenCalledWith(false);
+    expect(screen.getByRole('alert')).toHaveTextContent(VALUE_REQUIRED);
+    expect(trigger).toHaveFocus();
+  });
+
+  it('takes focus to the offending field of the first refused row, in the order the rows are shown', async () => {
+    const onSettle = jest.fn();
+    const { user } = setup(
+      <SettleHarness initial={{ region: ['eu'], host: ['Host1'] }} onChange={jest.fn()} onSettle={onSettle} />
+    );
+
+    // Both rows are edited into an invalid state. `host` is refused first because the rows are
+    // shown by name, not in the order the map happens to hold them.
+    await user.clear(rowValues('region'));
+    await user.clear(rowValues('host'));
+    await settle();
+
+    expect(onSettle).toHaveBeenCalledWith(false);
+    expect(rowValues('host')).toHaveFocus();
+    expect(rowValues('host')).toHaveAccessibleDescription(VALUE_REQUIRED);
+    // The other row keeps its own message: only focus is a single place.
+    expect(rowValues('region')).toHaveAccessibleDescription(VALUE_REQUIRED);
   });
 
   it('refuses the form while an existing row holds an invalid edit, and lets it through once corrected', async () => {
@@ -1340,19 +1489,15 @@ describe('PlaylistItemVariables', () => {
     const { user } = setup(<CollapsibleSettleHarness onChange={onChange} onSettle={onSettle} />);
 
     await user.type(newValues(), 'Host9');
-    fireEvent.click(settleButton());
-    await waitFor(() => {
-      expect(onSettle).toHaveBeenLastCalledWith(false);
-    });
+    await settle();
+    expect(onSettle).toHaveBeenLastCalledWith(false);
 
     // Collapsing takes the editor away, and with it the text it could not add. A save after that
     // has nothing left to settle, so it must go through rather than stay refused forever.
     await user.click(screen.getByRole('button', { name: 'Collapse' }));
-    fireEvent.click(settleButton());
+    await settle();
 
-    await waitFor(() => {
-      expect(onSettle).toHaveBeenLastCalledWith(true);
-    });
+    expect(onSettle).toHaveBeenLastCalledWith(true);
     expect(onChange).not.toHaveBeenCalled();
   });
 
@@ -1429,6 +1574,53 @@ describe('PlaylistItemVariables', () => {
     const [nameFraction, valuesFraction] = fractionTracks(tracks);
     expect(nameFraction).toBeGreaterThan(0);
     expect(valuesFraction).toBeGreaterThan(nameFraction);
+  });
+
+  /**
+   * `IconButton` paints hover on a layer behind its glyph and its own rule for the active state
+   * clears that layer for a text-filled button, so pressing this control looked exactly like not
+   * touching it: the audit behind this measured the pressed backdrop as `rgba(0, 0, 0, 0)` where
+   * hover had painted one. The press is painted back on the same layer, in the colour the row's own
+   * controls take, and without touching the glyph.
+   */
+  it('paints a pressed state on a variable remove button that its hover state does not', () => {
+    setup(<PlaylistItemVariables variables={{ host: ['a', 'b'] }} onChange={jest.fn()} />);
+
+    const remove = removeButton('host');
+    const hovered = pseudoDeclaration(remove, ':hover:before', 'background-color');
+    const pressed = pseudoDeclaration(remove, ':active:before', 'background-color');
+
+    expect(hovered).not.toBe('');
+    expect(pressed).not.toBe('');
+    expect(pressed).not.toBe(hovered);
+    // Behind the glyph, an unpainted layer is the same as no layer, which is the state that read
+    // as no press at all.
+    expect(pressed).not.toMatch(/transparent|rgba\(0,\s*0,\s*0,\s*0\)/);
+    expect(pseudoDeclaration(remove, ':active:before', 'opacity')).toBe('1');
+  });
+
+  /**
+   * The row this editor opens under gives its panel less of an indent on a narrow viewport, so the
+   * stacked layout is what has to fit whatever width is left. It fits because every track and every
+   * item in it is floored at zero rather than at the intrinsic width of a text field: two of those
+   * plus the remove button is what used to overflow the panel.
+   */
+  it('keeps every track and field of the stacked layout at a zero minimum width', () => {
+    setup(<PlaylistItemVariables variables={{ host: ['a', 'b'] }} onChange={jest.fn()} />);
+
+    const grid = gridContainerOf(rowName('host'));
+    const stackedTracks = mobileDeclaration(grid, 'grid-template-columns');
+
+    // One flexible column for the fields, which each take a line of their own, and one sized to the
+    // remove button beside the values.
+    expect(fractionTracks(stackedTracks)).toEqual([1]);
+    expect(stackedTracks.replace(/\s/g, '')).toContain('minmax(0,1fr)');
+    // A grid item, and every flex item inside `Input`, is otherwise floored at the text field's
+    // intrinsic width — the `auto` minimum — which no zero-minimum track can bring down.
+    for (const element of [gridItemOf(grid, rowName('host')), rowName('host'), rowValues('host')]) {
+      const { minWidth } = window.getComputedStyle(element);
+      expect(Number.parseFloat(minWidth)).toBe(0);
+    }
   });
 
   it('separates consecutive variables further than a variable is separated from its own values in the stacked layout', () => {

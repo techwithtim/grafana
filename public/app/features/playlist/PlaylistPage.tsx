@@ -14,7 +14,7 @@ import { type Playlist, useDeletePlaylistMutation, useListPlaylistQuery } from '
 
 import { PlaylistPageList } from './PlaylistPageList';
 import { StartModal } from './StartModal';
-import { searchPlaylists, useCanWritePlaylists } from './utils';
+import { playlistLabel, searchPlaylists, useCanWritePlaylists } from './utils';
 
 export const PlaylistPage = () => {
   const canWrite = useCanWritePlaylists();
@@ -196,16 +196,17 @@ export const PlaylistPage = () => {
                 // Repository-managed playlists are removed by committing the deletion to git.
                 <SaveProvisionedResourceDrawer
                   resource={playlistToDelete}
-                  title={playlistToDelete.spec?.title ?? ''}
+                  title={playlistLabel(playlistToDelete)}
                   action="delete"
                   onDismiss={onDismissDelete}
                 />
               ) : (
                 <ConfirmModal
-                  title={playlistToDelete.spec?.title ?? ''}
+                  title={playlistLabel(playlistToDelete)}
                   confirmText={t('playlist-page.delete-modal.confirm-text', 'Delete')}
                   body={t('playlist-page.delete-modal.body', 'Are you sure you want to delete {{name}} playlist?', {
-                    name: playlistToDelete.spec?.title,
+                    name: playlistLabel(playlistToDelete),
+                    interpolation: { escapeValue: false },
                   })}
                   onConfirm={onDeletePlaylist}
                   isOpen={Boolean(playlistToDelete)}

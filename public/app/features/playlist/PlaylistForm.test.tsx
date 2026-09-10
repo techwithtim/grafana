@@ -1,12 +1,15 @@
-import { act, render, screen, waitFor, within } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent, { type UserEvent } from '@testing-library/user-event';
 import { useEffect } from 'react';
 import { render as renderWithRouter } from 'test/test-utils';
 
-import { locationService, setBackendSrv } from '@grafana/runtime';
+import { colorManipulator, rangeUtil } from '@grafana/data';
+import { config, locationService, setBackendSrv } from '@grafana/runtime';
 import { getCustomSearchHandler } from '@grafana/test-utils/handlers';
 import server, { setupMockServer } from '@grafana/test-utils/server';
 import { type DashboardPickerDTO } from 'app/core/components/Select/DashboardPicker';
+import { type TermCount } from 'app/core/components/TagFilter/TagFilter';
+import * as searcherService from 'app/features/search/service/searcher';
 
 import { type Playlist } from '../../api/clients/playlist/v1';
 import { backendSrv } from '../../core/services/backend_srv';
@@ -21,12 +24,26 @@ setupMockServer();
 // facets whenever that identity changes, so the stand-in records every reference it is handed.
 const mockTagFilterTagProps: string[][] = [];
 
-jest.mock('app/core/components/TagFilter/TagFilter', () => ({
-  TagFilter: ({ tags }: { tags: string[] }) => {
-    mockTagFilterTagProps.push(tags);
-    return <>mocked-tag-filter</>;
-  },
-}));
+/**
+ * Whether "Add by tag" renders the real `TagFilter` for the case under test.
+ *
+ * The stand-in keeps every other case independent of react-select's async option loading, and it
+ * is what records the `tags` reference identity above. The cases that are about what the tag
+ * options themselves offer — their accessible names, and adding an item by picking one — need the
+ * real control, its real options and the real `TagOption` that renders them.
+ */
+const mockRealTagFilter = { enabled: false };
+
+jest.mock('app/core/components/TagFilter/TagFilter', () => {
+  const actualModule = jest.requireActual('app/core/components/TagFilter/TagFilter');
+
+  return {
+    TagFilter: (props: { tags: string[] }) => {
+      mockTagFilterTagProps.push(props.tags);
+      return mockRealTagFilter.enabled ? <actualModule.TagFilter {...props} /> : <>mocked-tag-filter</>;
+    },
+  };
+});
 
 // `jest.mock` factories are hoisted above the imports, so anything they reach for has to be
 // declared with a `mock`-prefixed name (babel-plugin-jest-hoist allows only those).
@@ -242,6 +259,103 @@ function dashboardPickerButton() {
 
 function saveButton() {
   return screen.getByRole('button', { name: /save/i });
+}
+
+function cancelButton() {
+  return screen.getByRole('link', { name: /cancel/i });
+}
+
+/**
+ * How the Save control presents its availability, in both of the ways it can.
+ *
+ * They are read together because the defect was that they disagreed: `Button` pairs the native
+ * `disabled` attribute with `aria-disabled="false"`, so an unavailable Save reported itself as
+ * enabled to assistive technology while being unfocusable and unhoverable — which took its reason
+ * with it. `nativeDisabled` must therefore be false in every state.
+ */
+function saveAvailability() {
+  const save = saveButton();
+  return {
+    ariaDisabled: save.getAttribute('aria-disabled'),
+    nativeDisabled: save.hasAttribute('disabled'),
+  };
+}
+
+/** The form's polite live region, which is where a refused save says so. */
+function saveLiveRegion() {
+  return screen.getByRole('status');
+}
+
+/** The interaction states a pointer or the keyboard can put a button into. */
+const REACHABLE_STATES = ['hover', 'focus', 'focus-visible', 'active'] as const;
+
+type ReachableState = (typeof REACHABLE_STATES)[number];
+
+/**
+ * The background each reachable state declares for `element`, read out of the emotion rules that
+ * apply to it and restricted to the rules that also carry the availability guard.
+ *
+ * `Button` declares a background for the same states without that guard, and those rules are still
+ * in the sheet — they are what the guarded ones override, since `:not()` makes them more specific.
+ * Reading them all back would therefore report the fill that loses rather than the one that paints,
+ * so the guard is what identifies the winning rule here. jsdom applies no pseudo-class state, which
+ * is why this reads the declarations instead of computed styles.
+ */
+function guardedStateFills(element: HTMLElement): Partial<Record<ReachableState, string>> {
+  const classSelectors = Array.from(element.classList, (name) => `.${name}`);
+  const fills: Partial<Record<ReachableState, string>> = {};
+
+  // Emotion inserts through the CSSOM here, so the rules are read from the sheets rather than from
+  // the text of the style elements, which is empty. Each rule is one flattened declaration block,
+  // e.g. `.css-hash:not([disabled]):not([aria-disabled='true']):hover {background: #2c64d6;}`.
+  for (const sheet of Array.from(document.styleSheets)) {
+    for (const rule of Array.from(sheet.cssRules ?? [])) {
+      const match = /^([^{}]+)\{([^{}]*)\}/.exec(rule.cssText ?? '');
+      if (!match) {
+        continue;
+      }
+      const [, selectorList, body] = match;
+      const background = /(?:^|;)\s*background(?:-color)?:\s*([^;]+)/.exec(body)?.[1]?.trim();
+      if (!background) {
+        continue;
+      }
+
+      for (const selector of selectorList.split(',')) {
+        if (!classSelectors.some((classSelector) => selector.includes(classSelector))) {
+          continue;
+        }
+        if (!selector.includes(':not([disabled])')) {
+          continue;
+        }
+        // `focus-visible` is matched ahead of `focus`, and `focus` only where no hyphen follows it,
+        // so a `:focus-visible` selector is not also counted as a `:focus` one.
+        for (const [, state] of selector.matchAll(/:(hover|active|focus-visible|focus(?!-))/g)) {
+          fills[state as ReachableState] = background;
+        }
+      }
+    }
+  }
+
+  return fills;
+}
+
+function nameField() {
+  return screen.getByRole('textbox', { name: /name/i });
+}
+
+function intervalField() {
+  return screen.getByRole('textbox', { name: /interval/i });
+}
+
+/**
+ * Submits the form itself, the way pressing Enter in a field does.
+ *
+ * Clicking Save proves nothing about a save the form refuses: Save is disabled while any field
+ * reports an error, so a swallowed click and a refused submit look identical. Going through the
+ * form puts the question to react-hook-form's submit handler, which is what has to decline.
+ */
+function submitForm() {
+  fireEvent.submit(saveButton());
 }
 
 function disclosureButtons() {
@@ -462,13 +576,124 @@ describe('PlaylistForm', () => {
         expect(onSubmitMock).not.toHaveBeenCalled();
       });
     });
+
+    describe('and name is nothing but spaces', () => {
+      it('then it is refused with a reason and nothing should be submitted', async () => {
+        const { onSubmitMock, user } = getTestContext();
+
+        await user.clear(nameField());
+        await user.type(nameField(), '   ');
+        // Submitted through the form rather than by clicking Save, so what refuses the save is the
+        // field's own validation and not the disabled state of the button.
+        submitForm();
+
+        // `required` alone accepts a name of spaces — it is a non-empty string — and the playlist
+        // used to be stored with it, leaving an unnamed card in the list.
+        expect(await screen.findByRole('alert')).toHaveTextContent('Name cannot consist only of spaces');
+        expect(onSubmitMock).not.toHaveBeenCalled();
+      });
+    });
+
+    describe('and the name has surrounding whitespace', () => {
+      it('then the trimmed name is submitted', async () => {
+        const { onSubmitMock, user } = getTestContext();
+
+        await user.clear(nameField());
+        await user.type(nameField(), '  Padded playlist  ');
+        await user.click(saveButton());
+
+        await waitFor(() => expect(onSubmitMock).toHaveBeenCalledTimes(1));
+        expect(firstSubmittedPlaylist(onSubmitMock).spec?.title).toBe('Padded playlist');
+        // The field itself keeps what was typed; only what is stored is normalised.
+        expect(nameField()).toHaveValue('  Padded playlist  ');
+      });
+    });
+
+    describe('and the interval is not a duration', () => {
+      it.each(['bogus', '5 minutes', 'm5', '   ', '0'])(
+        'then %p is refused with a reason and nothing should be submitted',
+        async (interval) => {
+          const { onSubmitMock, user } = getTestContext();
+
+          await user.clear(intervalField());
+          await user.type(intervalField(), interval);
+          submitForm();
+
+          // Every one of these throws in `rangeUtil.intervalToMs`, which is what `PlaylistSrv`
+          // calls when the playlist is started, so accepting one would store an unplayable
+          // playlist.
+          expect(await screen.findByRole('alert')).toHaveTextContent(
+            'Interval must be a duration such as 30s, 5m or 1h'
+          );
+          expect(() => rangeUtil.intervalToMs(interval)).toThrow();
+          expect(onSubmitMock).not.toHaveBeenCalled();
+        }
+      );
+
+      it.each(['30s', '5m', '90s', '1h', '2d', '45'])(
+        'then %p is accepted, exactly as playback parses it',
+        async (interval) => {
+          const { onSubmitMock, user } = getTestContext();
+
+          await user.clear(intervalField());
+          await user.type(intervalField(), interval);
+          await user.click(saveButton());
+
+          await waitFor(() => expect(onSubmitMock).toHaveBeenCalledTimes(1));
+          expect(firstSubmittedPlaylist(onSubmitMock).spec?.interval).toBe(interval);
+          expect(() => rangeUtil.intervalToMs(interval)).not.toThrow();
+        }
+      );
+    });
+
+    describe('and both a blank name and an invalid interval are given for a new playlist', () => {
+      it('then nothing is created until each one is corrected', async () => {
+        const { onSubmitMock, user } = getTestContext(mockEmptyPlaylist);
+
+        await user.clear(nameField());
+        await user.type(nameField(), '   ');
+        await user.clear(intervalField());
+        await user.type(intervalField(), 'bogus');
+        await user.click(dashboardPickerButton());
+        await waitFor(() => {
+          expect(rows()).toHaveLength(1);
+        });
+
+        submitForm();
+
+        // Both fields report, and the create request the QA reproduction saw is never made.
+        expect(await screen.findAllByRole('alert')).toHaveLength(2);
+        expect(onSubmitMock).not.toHaveBeenCalled();
+
+        await user.clear(nameField());
+        await user.type(nameField(), ' Corrected playlist ');
+        await user.clear(intervalField());
+        await user.type(intervalField(), '10m');
+        // Leaving the field is what re-runs its validation in this form (`validateOn="onBlur"`),
+        // which is how the messages go and how Save — unavailable while an error is reported —
+        // comes back for the retry.
+        await user.tab();
+
+        await waitFor(() => {
+          expect(screen.queryAllByRole('alert')).toHaveLength(0);
+        });
+        expect(saveAvailability()).toEqual({ ariaDisabled: 'false', nativeDisabled: false });
+        await user.click(saveButton());
+
+        await waitFor(() => expect(onSubmitMock).toHaveBeenCalledTimes(1));
+        expect(firstSubmittedPlaylist(onSubmitMock).spec).toMatchObject({
+          title: 'Corrected playlist',
+          interval: '10m',
+        });
+      });
+    });
   });
 
   describe('when items are missing', () => {
-    it('then save button is disabled', async () => {
+    it('then Save presents as unavailable, and says so the same way twice', async () => {
       getTestContext(mockEmptyPlaylist);
 
-      expect(screen.getByRole('button', { name: /save/i })).toBeDisabled();
+      expect(saveAvailability()).toEqual({ ariaDisabled: 'true', nativeDisabled: false });
     });
   });
 
@@ -990,13 +1215,13 @@ describe('PlaylistForm', () => {
       const { onSubmitMock, settleSubmit } = controlledSubmit();
       const { user } = renderWithSubmit(mockPlaylist, onSubmitMock);
 
-      expect(saveButton()).toBeEnabled();
+      expect(saveAvailability()).toEqual({ ariaDisabled: 'false', nativeDisabled: false });
       expect(saveButton()).toHaveAttribute('aria-busy', 'false');
 
       await user.click(saveButton());
 
       await waitFor(() => {
-        expect(saveButton()).toBeDisabled();
+        expect(saveAvailability()).toEqual({ ariaDisabled: 'true', nativeDisabled: false });
       });
       expect(saveButton()).toHaveAttribute('aria-busy', 'true');
       expect(onSubmitMock).toHaveBeenCalledTimes(1);
@@ -1006,7 +1231,7 @@ describe('PlaylistForm', () => {
       settleSubmit();
 
       await waitFor(() => {
-        expect(saveButton()).toBeEnabled();
+        expect(saveAvailability()).toEqual({ ariaDisabled: 'false', nativeDisabled: false });
       });
       expect(saveButton()).toHaveAttribute('aria-busy', 'false');
 
@@ -1022,13 +1247,13 @@ describe('PlaylistForm', () => {
       await user.dblClick(saveButton());
 
       await waitFor(() => {
-        expect(saveButton()).toBeDisabled();
+        expect(saveAvailability()).toEqual({ ariaDisabled: 'true', nativeDisabled: false });
       });
       expect(onSubmitMock).toHaveBeenCalledTimes(1);
 
       settleSubmit();
       await waitFor(() => {
-        expect(saveButton()).toBeEnabled();
+        expect(saveAvailability()).toEqual({ ariaDisabled: 'false', nativeDisabled: false });
       });
       expect(onSubmitMock).toHaveBeenCalledTimes(1);
     });
@@ -1045,7 +1270,7 @@ describe('PlaylistForm', () => {
 
       settleSubmit();
       await waitFor(() => {
-        expect(saveButton()).toBeEnabled();
+        expect(saveAvailability()).toEqual({ ariaDisabled: 'false', nativeDisabled: false });
       });
       expect(onSubmitMock).toHaveBeenCalledTimes(1);
     });
@@ -1145,6 +1370,233 @@ describe('PlaylistForm', () => {
       });
       expect(unsavedChangesModal()).not.toBeInTheDocument();
       expect(onSubmitMock).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('when adding an item by tag', () => {
+    /**
+     * The real "Add by tag" control, over the dashboard tag facets the form asks the searcher for.
+     * `getGrafanaSearcher` is stubbed rather than the HTTP layer because the form reaches for the
+     * searcher itself, and the facet counts are the point of these cases.
+     */
+    function withTagFacets(facets: TermCount[]) {
+      mockRealTagFilter.enabled = true;
+      jest.spyOn(searcherService, 'getGrafanaSearcher').mockReturnValue({
+        tags: async () => facets,
+      } as unknown as ReturnType<typeof searcherService.getGrafanaSearcher>);
+    }
+
+    async function openTagOptions(user: UserEvent) {
+      // The mocked dashboard picker is a button, so the tag filter owns the only combobox here.
+      await user.click(screen.getByRole('combobox'));
+      return screen.findAllByRole('option');
+    }
+
+    afterEach(() => {
+      mockRealTagFilter.enabled = false;
+    });
+
+    it('names each option after its own tag and the number of dashboards carrying it', async () => {
+      withTagFacets([
+        { term: 'qa-final', count: 2 },
+        { term: 'qa-final-ui', count: 1 },
+      ]);
+      const { user } = getTestContext(mockEmptyPlaylist);
+
+      const options = await openTagOptions(user);
+
+      // Every option used to be named "Tag option", leaving these two indistinguishable to anything
+      // that cannot see the badge.
+      expect(options).toHaveLength(2);
+      expect(options[0]).toHaveAccessibleName('Tag option qa-final (2)');
+      expect(options[1]).toHaveAccessibleName('Tag option qa-final-ui (1)');
+      expect(new Set(options.map((option) => option.getAttribute('aria-label'))).size).toBe(2);
+    });
+
+    it('names an option whose count the badge hides by its tag alone', async () => {
+      withTagFacets([{ term: 'no-count', count: 0 }]);
+      const { user } = getTestContext(mockEmptyPlaylist);
+
+      const [option] = await openTagOptions(user);
+
+      expect(option).toHaveAccessibleName('Tag option no-count');
+    });
+
+    it('keeps a tag name that would otherwise be escaped readable in the name', async () => {
+      withTagFacets([{ term: 'r&d "core"', count: 3 }]);
+      const { user } = getTestContext(mockEmptyPlaylist);
+
+      const [option] = await openTagOptions(user);
+
+      // The name is set as an attribute value, never parsed as HTML, so i18next's default escaping
+      // would only turn the tag into entities where it is announced.
+      expect(option).toHaveAccessibleName('Tag option r&d "core" (3)');
+    });
+
+    it('still adds the picked tag as an item', async () => {
+      withTagFacets([{ term: 'qa-final', count: 2 }]);
+      const { onSubmitMock, user } = getTestContext(mockEmptyPlaylist);
+
+      const [option] = await openTagOptions(user);
+      await user.click(option);
+
+      await waitFor(() => {
+        expect(rows()).toHaveLength(1);
+      });
+      expectCorrectRow({ index: 0, type: 'dashboard_by_tag', value: 'qa-final' });
+
+      await user.click(saveButton());
+      await waitFor(() => expect(onSubmitMock).toHaveBeenCalledTimes(1));
+      expect(firstSubmittedPlaylist(onSubmitMock).spec?.items).toEqual([
+        { type: 'dashboard_by_tag', value: 'qa-final' },
+      ]);
+    });
+  });
+
+  describe('what the Save control reports and what it refuses', () => {
+    it('never carries the native disabled attribute, in any state it presents', async () => {
+      const { user } = getTestContext(mockEmptyPlaylist);
+
+      // Unavailable for want of an item.
+      expect(saveAvailability()).toEqual({ ariaDisabled: 'true', nativeDisabled: false });
+
+      // Available: one item and valid fields.
+      await user.click(dashboardPickerButton());
+      await waitFor(() => {
+        expect(saveAvailability()).toEqual({ ariaDisabled: 'false', nativeDisabled: false });
+      });
+
+      // Unavailable for an invalid field. The native attribute is what used to appear here beside
+      // `aria-disabled="false"`, which is the contradiction the finding measured.
+      await user.clear(nameField());
+      await user.tab();
+      await waitFor(() => {
+        expect(saveAvailability()).toEqual({ ariaDisabled: 'true', nativeDisabled: false });
+      });
+    });
+
+    it('carries the reason it is unavailable, reachable by pointer and by keyboard', async () => {
+      const { user } = getTestContext(mockEmptyPlaylist);
+
+      // Focusable and hoverable is the point of reporting `aria-disabled` instead: the reason is on
+      // the control rather than something to deduce from a dead button.
+      await user.hover(saveButton());
+      expect(await screen.findByRole('tooltip')).toHaveTextContent('Add at least one dashboard before saving');
+
+      await user.unhover(saveButton());
+      saveButton().focus();
+      expect(saveButton()).toHaveFocus();
+      expect(await screen.findByRole('tooltip')).toHaveTextContent('Add at least one dashboard before saving');
+      // The tooltip describes the control while it is open, so the reason is announced with it.
+      expect(saveButton()).toHaveAccessibleDescription('Add at least one dashboard before saving');
+    });
+
+    it('refuses a submit that reaches the form while Save presents as unavailable', async () => {
+      const { onSubmitMock } = getTestContext(mockEmptyPlaylist);
+
+      // Save is this form's submit control and no longer carries the native attribute, so pressing
+      // Enter in a field now reaches the form's own submit. Nothing may be written by it.
+      submitForm();
+
+      await waitFor(() => {
+        expect(saveLiveRegion()).toHaveTextContent('Add at least one dashboard before saving');
+      });
+      expect(onSubmitMock).not.toHaveBeenCalled();
+      expect(rows).toThrow();
+    });
+
+    it('refuses a save while a variable is half-entered, moves focus to the field and announces it', async () => {
+      const { onSubmitMock, user } = getTestContext(playlistWithVariables());
+      const editor = await openVariableEditor(user, 0);
+
+      // A name with no values: a draft the editor cannot add, which used to leave Save enabled and
+      // then swallow the click — nothing was saved and nothing said so.
+      await user.type(newVariableName(editor), 'cluster');
+      await user.click(saveButton());
+
+      expect(onSubmitMock).not.toHaveBeenCalled();
+      expect(saveLiveRegion()).toHaveTextContent('Playlist not saved.');
+      expect(newVariableValues(editor)).toHaveFocus();
+      expect(newVariableValues(editor)).toHaveAccessibleDescription('Variable value is required');
+      // The draft is still there to be corrected rather than discarded.
+      expect(newVariableName(editor)).toHaveValue('cluster');
+
+      // A second attempt is announced again: identical text left in the same node is not a change a
+      // live region reports, so the announcement is a new node each time.
+      const firstAnnouncement = saveLiveRegion().firstElementChild;
+      await user.click(saveButton());
+      expect(saveLiveRegion().firstElementChild).not.toBe(firstAnnouncement);
+      expect(saveLiveRegion()).toHaveTextContent('Playlist not saved.');
+      expect(onSubmitMock).not.toHaveBeenCalled();
+
+      // And the refusal is not a dead end: completing the draft saves it with the playlist.
+      await user.type(newVariableValues(editor), 'eu');
+      await user.click(saveButton());
+      await waitFor(() => expect(onSubmitMock).toHaveBeenCalledTimes(1));
+      expect(firstSubmittedPlaylist(onSubmitMock).spec?.items?.[0]).toEqual({
+        type: 'dashboard_by_uid',
+        value: 'uid_1',
+        variables: { cluster: ['eu'], host: ['Host1'] },
+      });
+    });
+  });
+
+  describe('the size of the form controls', () => {
+    it('offers Save and Cancel a 44 px box without changing their labels', () => {
+      getTestContext();
+
+      for (const control of [saveButton(), cancelButton()]) {
+        const { minWidth, minHeight, fontSize } = window.getComputedStyle(control);
+        expect({ label: control.textContent, minWidth, minHeight }).toEqual({
+          label: control.textContent,
+          minWidth: '44px',
+          minHeight: '44px',
+        });
+        // The box is the whole change: a control grown by scaling its text is a different control,
+        // so both keep the type size `Button` gives a `size="md"` control.
+        expect(fontSize).toBe(config.theme2.typography.size.md);
+      }
+    });
+  });
+
+  describe('the contrast of the form controls', () => {
+    it('keeps the Save label above 4.5:1 on every state a pointer or the keyboard can reach', () => {
+      getTestContext();
+      const { colors } = config.theme2;
+      const fills = guardedStateFills(saveButton());
+
+      // Every reachable state has to be covered: `Button` paints hover and focus with the lighter
+      // `primary.shade`, which carried white text at 3.55:1, and leaves `:active` on `primary.main`.
+      expect(Object.keys(fills).sort()).toEqual([...REACHABLE_STATES].sort());
+
+      for (const state of REACHABLE_STATES) {
+        const background = fills[state] ?? '';
+        const ratio = colorManipulator.getContrastRatio(colors.primary.contrastText, background);
+        // The state is carried into the assertion so a failure names the state that fell short
+        // rather than reporting a bare `false`.
+        expect({ state, meetsContrastMinimum: ratio >= 4.5 }).toEqual({ state, meetsContrastMinimum: true });
+        // A state that reads exactly like the rest state would meet the ratio by removing the
+        // feedback instead of fixing it, so each fill also has to differ from the resting one.
+        expect({ state, fill: colorManipulator.asHexString(background) }).not.toEqual({
+          state,
+          fill: colorManipulator.asHexString(colors.primary.main),
+        });
+      }
+    });
+
+    it('leaves the Cancel link on the secondary fills, which already clear 4.5:1 in every state', () => {
+      getTestContext();
+
+      // Recorded rather than changed: `secondary.main` and `secondary.shade` carry
+      // `secondary.contrastText` at 8.49:1 and 7.04:1 on the dark theme, so the control the finding
+      // asked about needs no override — and an override here would be an unexplained visual change.
+      expect(guardedStateFills(cancelButton())).toEqual({});
+      const { colors } = config.theme2;
+      for (const background of [colors.secondary.main, colors.secondary.shade]) {
+        expect(colorManipulator.getContrastRatio(colors.secondary.contrastText, background)).toBeGreaterThanOrEqual(
+          4.5
+        );
+      }
     });
   });
 });
